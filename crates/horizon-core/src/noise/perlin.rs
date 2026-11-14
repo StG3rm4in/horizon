@@ -452,6 +452,12 @@ impl SmearedPerlinNoise {
     }
 }
 
+impl SmearedPerlinNoise {
+    /// GPU (fork StG3rm4in/horizon): the Y smear scale.
+    pub fn fudge_y_scale(&self) -> f64 {
+        self.fudge_y_scale
+    }
+}
 fn compute_fudge_y(input_y: f64, relative_y: f64, scale: f64) -> f64 {
     let limited_y = if input_y >= 0.0 && input_y < relative_y {
         input_y

@@ -32,6 +32,16 @@ pub struct MultipointSpline<C = usize> {
     pub(super) points: Vec<SplinePoint<C>>,
     pub(super) depth: usize,
 }
+impl<C: Copy> MultipointSpline<C> {
+    /// GPU (fork StG3rm4in/horizon): the coordinate this spline is evaluated at.
+    pub fn coordinate(&self) -> C {
+        self.coordinate
+    }
+    /// GPU (fork StG3rm4in/horizon): the points, in definition order.
+    pub fn points(&self) -> &[SplinePoint<C>] {
+        &self.points
+    }
+}
 /// An immutable spline definition. Coordinate indices are resolved against a
 /// sampler table at compilation. Point order is retained, including NaNs and
 /// equal locations; codec ordering constraints belong to serialized definitions.

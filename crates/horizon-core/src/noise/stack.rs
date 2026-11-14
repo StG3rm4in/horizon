@@ -4,6 +4,18 @@ use std::sync::Arc;
 /// Immutable noise sampling. Implementations may override the default scalar
 /// volume traversal when vanilla has a distinct bulk arithmetic path.
 pub trait Noise: std::fmt::Debug + Send + Sync {
+    /// GPU (fork StG3rm4in/horizon): this noise, when it is a plain Perlin noise.
+    fn as_perlin(&self) -> Option<&PerlinNoise> {
+        None
+    }
+    /// GPU (fork StG3rm4in/horizon): this noise, when it is a smeared Perlin noise.
+    fn as_smeared(&self) -> Option<&SmearedPerlinNoise> {
+        None
+    }
+    /// GPU (fork StG3rm4in/horizon): this noise, when it is an octave stack.
+    fn as_stack(&self) -> Option<&NoiseStack> {
+        None
+    }
     fn range(&self) -> Result<[f32; 2], NanRange>;
     fn get2(&self, x: f64, z: f64) -> f32;
     fn get3(&self, x: f64, y: f64, z: f64) -> f32;
@@ -49,6 +61,9 @@ pub trait Noise: std::fmt::Debug + Send + Sync {
 }
 
 impl Noise for PerlinNoise {
+    fn as_perlin(&self) -> Option<&PerlinNoise> {
+        Some(self)
+    }
     fn range(&self) -> Result<[f32; 2], NanRange> {
         Ok(PerlinNoise::range(self))
     }
@@ -81,6 +96,9 @@ impl Noise for PerlinNoise {
     }
 }
 impl Noise for SmearedPerlinNoise {
+    fn as_smeared(&self) -> Option<&SmearedPerlinNoise> {
+        Some(self)
+    }
     fn range(&self) -> Result<[f32; 2], NanRange> {
         SmearedPerlinNoise::range(self)
     }
@@ -151,6 +169,9 @@ impl NoiseStack {
     }
 }
 impl Noise for NoiseStack {
+    fn as_stack(&self) -> Option<&NoiseStack> {
+        Some(self)
+    }
     fn range(&self) -> Result<[f32; 2], NanRange> {
         Ok(self.range)
     }

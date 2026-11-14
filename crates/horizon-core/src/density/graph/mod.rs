@@ -526,6 +526,13 @@ impl DensityGraph {
         });
         Ok(id)
     }
+    /// GPU (fork StG3rm4in/horizon): the definition of a function, `None` for a bound sampler.
+    pub fn node(&self, id: FunctionId) -> Option<&GraphNode> {
+        match &self.entries.get(id.0)?.definition {
+            Definition::Node(node) => Some(node),
+            Definition::Bound { .. } => None,
+        }
+    }
     fn entry(&self, id: FunctionId) -> Result<&Entry, CompileError> {
         self.entries.get(id.0).ok_or(CompileError::UnknownFunction)
     }
