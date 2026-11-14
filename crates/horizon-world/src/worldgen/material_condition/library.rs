@@ -116,6 +116,10 @@ impl MaterialRuleLibrary {
     }
     /// Compile a router decoded into the density registry passed to `from_json`.
     /// Its roots share cache IDs with all material and aquifer samplers.
+    /// The world-seeded compiler, read by the GPU final density translation.
+    pub fn compiler(&self) -> &DensityCompiler {
+        &self.compiler
+    }
     pub fn compile_router(&mut self, router: NoiseRouter) -> Result<RouterSamplers, DecodeError> {
         Ok(router.compile(&mut self.compiler)?)
     }

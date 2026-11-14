@@ -742,16 +742,39 @@ pub fn fill_noise<B: TerrainBlockStates>(
     aquifer: &mut (impl TerrainAquifer + ?Sized),
     default_block: BlockStateId,
 ) -> Result<(), TerrainError> {
+    fill_noise_with(
+        chunk,
+        volume,
+        final_density,
+        context,
+        aquifer,
+        default_block,
+        |_| false,
+    )
+}
+
+/// [`fill_noise`] whose final density `presample` may write itself (the GPU
+/// path): when it returns true, `final_density` is not sampled on the CPU.
+pub fn fill_noise_with<B: TerrainBlockStates>(
+    chunk: &mut TerrainChunk<'_, B>,
+    volume: DensityVolume,
+    final_density: &dyn DensitySampler,
+    context: &mut SamplerContext,
+    aquifer: &mut (impl TerrainAquifer + ?Sized),
+    default_block: BlockStateId,
+    presample: impl FnOnce(&mut [f32]) -> bool,
+) -> Result<(), TerrainError> {
     let size = volume.size();
     SCRATCH_DENSITY.with_borrow_mut(|scratch| {
         if scratch.len() < size {
             scratch.resize(size, 0.0);
         }
         scratch[..size].fill(0.0);
+        let sampled = presample(&mut scratch[..size]);
         fill_noise_inner(
             chunk,
             volume,
-            final_density,
+            (!sampled).then_some(final_density),
             context,
             aquifer,
             default_block,
@@ -763,7 +786,7 @@ pub fn fill_noise<B: TerrainBlockStates>(
 fn fill_noise_inner<B: TerrainBlockStates>(
     chunk: &mut TerrainChunk<'_, B>,
     volume: DensityVolume,
-    final_density: &dyn DensitySampler,
+    final_density: Option<&dyn DensitySampler>,
     context: &mut SamplerContext,
     aquifer: &mut (impl TerrainAquifer + ?Sized),
     default_block: BlockStateId,
@@ -784,7 +807,9 @@ fn fill_noise_inner<B: TerrainBlockStates>(
     }
     chunk.ensure_heightmap(HeightmapType::OceanFloorWg);
     chunk.ensure_heightmap(HeightmapType::WorldSurfaceWg);
-    final_density.sample_volume(context, density, volume)?;
+    if let Some(final_density) = final_density {
+        final_density.sample_volume(context, density, volume)?;
+    }
     let air_above = aquifer.air_above_y();
     // A non-air, non-fluid default block may be written as a run without asking
     // the aquifer or touching the heightmap below the run's top.

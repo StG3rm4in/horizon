@@ -1,0 +1,15 @@
+[package]
+name = "horizon-gpu"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "final_density sur GPU CUDA, au bit pres identique au CPU"
+
+[dependencies]
+horizon-core = { path = "../horizon-core" }
+cudarc = { version = "0.19", features = ["cuda-version-from-build-system"] }
+log = "0.4"
+
+[lints]
+workspace = true

@@ -38,7 +38,9 @@ use super::{
     settings::NoiseSettings,
     spawn_finder::{SpawnTargetPoint, find_spawn_position},
     tags::TagDefinitions,
-    terrain::{PreLightChunkStage, TerrainAquifer, TerrainBlockStates, TerrainChunk, fill_noise},
+    terrain::{
+        PreLightChunkStage, TerrainAquifer, TerrainBlockStates, TerrainChunk, fill_noise_with,
+    },
 };
 use crate::{
     heightmap::{HeightmapState, HeightmapType},
@@ -957,6 +959,8 @@ struct Pipeline<R: RandomSource> {
     flat: Option<FlatLayers>,
     /// The dimension it generates, as native mods are told.
     dimension: String,
+    /// final_density on the GPU, for chunks without structures or blending.
+    gpu: Option<horizon_gpu::GpuFinalDensity>,
 }
 /// `FlatLevelGeneratorSettings.getLayers` as `FlatLevelSource` reads them: the states from the
 /// level's minimum Y up, with the layers `adjustGenerationSettings` replaced by `null`
@@ -1124,7 +1128,22 @@ where
             seed,
             settings.legacy,
         )?;
+        let final_density_id = router.function(RouterField::FinalDensity);
         let router = library.compile_router(router)?;
+        let gpu = horizon_gpu::GpuFinalDensity::new(
+            library.compiler(),
+            final_density_id,
+            seed,
+            settings.legacy,
+            router.get(RouterField::FinalDensity).clone(),
+            settings.noise_min_y,
+            settings.noise_height,
+            &format!(
+                "noise y {}..{}",
+                settings.noise_min_y,
+                settings.noise_min_y + settings.noise_height
+            ),
+        );
         let debug_density = debug_functions
             .into_iter()
             .map(|(label, id)| Ok((label, library.function_sampler(id)?)))
@@ -1246,6 +1265,7 @@ where
             spawn_position: std::sync::OnceLock::new(),
             flat: None,
             dimension: "minecraft:overworld".to_owned(),
+            gpu,
         };
         pipeline.decoration = pipeline
             .data
@@ -1729,6 +1749,14 @@ where
             .structures
             .as_ref()
             .and_then(|s| s.beardifier(&references, pos));
+        // The GPU final density knows no structures and no old chunks to blend.
+        let gpu = self.gpu.as_ref().filter(|gpu| {
+            let free = beard.is_none() && blender.is_empty();
+            if !free {
+                gpu.note_cpu_fallback();
+            }
+            free
+        });
         if beard.is_some() || !blender.is_empty() {
             let mut fields = horizon_core::density::WorldFields::default();
             if let Some(beard) = beard {
@@ -1797,13 +1825,14 @@ where
                     .collect()
             };
             context.set_lattice(lattice);
-            let filled = fill_noise(
+            let filled = fill_noise_with(
                 &mut chunk,
                 volume,
                 self.router.get(RouterField::FinalDensity).as_ref(),
                 context,
                 aquifer.as_mut(),
                 self.settings.default_block,
+                |density| gpu.is_some_and(|gpu| gpu.fill_chunk(pos.x, pos.z, density)),
             );
             context.clear_lattice();
             filled.map_err(stage("noise"))?;
