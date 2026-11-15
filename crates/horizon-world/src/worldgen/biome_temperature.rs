@@ -56,6 +56,12 @@ fn noises() -> &'static TemperatureNoises {
         }
     })
 }
+/// The fixed temperature noises (height variation, frozen stack, biome info),
+/// for samplers evaluated elsewhere (the GPU fork).
+pub fn temperature_noises() -> (&'static SimplexNoise, &'static NoiseStack, &'static SimplexNoise) {
+    let n = noises();
+    (&n.height, &n.frozen, &n.info)
+}
 impl TemperatureModifier {
     pub fn modify(self, position: BlockPos, base: f32) -> f32 {
         if self == Self::Frozen {
@@ -147,10 +153,19 @@ impl BiomeTemperature {
             limit,
         }
     }
+    /// No cache: every query computes the value. Within one generator (one sea level) it is a pure
+    /// function of the position, so this only saves the cache's work, which costs more than the
+    /// value for a query that does not come back (`SnowAndFreezeFeature`: two positions a column).
+    pub fn uncached(settings: BiomeTemperatureSettings) -> Self {
+        Self::with_limit(settings, 0)
+    }
     pub fn settings(&self) -> BiomeTemperatureSettings {
         self.settings
     }
     pub fn temperature(&mut self, position: BlockPos, sea_level: i32) -> f32 {
+        if self.limit == 0 {
+            return self.settings.height_adjusted(position, sea_level);
+        }
         let key = position.pack();
         if let Some(value) = self
             .values

@@ -225,6 +225,11 @@ impl LightTables {
         tables.rebuild_cache();
         tables
     }
+    /// What the GPU light reads (`horizon_gpu::LightGpu::new`): each state's info, the blocking
+    /// masks between cell configurations (`a * types + b`) and their number.
+    pub fn gpu_tables(&self) -> (&[u32], &[u8], usize) {
+        (&self.info, &self.block_masks, self.types)
+    }
     /// `LightEngine.shapeOccludes(from, to, direction)`.
     #[inline]
     fn blocked(&self, from: usize, to: usize, direction: usize) -> bool {
@@ -762,6 +767,88 @@ fn pack_lighting(
                 }
             }
             Light::from_slice(&data)
+        })
+        .collect()
+}
+
+/// `light_chunk` on the GPU (HORIZON_GPU_LIGHT): the region's sections, as stored (palette and
+/// packed words), go to `gpu`, which lights the centre column; `lights_from_gpu` reads it back.
+/// The height and the sections lit are those of `light_chunk`.
+pub fn gpu_light_submit(
+    gpu: &horizon_gpu::LightGpu,
+    region: &[[Option<&Chunk>; 3]; 3],
+    tables: &LightTables,
+    sky_light: bool,
+) -> Result<horizon_gpu::LightJob, String> {
+    let sections = region[1][1].ok_or("no centre chunk")?.sections.len();
+    let mut top_section = 0;
+    for chunk in region.iter().flatten().flatten() {
+        if chunk.sections.len() != sections {
+            return Err("columns of different heights".into());
+        }
+        for (i, s) in chunk.sections.iter().enumerate().rev() {
+            if !s.is_uniform(0) {
+                top_section = top_section.max(i + 1);
+                break;
+            }
+        }
+    }
+    let h = ((top_section + 1) * 16).min(sections * 16);
+    let nsh = h / 16;
+    let mut present = 0u16;
+    for (dz, row) in region.iter().enumerate() {
+        for (dx, chunk) in row.iter().enumerate() {
+            if chunk.is_some() {
+                present |= 1 << (dz * 3 + dx);
+            }
+        }
+    }
+    // Per (chunk, section under h): nothing (no chunk, air, above the top), one state's info, or the
+    // packed states, which the GPU keeps for the next jobs (`Arc<Section>` copied on write).
+    let mut inputs: Vec<horizon_gpu::LightInput<'_, Section>> = Vec::with_capacity(9 * nsh);
+    for c in 0..9 {
+        let chunk = region[c / 3][c % 3];
+        for s in 0..nsh {
+            let section = chunk
+                .and_then(|ch| ch.sections.get(s))
+                .filter(|sec| s < top_section && !sec.is_uniform(0));
+            let Some(section) = section else {
+                inputs.push(horizon_gpu::LightInput::Absent);
+                continue;
+            };
+            let blocks = &section.blocks;
+            let bits = blocks.bits();
+            if bits == 0 {
+                let info = *tables
+                    .info
+                    .get(blocks.get(0) as usize)
+                    .ok_or("state outside the light tables")?;
+                inputs.push(horizon_gpu::LightInput::Uniform(info));
+                continue;
+            }
+            inputs.push(horizon_gpu::LightInput::Packed {
+                section,
+                bits,
+                palette: blocks.palette(),
+                words: blocks.words(),
+            });
+        }
+    }
+    gpu.submit_sections(h, sky_light, present, &tables.info, &inputs)
+}
+
+/// The centre column's light from a GPU light job, as `light_chunk` returns it.
+pub fn lights_from_gpu(sections: &[horizon_gpu::LightSection<'_>]) -> Option<Vec<Light>> {
+    use horizon_gpu::LightSection as S;
+    sections
+        .iter()
+        .map(|s| {
+            Some(match *s {
+                S::Uniform(v) => Light::Uniform(v),
+                S::Sky(layer, block) => Light::Sky(Box::new(layer.try_into().ok()?), block),
+                S::Block(layer, sky) => Light::Block(Box::new(layer.try_into().ok()?), sky),
+                S::Full(data) => Light::Full(Box::new(data.try_into().ok()?)),
+            })
         })
         .collect()
 }

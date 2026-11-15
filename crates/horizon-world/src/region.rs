@@ -38,9 +38,13 @@ impl ChunkRecord {
         limits: Limits,
     ) -> io::Result<Self> {
         let bytes = nbt::write_named(root, limits).map_err(|e| invalid(e.to_string()))?;
+        Self::from_bytes(&bytes, compression, timestamp)
+    }
+    /// A record of NBT already written (`nbt::write_named`'s bytes, or a writer that makes the same).
+    pub fn from_bytes(bytes: &[u8], compression: Compression, timestamp: u32) -> io::Result<Self> {
         Ok(Self {
             compression,
-            compressed: compression.encode(&bytes)?,
+            compressed: compression.encode(bytes)?,
             timestamp,
         })
     }

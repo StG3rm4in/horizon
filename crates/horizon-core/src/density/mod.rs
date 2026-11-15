@@ -11,7 +11,7 @@ use std::sync::Arc;
 mod beardifier;
 pub use beardifier::{
     Beardifier, JigsawJunction, KernelJunction, KernelPiece, RigidPiece, StructureBounds,
-    TerrainAdjustment, TerrainKernel,
+    TerrainAdjustment, TerrainKernel, beard_kernel,
 };
 mod cache;
 mod world_fields;

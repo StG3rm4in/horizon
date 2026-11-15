@@ -55,6 +55,28 @@ impl CarvingMask {
             used_words: 0,
         })
     }
+    /// A mask from its packed words (bit `y - min_y + (z + x * 16) * height`), as `words` gives
+    /// them; extra zero words are dropped.
+    pub fn from_words(min_y: i32, max_y: i32, mut words: Vec<u64>) -> Result<Self, CarvingMaskError> {
+        let mut mask = Self::new(min_y, max_y)?;
+        if words.len() > (1 << 24) / 64 {
+            return Err(CarvingMaskError::Capacity);
+        }
+        mask.used_words = words.iter().rposition(|w| *w != 0).map_or(0, |i| i + 1);
+        if words.len() < mask.words.len() {
+            words.resize(mask.words.len(), 0);
+        }
+        mask.words = words;
+        Ok(mask)
+    }
+    /// The packed words up to the last carved one.
+    pub fn words(&self) -> &[u64] {
+        &self.words[..self.used_words]
+    }
+    /// Cells per column (`max_y - min_y + 1`).
+    pub fn height(&self) -> i32 {
+        self.height
+    }
     pub fn min_y(&self) -> i32 {
         self.min_y
     }

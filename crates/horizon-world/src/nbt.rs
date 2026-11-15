@@ -787,6 +787,139 @@ pub fn write_named(root: &NamedTag, limits: Limits) -> Result<Vec<u8>, Error> {
     Ok(writer.bytes)
 }
 
+/// A file root written as [`write_named`] writes its tree, entry by entry: a caller writes large
+/// values (a chunk's sections) straight into the bytes instead of building their tags first. Every
+/// byte goes through the same [`Writer`] (modified UTF-8, an overlong string written empty, canonical
+/// NaN, the byte limit). What is written directly is not counted as nodes, so it exists only under
+/// limits without a node cap ([`Limits::saved`]).
+pub struct RootWriter {
+    writer: Writer,
+}
+impl RootWriter {
+    /// The root compound named `name`, whose entries follow; None under limits with a node cap.
+    pub fn compound(name: &JavaString, limits: Limits) -> Result<Option<Self>, Error> {
+        if limits.max_nodes != usize::MAX {
+            return Ok(None);
+        }
+        let mut writer = Writer {
+            bytes: Vec::with_capacity(1 << 16),
+            limits,
+            nodes: 1,
+            empty_long_strings: true,
+            canonical_nan: true,
+        };
+        writer.put(&[10])?;
+        writer.string(name)?;
+        Ok(Some(Self { writer }))
+    }
+    /// An entry of the root: `tag` under `key`, as the root compound writes it.
+    pub fn entry(&mut self, key: &JavaString, tag: &Tag) -> Result<(), Error> {
+        if matches!(tag, Tag::End) {
+            return Err(self.writer.error("End cannot be a named value"));
+        }
+        self.writer.put(&[tag.id()])?;
+        self.writer.string(key)?;
+        self.writer.payload(tag, 1)
+    }
+    /// The id and the name of a named value, its payload to follow.
+    pub fn named(&mut self, id: u8, key: &str) -> Result<(), Error> {
+        self.writer.put(&[id])?;
+        self.str(key)
+    }
+    /// [`named`](Self::named) for a key held as a [`JavaString`].
+    pub fn named_java(&mut self, id: u8, key: &JavaString) -> Result<(), Error> {
+        self.writer.put(&[id])?;
+        self.writer.string(key)
+    }
+    /// A string payload, as `Tag::String(s.into())` writes: ASCII without NUL at once, the rest
+    /// through the UTF-16 units.
+    pub fn str(&mut self, s: &str) -> Result<(), Error> {
+        let bytes = s.as_bytes();
+        if bytes.len() <= usize::from(u16::MAX) && bytes.iter().all(|&c| (1..=127).contains(&c)) {
+            self.writer.put(&(bytes.len() as u16).to_be_bytes())?;
+            return self.writer.put(bytes);
+        }
+        self.writer.string(&JavaString::from(s))
+    }
+    pub fn byte(&mut self, value: i8) -> Result<(), Error> {
+        self.writer.put(&[value as u8])
+    }
+    pub fn int(&mut self, value: i32) -> Result<(), Error> {
+        self.writer.put(&value.to_be_bytes())
+    }
+    /// A `ByteArray` payload.
+    pub fn byte_array(&mut self, values: &[u8]) -> Result<(), Error> {
+        self.writer.count(values.len())?;
+        self.writer.put(values)
+    }
+    /// A `LongArray` payload of `words` (as i64).
+    pub fn long_array(&mut self, words: &[u64]) -> Result<(), Error> {
+        self.writer.count(words.len())?;
+        if words.len().saturating_mul(8) <= self.writer.limits.max_bytes.saturating_sub(self.writer.bytes.len()) {
+            self.writer.bytes.reserve(words.len() * 8);
+            for &word in words {
+                self.writer.bytes.extend_from_slice(&(word as i64).to_be_bytes());
+            }
+            return Ok(());
+        }
+        for &word in words {
+            self.writer.put(&(word as i64).to_be_bytes())?;
+        }
+        Ok(())
+    }
+    /// A list payload's header: the element id (0 for an empty list) and the count.
+    pub fn list(&mut self, id: u8, len: usize) -> Result<(), Error> {
+        self.writer.put(&[id])?;
+        self.writer.count(len)
+    }
+    /// Bytes [`payload_bytes`] made, as they are.
+    pub fn raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.writer.put(bytes)
+    }
+    /// An element of a list that mixes types, wrapped as the writer wraps it: a one-entry compound
+    /// whose key is the empty string. `payload` is the element's payload.
+    pub fn wrapped(&mut self, id: u8, payload: &[u8]) -> Result<(), Error> {
+        self.writer.put(&[id])?;
+        self.writer.string(&JavaString::default())?;
+        self.writer.put(payload)?;
+        self.writer.put(&[0])
+    }
+    /// [`wrapped`](Self::wrapped) for a string element.
+    pub fn wrapped_str(&mut self, s: &str) -> Result<(), Error> {
+        self.writer.put(&[8])?;
+        self.writer.string(&JavaString::default())?;
+        self.str(s)?;
+        self.writer.put(&[0])
+    }
+    /// The end of a compound payload.
+    pub fn end(&mut self) -> Result<(), Error> {
+        self.writer.put(&[0])
+    }
+    /// The root's end, and the bytes.
+    pub fn finish(mut self) -> Result<Vec<u8>, Error> {
+        self.writer.put(&[0])?;
+        Ok(self.writer.bytes)
+    }
+}
+/// The payload of `tag` as a file root writes it, for a value [`RootWriter::raw`] writes again and
+/// again (a block state of a palette).
+pub fn payload_bytes(tag: &Tag, limits: Limits) -> Result<Vec<u8>, Error> {
+    let mut writer = Writer {
+        bytes: Vec::new(),
+        limits,
+        nodes: 0,
+        empty_long_strings: true,
+        canonical_nan: true,
+    };
+    writer.payload(tag, 2)?;
+    Ok(writer.bytes)
+}
+/// Whether a list that mixes types wraps `tag` even though it is a compound: one whose only key is
+/// the empty string, which reading would take for a wrapper.
+pub fn wrapped_in_mixed_list(tag: &Tag) -> bool {
+    matches!(tag, Tag::Compound(c) if c.len() == 1 && c.contains_key(&JavaString::default()))
+}
+
 pub fn write_network(tag: &Tag, limits: Limits) -> Result<Vec<u8>, Error> {
     let mut writer = Writer {
         bytes: Vec::new(),

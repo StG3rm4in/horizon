@@ -9,10 +9,38 @@ use super::{
     number_text, optional, required,
     value_provider::{FloatProvider, IntProvider},
 };
-pub use canyon::{CanyonCarver, CanyonShape};
+pub use canyon::{CanyonCarver, CanyonShape, PlannedCanyon};
 pub use generation::{
     CarverCatalog, MaskGenerationError, WorldCarver, generate_carving_mask, large_feature_random,
 };
+
+/// One item of a carver call planned without its target (`WorldCarver::plan`): what `carve` draws
+/// before tracing, which does not depend on the target chunk. Tunnels and canyons keep the state
+/// their own random stream starts from; `WorldCarver::execute` traces them for a target.
+#[derive(Clone, Debug)]
+pub enum PlannedCarve {
+    /// A cave room: one ellipsoid, with the cave's floor level
+    Room {
+        center: [f64; 3],
+        horizontal: f64,
+        vertical: f64,
+        floor: f64,
+    },
+    /// A cave tunnel from step 0 (`CaveRun::tunnel`) and its run's radius multipliers
+    Tunnel {
+        seed: i64,
+        position: [f64; 3],
+        thickness: f32,
+        yaw: f32,
+        pitch: f32,
+        end: i32,
+        vertical_scale: f64,
+        horizontal: f64,
+        vertical: f64,
+        floor: f64,
+    },
+    Canyon(Box<PlannedCanyon>),
+}
 use horizon_core::{
     carving::{CarveError, CarverOutput, can_reach, carve_ellipsoid_with_budget},
     geometry::trig::{cos, sin},
@@ -185,6 +213,132 @@ impl CaveCarver {
         }
         Ok(true)
     }
+    /// The draws of `carve` that do not depend on the target, in the same order, appended to `out`.
+    /// An error is one `carve` would also return (before or while carving).
+    pub fn plan(
+        &self,
+        context: WorldGenerationContext,
+        random: &mut impl RandomSource,
+        origin: ChunkPos,
+        out: &mut Vec<PlannedCarve>,
+    ) -> Result<(), CarverError<std::convert::Infallible>> {
+        let count = self.count.sample(random)?;
+        if count > 4096 {
+            return Err(CarverError::IterationLimit);
+        }
+        for _ in 0..count {
+            let x = f64::from(
+                origin
+                    .x
+                    .wrapping_shl(4)
+                    .wrapping_add(random.next_int_bound(16)?),
+            );
+            let y = f64::from(self.y.sample(random, context)?);
+            let z = f64::from(
+                origin
+                    .z
+                    .wrapping_shl(4)
+                    .wrapping_add(random.next_int_bound(16)?),
+            );
+            let horizontal = f64::from(self.horizontal_radius_multiplier.sample(random));
+            let vertical = f64::from(self.vertical_radius_multiplier.sample(random));
+            let start_vertical = f64::from(self.start_vertical_radius_multiplier.sample(random));
+            let floor = f64::from(self.floor_level.sample(random));
+            let mut tunnels = 1;
+            if random.next_int_bound(4)? == 0 {
+                let multiplier = f64::from(self.room_vertical_radius_multiplier.sample(random));
+                let thickness = 1. + random.next_float() * 6.;
+                let radius =
+                    1.5 + f64::from(sin(f64::from(std::f32::consts::FRAC_PI_2)) * thickness);
+                out.push(PlannedCarve::Room {
+                    center: [x + 1., y, z],
+                    horizontal: radius,
+                    vertical: radius * multiplier,
+                    floor,
+                });
+                tunnels += random.next_int_bound(4)?;
+            }
+            for _ in 0..tunnels {
+                let yaw = random.next_float() * std::f32::consts::TAU;
+                let pitch = (random.next_float() - 0.5) / 4.;
+                let mut thickness = self.thickness.sample(random);
+                if self.weird_thickness_bias && random.next_int_bound(10)? == 0 {
+                    thickness *= random.next_float() * random.next_float() * 3. + 1.;
+                }
+                let end = 112 - random.next_int_bound(28)?;
+                out.push(PlannedCarve::Tunnel {
+                    seed: random.next_long(),
+                    position: [x, y, z],
+                    thickness,
+                    yaw,
+                    pitch,
+                    end,
+                    vertical_scale: start_vertical,
+                    horizontal,
+                    vertical,
+                    floor,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+/// Carve planned cave items for a target with one budget, as `CaveCarver::carve` would.
+pub(crate) fn execute_cave<O: CarverOutput>(
+    items: &[PlannedCarve],
+    target: ChunkPos,
+    output: &mut O,
+    budget: &mut usize,
+) -> Result<(), CarverError<O::Error>> {
+    for item in items {
+        match *item {
+            PlannedCarve::Room {
+                center,
+                horizontal,
+                vertical,
+                floor,
+            } => CaveRun {
+                target,
+                output: &mut *output,
+                budget: &mut *budget,
+                horizontal: 1.,
+                vertical: 1.,
+                floor,
+            }
+            .ellipsoid(center, horizontal, vertical)?,
+            PlannedCarve::Tunnel {
+                seed,
+                position,
+                thickness,
+                yaw,
+                pitch,
+                end,
+                vertical_scale,
+                horizontal,
+                vertical,
+                floor,
+            } => CaveRun {
+                target,
+                output: &mut *output,
+                budget: &mut *budget,
+                horizontal,
+                vertical,
+                floor,
+            }
+            .tunnel(Tunnel {
+                seed,
+                position,
+                thickness,
+                yaw,
+                pitch,
+                start: 0,
+                end,
+                vertical_scale,
+            })?,
+            PlannedCarve::Canyon(_) => return Err(CarverError::InvalidBounds),
+        }
+    }
+    Ok(())
 }
 struct CaveRun<'a, O: CarverOutput> {
     target: ChunkPos,

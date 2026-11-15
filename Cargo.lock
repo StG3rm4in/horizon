@@ -1670,6 +1670,7 @@ dependencies = [
  "horizon-client-input",
  "horizon-command",
  "horizon-core",
+ "horizon-gpu",
  "horizon-hdr",
  "horizon-hooks",
  "horizon-items",

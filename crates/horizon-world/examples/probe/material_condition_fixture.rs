@@ -323,6 +323,7 @@ fn rule(
                 channel: Some(2),
             }),
             positive_y: [i32::MIN, i32::MAX],
+            roots: None,
         },
         "if" => MaterialRule::Condition {
             if_true: condition(&v[1], registry),

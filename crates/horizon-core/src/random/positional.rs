@@ -8,6 +8,11 @@ pub trait PositionalRandom {
     fn from_seed(&self, seed: i64) -> Self::Source;
     fn from_hash_of(&self, name: &str) -> Self::Source;
     fn from_hash_of_utf16(&self, name: &[u16]) -> Self::Source;
+    /// The (lo, hi) state of a Xoroshiro factory, for samplers evaluated
+    /// elsewhere (the GPU fork); `None` for every other factory.
+    fn xoroshiro_state(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +56,9 @@ impl XoroshiroPositionalRandom {
 }
 impl PositionalRandom for XoroshiroPositionalRandom {
     type Source = XoroshiroRandom;
+    fn xoroshiro_state(&self) -> Option<(u64, u64)> {
+        Some((self.lo, self.hi))
+    }
     fn at(&self, position: BlockPos) -> Self::Source {
         XoroshiroRandom::from_state(position_seed(position) as u64 ^ self.lo, self.hi)
     }

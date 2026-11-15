@@ -195,6 +195,36 @@ impl Game<'_> {
             task.moved = Instant::now();
         }
         streaming.set_band(task.pregen.band());
+        // HORIZON_PREGEN_TRACE: each stage's average over a second, and how often the workers' queue
+        // was empty, in the log.
+        if std::env::var_os("HORIZON_PREGEN_TRACE").is_some() {
+            use std::sync::Mutex;
+            static TRACE: Mutex<Option<(Instant, u64, [u64; 7], u64)>> = Mutex::new(None);
+            let mut t = TRACE.lock().unwrap();
+            let (since, n, sums, empty) = t.get_or_insert_with(|| (Instant::now(), 0, [0; 7], 0));
+            let stages = streaming.stages();
+            *n += 1;
+            for (sum, (_, v)) in sums.iter_mut().zip(stages) {
+                *sum += v as u64;
+            }
+            *empty += u64::from(stages[0].1 == 0);
+            if since.elapsed() >= Duration::from_secs(1) {
+                let avg: Vec<String> = stages
+                    .iter()
+                    .zip(sums.iter())
+                    .map(|((name, _), sum)| format!("{name} {:.1}", *sum as f64 / *n as f64))
+                    .collect();
+                log::info!(
+                    "pregen trace: row {} done {} ; {} ; queue empty {:.0} % of {} updates",
+                    task.pregen.row(),
+                    task.pregen.done,
+                    avg.join(", "),
+                    100.0 * *empty as f64 / *n as f64,
+                    n
+                );
+                *t = None;
+            }
+        }
         if task.moved.elapsed() >= STALL {
             // Nothing advanced for a while: say what the first row waits
             // for, and queue light again for chunks that lost their job.

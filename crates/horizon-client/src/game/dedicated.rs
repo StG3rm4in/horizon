@@ -487,6 +487,25 @@ pub(super) fn preflight(options: &mut Options) -> Result<bool> {
             ),
         );
     }
+    // `horizon-region-deflate-level` (server.toml's `[world] region_deflate_level`): the deflate level of
+    // the region files written in deflate or gzip. Absent: 6, as vanilla; invalid: logged, 6 stays.
+    if let Some(text) = props
+        .raw
+        .get(horizon_world::compression::DEFLATE_LEVEL_PROPERTY)
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        && !text
+            .parse::<u32>()
+            .is_ok_and(horizon_world::compression::Compression::configure_deflate_level)
+    {
+        log(
+            "ERROR",
+            &format!(
+                "Invalid `{}` value `{text}` in server.properties. Please use a number from 0 to 9",
+                horizon_world::compression::DEFLATE_LEVEL_PROPERTY
+            ),
+        );
+    }
     let eula_file = PathBuf::from("eula.txt");
     let agreed = match eula::agreed(&eula_file) {
         Ok(a) => a,

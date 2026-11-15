@@ -226,6 +226,35 @@ fn palette_ids(values: &[u32]) -> (Vec<u32>, Vec<u32>) {
     (palette, ids)
 }
 /// Words holding `ids` in `bits`-wide slots.
+/// The `entries` ids of `src` (`src_bits` wide) through `f`, packed `bits` wide. Four bits to four
+/// bits, the usual widths, maps the two entries of a byte with one table look-up.
+fn remap_words(src_bits: u8, src: &[u64], bits: u8, entries: usize, f: impl Fn(u32) -> u32) -> Vec<u64> {
+    if src_bits == 4 && bits == 4 && src.len() * 16 == entries {
+        let mut table = [0u8; 256];
+        for (b, t) in table.iter_mut().enumerate() {
+            *t = (f((b & 15) as u32) as u8 & 15) | ((f((b >> 4) as u32) as u8 & 15) << 4);
+        }
+        return src
+            .iter()
+            .map(|&w| {
+                let mut o = 0u64;
+                for k in 0..8 {
+                    o |= u64::from(table[((w >> (8 * k)) & 0xFF) as usize]) << (8 * k);
+                }
+                o
+            })
+            .collect();
+    }
+    let mut out = vec![0u64; storage_len(bits, entries)];
+    let per = 64 / usize::from(src_bits.max(1));
+    let m = mask(src_bits);
+    for i in 0..entries {
+        let (w, sh) = (i / per, (i % per) * usize::from(src_bits));
+        let id = src.get(w).map_or(0, |&word| ((word >> sh) & m) as u32);
+        write(&mut out, bits, i, f(id));
+    }
+    out
+}
 fn pack_words(bits: u8, entries: usize, ids: impl Iterator<Item = u32>) -> Vec<u64> {
     let mut words = vec![0u64; storage_len(bits, entries)];
     for (i, id) in ids.enumerate() {
@@ -233,6 +262,13 @@ fn pack_words(bits: u8, entries: usize, ids: impl Iterator<Item = u32>) -> Vec<u
     }
     words
 }
+/// HORIZON_PACK_TEST=1: `pack` works out every packed form in full too, and compares.
+fn pack_test() -> bool {
+    static TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TEST.get_or_init(|| std::env::var_os("HORIZON_PACK_TEST").is_some())
+}
+static PACK_TESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PACK_MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The saved form: distinct values in index order, and the packed indices
 /// when there is more than one value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,12 +285,17 @@ pub struct PalettedContainer {
     bits: u8,
     palette: Palette,
     words: Vec<u64>,
+    /// Built by `from_values` or `from_mapped`, and not written since (`set` clears it): its palette
+    /// lists every value it holds, in the order they first occur, and its words are those `pack`
+    /// would encode, so it is its own packed form.
+    packed: bool,
 }
 impl PalettedContainer {
     /// `new PalettedContainer(initialValue, strategy)`.
     pub fn new(strategy: Strategy, value: u32) -> Self {
         Self {
             strategy,
+            packed: false,
             bits: 0,
             palette: Palette::Single(value),
             words: Vec::new(),
@@ -270,6 +311,10 @@ impl PalettedContainer {
     /// What the stored ids stand for — the values of the list palette, `None`
     /// for a single value (`uniform()`) and for the global palette, whose
     /// stored ids are the values.
+    /// The packed entries: `64 / bits` per word, from the low bits (none for a single value).
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
     pub fn palette(&self) -> Option<&[u32]> {
         match &self.palette {
             Palette::List(list) => Some(list),
@@ -398,6 +443,7 @@ impl PalettedContainer {
     }
     /// `getAndSet`: stores `value` and returns the previous one.
     pub fn set(&mut self, i: usize, value: u32) -> u32 {
+        self.packed = false;
         let id = self.id_for(value);
         match &self.palette {
             Palette::Single(old) => *old,
@@ -570,7 +616,45 @@ impl PalettedContainer {
     pub fn from_values(strategy: Strategy, values: &[u32]) -> Self {
         assert_eq!(values.len(), strategy.entries());
         let (palette, ids) = palette_ids(values);
-        Self::build(strategy, palette, &ids)
+        let mut container = Self::build(strategy, palette, &ids);
+        container.packed = true;
+        container
+    }
+    /// `from_values` for entries held as ids (`src_bits` wide, in the same padded words) that `map`
+    /// takes to `palette` indices. `palette` lists the distinct values in the order they first occur,
+    /// as `from_values` finds them, so the container is the one `from_values` builds, word for word.
+    pub fn from_mapped(
+        strategy: Strategy,
+        palette: Vec<u32>,
+        src_bits: u8,
+        src_words: &[u64],
+        map: &[u32],
+    ) -> Self {
+        let entries = strategy.entries();
+        let id = |i: u32| map.get(i as usize).copied().unwrap_or(0);
+        match strategy.config(ceil_log2(palette.len())) {
+            Config::Single => Self::new(strategy, palette[0]),
+            Config::List(bits) => Self {
+                strategy,
+                packed: true,
+                bits,
+                words: remap_words(src_bits, src_words, bits, entries, id),
+                palette: Palette::List(palette),
+            },
+            Config::Global => {
+                let bits = strategy.global_bits;
+                let words = remap_words(src_bits, src_words, bits, entries, |i| {
+                    palette.get(id(i) as usize).copied().unwrap_or(0)
+                });
+                Self {
+                    strategy,
+                    packed: false,
+                    bits,
+                    words,
+                    palette: Palette::Global,
+                }
+            }
+        }
     }
     /// A container over a distinct-value `palette` and an id per entry.
     fn build(strategy: Strategy, palette: Vec<u32>, ids: &[u32]) -> Self {
@@ -579,6 +663,7 @@ impl PalettedContainer {
             Config::Single => Self::new(strategy, palette[0]),
             Config::List(bits) => Self {
                 strategy,
+                packed: false,
                 bits,
                 words: pack_words(bits, ids.len(), ids.iter().copied()),
                 palette: Palette::List(palette),
@@ -587,6 +672,7 @@ impl PalettedContainer {
                 let bits = strategy.global_bits;
                 Self {
                     strategy,
+                    packed: false,
                     bits,
                     words: pack_words(bits, ids.len(), ids.iter().map(|&id| palette[id as usize])),
                     palette: Palette::Global,
@@ -625,6 +711,7 @@ impl PalettedContainer {
                 }
                 let container = Self {
                     strategy,
+                    packed: false,
                     bits,
                     palette: Palette::List(palette),
                     words,
@@ -634,6 +721,7 @@ impl PalettedContainer {
             }
             Config::Global => Ok(Self {
                 strategy,
+                packed: false,
                 bits: storage_bits,
                 palette: Palette::Global,
                 words,
@@ -718,6 +806,47 @@ impl PalettedContainer {
                 data: None,
             };
         }
+        // A list container `from_values` or `from_mapped` built, not written since, is its own
+        // packed form: `build` encodes the first-occurrence ids at the width `pack` picks, with
+        // `pack_words` as here. HORIZON_PACK_TEST=1 also packs it in full and compares.
+        if self.packed
+            && let Palette::List(list) = &self.palette
+        {
+            let fast = Packed {
+                palette: list.clone(),
+                bits: self.bits,
+                data: Some(self.words.clone()),
+            };
+            if pack_test() {
+                let full = self.pack_full(entries);
+                let n = PACK_TESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if full != fast {
+                    let m = PACK_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if m <= 8 {
+                        eprintln!("pack test: mismatch (bits {} / {}, palette {} / {})", fast.bits, full.bits, fast.palette.len(), full.palette.len());
+                    }
+                    return full;
+                }
+                if n.is_power_of_two() {
+                    eprintln!(
+                        "pack test: {n} containers, {} mismatches",
+                        PACK_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed)
+                    );
+                }
+            }
+            return fast;
+        }
+        self.pack_full(entries)
+    }
+    /// `pack` from the values: unpack, palette in first-occurrence order, ids at the saved width.
+    fn pack_full(&self, entries: usize) -> Packed {
+        if let Some(value) = self.uniform() {
+            return Packed {
+                palette: vec![value],
+                bits: 0,
+                data: None,
+            };
+        }
         let mut values = vec![0u32; entries];
         self.unpack(&mut values);
         let (palette, ids) = palette_ids(&values);
@@ -765,6 +894,7 @@ impl PalettedContainer {
             // Validate them without allocating an unpacked copy that is unused.
             let container = Self {
                 strategy,
+                packed: false,
                 bits,
                 words: data.to_vec(),
                 palette: Palette::List(palette),
@@ -867,6 +997,39 @@ impl PartialEq for PalettedContainer {
 
 #[cfg(test)]
 mod tests {
+    /// `pack`'s shortcut for a container `from_values` or `from_mapped` built gives what packing
+    /// it in full gives; a write takes the shortcut away.
+    #[test]
+    fn packed_containers_pack_as_in_full() {
+        use super::*;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for strategy in [Strategy::blocks(15), Strategy::biomes(6)] {
+            let entries = strategy.entries();
+            for distinct in [2u64, 3, 5, 16, 17, 40, 200, 300] {
+                let values: Vec<u32> = (0..entries).map(|_| next(distinct) as u32 * 7 + 1).collect();
+                let container = PalettedContainer::from_values(strategy, &values);
+                assert_eq!(container.pack(), container.pack_full(entries), "{distinct} values");
+                let mut written = container.clone();
+                written.set(0, 12345);
+                assert!(!written.packed);
+                assert_eq!(written.pack(), written.pack_full(entries));
+                // from_mapped: the same container from 8-bit ids
+                let (palette, ids) = palette_ids(&values);
+                if palette.len() <= 256 {
+                    let src = pack_words(8, entries, ids.iter().copied());
+                    let map: Vec<u32> = (0..256).collect();
+                    let mapped = PalettedContainer::from_mapped(strategy, palette, 8, &src, &map);
+                    assert_eq!(mapped.pack(), mapped.pack_full(entries), "mapped {distinct}");
+                }
+            }
+        }
+    }
     use super::*;
     const BLOCKS: Strategy = Strategy::blocks(16);
     const BIOMES: Strategy = Strategy::biomes(7);
@@ -1119,6 +1282,7 @@ mod tests {
         }
         fn compare(strategy: Strategy, bits: u8, len: usize, words: &[u64], what: &str) {
             let container = PalettedContainer {
+                packed: false,
                 strategy,
                 bits,
                 palette: Palette::List((0..len as u32).collect()),
@@ -1232,6 +1396,7 @@ mod tests {
             }
             Ok(match config {
                 Config::List(bits) => PalettedContainer {
+                    packed: false,
                     strategy,
                     bits,
                     palette: Palette::List(palette),
@@ -1539,6 +1704,7 @@ mod tests {
         let per = 64 / width;
         let pattern = (0..per).fold(0u64, |word, slot| word | u64::from(value) << (slot * width));
         PalettedContainer {
+            packed: false,
             strategy: BLOCKS,
             bits,
             palette: Palette::Global,

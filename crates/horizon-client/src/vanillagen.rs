@@ -417,11 +417,49 @@ impl VanillaTerrain {
                 continue;
             }
             let mut any = false;
-            // A whole generated section is read in one pass (it runs on the
-            // server thread for every light view); a partly generated one
-            // block by block.
-            if base >= lo && base + 16 <= hi && chunk.terrain.section_states(base, &mut values) {
-                any = values.iter().any(|&id| id != 0);
+            // A whole generated section is converted as it is stored, without unpacking its states
+            // (it runs on the server thread for every light view); a partly generated one block by
+            // block.
+            // HORIZON_COLUMN=values: the states unpacked and converted as before (banc).
+            static PAR_VALEURS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let par_valeurs = *PAR_VALEURS
+                .get_or_init(|| std::env::var("HORIZON_COLUMN").as_deref() == Ok("values"));
+            if par_valeurs && base >= lo && base + 16 <= hi && chunk.terrain.section_states(base, &mut values) {
+                if values.iter().any(|&id| id != 0) {
+                    Arc::make_mut(&mut out.sections[si as usize]).blocks = Section::from_blocks(&values);
+                }
+                continue;
+            }
+            if base >= lo
+                && base + 16 <= hi
+                && let Some(blocks) = chunk
+                    .terrain
+                    .section_container(base, crate::chunk::block_strategy())
+            {
+                // HORIZON_COLUMN_TEST=1: the states unpacked and converted as before, compared word for word.
+                static TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TEST.get_or_init(|| std::env::var_os("HORIZON_COLUMN_TEST").is_some())
+                    && chunk.terrain.section_states(base, &mut values)
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+                    static SECTIONS: AtomicU64 = AtomicU64::new(0);
+                    static ECARTS: AtomicU64 = AtomicU64::new(0);
+                    let before = Section::from_blocks(&values);
+                    if before.to_wire() != blocks.to_wire() {
+                        ECARTS.fetch_add(1, Relaxed);
+                    }
+                    let n = SECTIONS.fetch_add(1, Relaxed) + 1;
+                    if n.is_power_of_two() && n >= 1024 {
+                        log::info!(
+                            "column test: {n} sections converted, {} differ from from_values",
+                            ECARTS.load(Relaxed)
+                        );
+                    }
+                }
+                if blocks.uniform() != Some(0) {
+                    Arc::make_mut(&mut out.sections[si as usize]).blocks = blocks;
+                }
+                continue;
             } else {
                 values.fill(0);
                 for y in base.max(lo)..(base + 16).min(hi) {

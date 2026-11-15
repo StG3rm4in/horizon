@@ -92,9 +92,12 @@ impl<S: MaterialSurfaceQueries> MaterialDensitySources<S> {
         let plane = DensityVolume::new([1; 3], [position[0], 0, position[2]], [1; 3])
             .map_err(|_| DecodeError::Field("material preliminary plane"))?;
         self.expected = volume;
+        // The plane is sampled lazily at a new x/z. The cells a carver restores follow each other
+        // down a column: the same plane gives the same values, so they are kept.
+        if plane.minimum() != self.plane.minimum() || plane.sizes() != self.plane.sizes() {
+            self.buffer = None;
+        }
         self.plane = plane;
-        // The plane is sampled lazily at the new x/z.
-        self.buffer = None;
         let mut sampled = vec![false; self.buffers.len()];
         let mut pending = Vec::new();
         for bound in &self.densities {

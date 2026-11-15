@@ -168,6 +168,25 @@ impl Beardifier {
         self.kernel_junctions = junctions;
         self
     }
+    /// Its components (the GPU fork evaluates them elsewhere): rigid pieces,
+    /// junctions, terrain-kernel pieces and junctions, and the affected box.
+    pub fn parts(
+        &self,
+    ) -> (
+        &[RigidPiece],
+        &[JigsawJunction],
+        &[KernelPiece],
+        &[KernelJunction],
+        Option<StructureBounds>,
+    ) {
+        (
+            &self.pieces,
+            &self.junctions,
+            &self.kernel_pieces,
+            &self.kernel_junctions,
+            self.affected,
+        )
+    }
     fn sample_unchecked(&self, [x, y, z]: [i32; 3]) -> f32 {
         let mut value = 0.;
         // The kernel is a process-wide constant; resolving it once keeps the
@@ -318,6 +337,10 @@ fn fast_inverse_sqrt(value: f64) -> f64 {
     let bits = 6_910_469_410_427_058_090i64.wrapping_sub((value.to_bits() as i64) >> 1);
     let estimate = f64::from_bits(bits as u64);
     estimate * (1.5 - half * estimate * estimate)
+}
+/// Vanilla's beard kernel: 24 x 24 x 24 weights, z then x then y.
+pub fn beard_kernel() -> &'static [f32; 13824] {
+    kernel()
 }
 fn kernel() -> &'static [f32; 13824] {
     static KERNEL: OnceLock<[f32; 13824]> = OnceLock::new();

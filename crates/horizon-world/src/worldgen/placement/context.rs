@@ -72,6 +72,37 @@ pub trait PlacementContext {
     ) -> Result<(), PlacementQueryError> {
         Err(PlacementQueryError::Unavailable)
     }
+    /// Raw section writes along one row of cells: for each set bit `i` of `bits`, the cell
+    /// `[x, y, z + i]` is skipped unless it may be written (`ensure_can_write`) and has a section
+    /// state (`section_block`); `cell` is given its state and the state it returns, if any, is
+    /// written (`set_section_block`). Whether a cell was written.
+    fn replace_row(
+        &mut self,
+        [x, y, z]: [i32; 3],
+        bits: u32,
+        cell: &mut dyn FnMut(
+            [i32; 3],
+            crate::registry::BlockStateId,
+        ) -> Option<crate::registry::BlockStateId>,
+    ) -> Result<bool, PlacementQueryError> {
+        let mut wrote = false;
+        let mut bits = bits;
+        while bits != 0 {
+            let p = [x, y, z.wrapping_add(bits.trailing_zeros() as i32)];
+            bits &= bits - 1;
+            if !self.ensure_can_write(p)? {
+                continue;
+            }
+            let Some(state) = self.section_block(p)? else {
+                continue;
+            };
+            if let Some(new) = cell(p, state) {
+                self.set_section_block(p, new)?;
+                wrote = true;
+            }
+        }
+        Ok(wrote)
+    }
     /// ChunkAccess.setBlockState(pos, state, false) in generation (a
     /// ProtoChunk write with its heightmaps, no neighbour or block-entity
     /// effects), as mods' structure processors write past their template.

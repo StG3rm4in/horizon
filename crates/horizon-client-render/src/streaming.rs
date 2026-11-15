@@ -811,11 +811,133 @@ struct WorkerLocal<W> {
     faces: Option<(Arc<MeshTables>, FaceVisibility)>,
     mesh_scratch: MeshScratch,
 }
+/// HORIZON_GPU_LIGHT=1 (or `test`, which checks every chunk against `light_chunk`): chunk light
+/// on the GPU. A light job sends its region and returns at once; a thread of its own waits for the
+/// jobs in turn and sends `Done::Lit` as the job would have. A job the GPU cannot take (all its
+/// buffers busy, an unexpected column) is lit on the CPU as before.
+struct GpuLighting {
+    gpu: std::sync::OnceLock<Option<Arc<horizon_gpu::LightGpu>>>,
+    send: Mutex<std::sync::mpsc::Sender<PendingLight>>,
+}
+struct PendingLight {
+    x: i32,
+    z: i32,
+    seq: u64,
+    sky: bool,
+    region: Box<Region>,
+    job: horizon_gpu::LightJob,
+    gpu: Arc<horizon_gpu::LightGpu>,
+}
+/// The same light as `light_chunk` gives: the same kind of storage and the same values.
+fn same_column_light(a: &[crate::chunk::Light], b: &[crate::chunk::Light]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(a, b)| std::mem::discriminant(a) == std::mem::discriminant(b) && a.same_as(b))
+}
+impl GpuLighting {
+    fn from_env(shared: Arc<Shared>, tables: Arc<LightTables>) -> Option<Arc<Self>> {
+        let test = match std::env::var("HORIZON_GPU_LIGHT").as_deref() {
+            Ok("1") => false,
+            Ok("test") => true,
+            _ => return None,
+        };
+        let (send, recv) = std::sync::mpsc::channel::<PendingLight>();
+        std::thread::Builder::new()
+            .name("horizon-gpu-light".into())
+            .spawn(move || {
+                for mut p in recv {
+                    let gpu = p.gpu.clone();
+                    let mut lights = if gpu.wait(&mut p.job) {
+                        gpu.sections(&p.job)
+                            .and_then(|s| crate::light::lights_from_gpu(&s))
+                    } else {
+                        None
+                    };
+                    gpu.finish(p.job);
+                    if test || lights.is_none() {
+                        let cpu = light_chunk(&borrow(&p.region), &tables, p.sky);
+                        match &lights {
+                            Some(g) if same_column_light(g, &cpu) => {}
+                            Some(_) => {
+                                gpu.note_mismatch();
+                                lights = Some(cpu);
+                            }
+                            None => {
+                                gpu.note_cpu_fallback();
+                                lights = Some(cpu);
+                            }
+                        }
+                    }
+                    drop(p.region);
+                    shared.done.send(Done::Lit(p.x, p.z, lights.unwrap(), p.seq));
+                }
+            })
+            .ok()?;
+        Some(Arc::new(Self {
+            gpu: std::sync::OnceLock::new(),
+            send: Mutex::new(send),
+        }))
+    }
+    /// Send a light job to the GPU; the region comes back when the GPU does not take it.
+    fn submit(
+        &self,
+        x: i32,
+        z: i32,
+        region: Box<Region>,
+        seq: u64,
+        sky: bool,
+        tables: &LightTables,
+    ) -> Result<(), Box<Region>> {
+        let Some(sections) = region[1][1].as_ref().map(|c| c.sections.len()) else {
+            return Err(region);
+        };
+        let gpu = self.gpu.get_or_init(|| {
+            let (info, masks, types) = tables.gpu_tables();
+            match horizon_gpu::LightGpu::new(info, masks, types, sections) {
+                Ok(g) => Some(Arc::new(g)),
+                Err(e) => {
+                    log::error!("GPU lumiere : pas de lumiere sur GPU : {e}");
+                    None
+                }
+            }
+        });
+        let Some(gpu) = gpu else {
+            return Err(region);
+        };
+        if gpu.section_count() != sections {
+            gpu.note_cpu_fallback();
+            return Err(region);
+        }
+        let job = match crate::light::gpu_light_submit(gpu, &borrow(&region), tables, sky) {
+            Ok(job) => job,
+            Err(_) => {
+                gpu.note_cpu_fallback();
+                return Err(region);
+            }
+        };
+        let pending = PendingLight {
+            x,
+            z,
+            seq,
+            sky,
+            region,
+            job,
+            gpu: gpu.clone(),
+        };
+        self.send.lock().unwrap().send(pending).map_err(|e| {
+            let p = e.0;
+            p.gpu.finish(p.job);
+            p.region
+        })
+    }
+}
 /// A streamer's jobs, run by the process's shared pool (`horizon_threads::jobs`).
 struct Jobs<G: ChunkGenerator> {
     shared: Arc<Shared>,
     generator: Arc<G>,
     light: Arc<LightTables>,
+    light_gpu: Option<Arc<GpuLighting>>,
     locals: PerWorker<WorkerLocal<G::Worker>>,
 }
 impl<G: ChunkGenerator> Source for Jobs<G> {
@@ -994,6 +1116,13 @@ impl<G: ChunkGenerator> Jobs<G> {
                 return None;
             }
             Job::Light(x, z, region, seq, sky) => {
+                let region = match &self.light_gpu {
+                    Some(gpu) => match gpu.submit(x, z, region, seq, sky, light) {
+                        Ok(()) => return None,
+                        Err(region) => region,
+                    },
+                    None => region,
+                };
                 Done::Lit(x, z, light_chunk(&borrow(&region), light, sky), seq)
             }
             Job::Mesh(x, sy, z, region, seq, settings) => {
@@ -1067,6 +1196,7 @@ impl Streaming {
             shared: shared.clone(),
             generator: generator.clone(),
             light: context.light.clone(),
+            light_gpu: GpuLighting::from_env(shared.clone(), context.light.clone()),
             locals: horizon_threads::jobs::PerWorker::new(pool.threads()),
         });
         let jobs = pool.register(source);
@@ -2432,9 +2562,21 @@ impl Streaming {
             _ => band.z0 - REACH,
         };
         let end = band.z1 + REACH;
+        // Each row in three passes, every third column a pass. Ranked column after column
+        // (HORIZON_PREGEN_ORDER=rows), a row decorates one chunk after another (each waits for the
+        // one before it, within two): a band of a few rows ran five or six decorations at a time.
+        // Chunks three apart share no write region, so a pass decorates in parallel.
+        let passes = match std::env::var("HORIZON_PREGEN_ORDER").as_deref() {
+            Ok("rows") => 1,
+            _ => 3,
+        };
         for z in first..=end {
-            for x in x0..=x1 {
-                self.decoration_order.rank_or_append(x, z);
+            for pass in 0..passes {
+                let mut x = x0 + pass;
+                while x <= x1 {
+                    self.decoration_order.rank_or_append(x, z);
+                    x += passes;
+                }
             }
         }
         self.band_ranked = Some((x0, x1, end.max(first - 1) + 1));

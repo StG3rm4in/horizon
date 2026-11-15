@@ -353,6 +353,26 @@ impl<T> ClimateIndex<T> {
         walk(&self.links, 0, &mut result);
         result
     }
+    /// The search tree for another searcher (the GPU's biomes), in this
+    /// index's node order, root at 0: per node, its six intervals' minimums,
+    /// then their maximums, then the squared distance of its offset; and per
+    /// node its first child and child count, or its entry and 0 for a leaf.
+    pub fn tree(&self) -> (Vec<[i64; 13]>, &[(u32, u32)]) {
+        let spaces = self
+            .spaces
+            .iter()
+            .map(|space| {
+                let mut row = [0; 13];
+                for (axis, parameter) in space.coordinates.iter().enumerate() {
+                    row[axis] = parameter.min;
+                    row[6 + axis] = parameter.max;
+                }
+                row[12] = space.offset;
+                row
+            })
+            .collect();
+        (spaces, &self.links)
+    }
     /// Vanilla's `SubTree.search` below `id`, whose best leaf so far is `best`
     /// at distance `fitness` (`i64::MAX` with none), returning the best leaf
     /// and its distance. Vanilla measures the best leaf again in every subtree

@@ -29,6 +29,9 @@ pub enum MaterialRule {
         /// the vein places nothing there (`DensityGraph::positive_y_bounds`);
         /// `[i32::MIN, i32::MAX]` when unknown.
         positive_y: [i32; 2],
+        /// The graph roots of `density`, `richness` and `filler_gap` (the GPU fork translates them);
+        /// `None` for rules built without a graph.
+        roots: Option<[horizon_core::density::graph::FunctionId; 3]>,
     },
     Sequence(Vec<MaterialRule>),
     Condition {
@@ -120,6 +123,7 @@ impl<R: RandomSource> CompiledRule<R> {
                 richness,
                 filler_gap,
                 positive_y,
+                roots: _,
             } => {
                 let surface = &mut context.surface;
                 let density = surface.bind_density_rows(density, true, positive_y)?;

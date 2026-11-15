@@ -178,8 +178,8 @@ pub fn compress_records_with_pool(
     let compression = Compression::selected();
     let compress = move |record: &Record| {
         record
-            .tag()
-            .map(|tag| ChunkRecord::from_nbt(&tag, compression, timestamp, Limits::saved()))
+            .encoded(Limits::saved())
+            .map(|bytes| bytes.and_then(|bytes| ChunkRecord::from_bytes(&bytes, compression, timestamp)))
             .transpose()
     };
     if count < MIN_PARALLEL_CHUNKS || pool.workers() == 0 {

@@ -38,6 +38,7 @@ seed = ""                    # empty: a random seed on the first start
 game_mode = "survival"       # survival, creative, adventure or spectator
 difficulty = "easy"          # peaceful, easy, normal or hard
 hardcore = false             # one life: a player who dies becomes a spectator
+region_deflate_level = 6     # 0 to 9: how hard deflate region files are compressed; 1 pregenerates ~8 % faster for ~27 % more disk
 
 # Any other server.properties key, spelled as vanilla spells it, for example:
 # spawn-protection = 16
@@ -120,7 +121,7 @@ enabled = true               # false pauses it and keeps the webhook
 "##;
 
 /// Each typed setting: its section, its name, and the vanilla key it writes.
-pub(crate) const TYPED: [(&str, &str, &str); 17] = [
+pub(crate) const TYPED: [(&str, &str, &str); 18] = [
     ("server", "motd", "motd"),
     ("server", "port", "server-port"),
     ("server", "bind", "server-ip"),
@@ -146,6 +147,11 @@ pub(crate) const TYPED: [(&str, &str, &str); 17] = [
     ("world", "game_mode", "gamemode"),
     ("world", "difficulty", "difficulty"),
     ("world", "hardcore", "hardcore"),
+    (
+        "world",
+        "region_deflate_level",
+        "horizon-region-deflate-level",
+    ),
 ];
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -292,6 +298,8 @@ pub struct World {
     pub game_mode: String,
     pub difficulty: String,
     pub hardcore: bool,
+    /// The deflate level of the region files (`horizon-region-deflate-level`): 0 to 9, 6 as vanilla.
+    pub region_deflate_level: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -521,6 +529,7 @@ impl Default for World {
             game_mode: "survival".into(),
             difficulty: "easy".into(),
             hardcore: false,
+            region_deflate_level: 6,
         }
     }
 }
@@ -1079,6 +1088,8 @@ mod tests {
                 let vanilla_like = match key.as_str() {
                     "horizon-admin-feedback-to-ops" => "true",
                     "horizon-accept-older-clients" => "false",
+                    // Deflater.DEFAULT_COMPRESSION, the level vanilla writes its region files at.
+                    "horizon-region-deflate-level" => "6",
                     _ => "0",
                 };
                 assert_eq!(value, vanilla_like, "{key}");

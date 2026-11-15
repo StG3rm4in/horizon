@@ -11,7 +11,7 @@ use super::{
     DecodeError,
     anchor::WorldGenerationContext,
     aquifer::{
-        AquiferConfig, AquiferField, AquiferSamplers, DisabledAquifer, GlobalFluidPicker,
+        AquiferConfig, AquiferField, AquiferSamplers, DisabledAquifer, FluidPicker, GlobalFluidPicker,
         NoiseBasedAquifer, RegistryAquiferBlockStates,
     },
     biome::BiomeId,
@@ -19,8 +19,8 @@ use super::{
     biome_chunks::BiomeChunks,
     biome_source::{BiomeSourceCatalog, ResolvedBiomeSource},
     biome_temperature::{BiomeTemperature, BiomeTemperatureSettings},
-    carver::{CarverCatalog, WorldCarver, generate_carving_mask},
-    carving::{CarvingBlocks, apply_carving_mask_shared},
+    carver::{CarverCatalog, PlannedCarve, WorldCarver, generate_carving_mask, large_feature_random},
+    carving::{CarvedSubstance, CarvingBlocks, apply_carving_mask_shared, apply_carving_mask_with},
     climate::{ClimateSampler, decode_parameter, quantize},
     decode_noise,
     density::DensityRegistry,
@@ -38,8 +38,10 @@ use super::{
     settings::NoiseSettings,
     spawn_finder::{SpawnTargetPoint, find_spawn_position},
     tags::TagDefinitions,
+    value_provider::FloatProvider,
     terrain::{
-        PreLightChunkStage, TerrainAquifer, TerrainBlockStates, TerrainChunk, fill_noise_with,
+        PreLightChunkStage, TerrainAquifer, TerrainBlockStates, TerrainChunk, check_noise_sections, fill_noise_codes,
+        fill_noise_sections, fill_noise_states, fill_noise_with,
     },
 };
 use crate::{
@@ -48,6 +50,7 @@ use crate::{
 };
 use horizon_core::{
     biome::{BiomeZoom, obfuscate_seed},
+    carving::CarvingMask,
     density::{DensitySampler, LatticeSamples, SamplerContext},
     noise::{DensityVolume, Noise},
     position::{BlockPos, ChunkPos},
@@ -961,6 +964,41 @@ struct Pipeline<R: RandomSource> {
     dimension: String,
     /// final_density on the GPU, for chunks without structures or blending.
     gpu: Option<horizon_gpu::GpuFinalDensity>,
+    /// The surface on the GPU: HORIZON_GPU_SURFACE=1 writes its final states (`surface_integree`),
+    /// HORIZON_GPU_SURFACE_TEST checks them against the CPU surface.
+    surface_gpu: Option<horizon_gpu::SurfaceGpu>,
+    surface_integree: bool,
+    /// The cells of the ores' blobs on the GPU (HORIZON_GPU_ORES=1, or `test` to check them
+    /// against the CPU's).
+    ores_gpu: Option<horizon_gpu::OreGpu>,
+    /// The carvers' masks traced on the GPU, with the aquifer's substance of their cells
+    /// (HORIZON_GPU_CAVES=1, or `test` to check both against the CPU's).
+    caves_gpu: Option<horizon_gpu::CaveGpu>,
+    caves_test: bool,
+    /// The carvers each origin chunk starts, planned once for every target (`WorldCarver::plan`),
+    /// by blocks of 8 x 8 origins.
+    carver_plans: Mutex<HashMap<(i32, i32), Arc<OriginBlock>>>,
+    /// HORIZON_GPU_SECTIONS: the GPU builds the fill's compact sections (1), or also sends the states
+    /// to check them against `fill_noise_states` (2); 0: the states, written by the CPU.
+    gpu_sections: u8,
+    /// Per registry state, what the GPU's sections read (`TerrainChunk::section_flags`).
+    section_flags: OnceLock<Vec<u8>>,
+    /// The biomes of multi-noise chunks on the GPU, by regions (HORIZON_GPU_BIOMES=1, or `test` to
+    /// check each chunk against the CPU's).
+    biomes_gpu: Option<horizon_gpu::BiomeGpu>,
+    biomes_test: bool,
+    biome_regions: Mutex<GpuBiomeRegions>,
+}
+/// The planned carvers of 8 x 8 origin chunks (key: origin x >> 3, z >> 3), at (x & 7) * 8 + (z & 7).
+struct OriginBlock {
+    plans: Vec<OriginCarvers>,
+}
+/// The carvers an origin chunk starts, in `generate_carving_mask`'s order, planned without a
+/// target: one call per started carver.
+struct OriginCarvers {
+    calls: Vec<(Arc<WorldCarver>, Vec<PlannedCarve>)>,
+    /// A plan failed (or too many carvers): only the CPU path reproduces the error.
+    error: bool,
 }
 /// `FlatLevelGeneratorSettings.getLayers` as `FlatLevelSource` reads them: the states from the
 /// level's minimum Y up, with the layers `adjustGenerationSettings` replaced by `null`
@@ -1032,6 +1070,22 @@ impl ChunkWork {
 }
 
 type BiomeCache = Mutex<BiomeChunks>;
+/// A region of the GPU's biomes ([`horizon_gpu::BiomeGpu::region`]), computed by the first worker
+/// that needs one of its chunks: per chunk, its quarts' biome ids in fill order; None if the GPU
+/// failed.
+#[derive(Default)]
+struct GpuBiomeRegion {
+    done: OnceLock<Option<Arc<Vec<u32>>>>,
+    work: Mutex<()>,
+}
+/// The regions of the GPU's biomes, the oldest first: at most [`GPU_BIOME_REGIONS`]. A chunk is read
+/// from its region once, then from the biome cache; a region dropped too soon is only computed again.
+#[derive(Default)]
+struct GpuBiomeRegions {
+    slots: HashMap<(i32, i32), Arc<GpuBiomeRegion>>,
+    order: std::collections::VecDeque<(i32, i32)>,
+}
+const GPU_BIOME_REGIONS: usize = 128;
 type LatticeCache = Mutex<HashMap<(i32, i32), Arc<Vec<LatticeSamples>>>>;
 /// ~33 KB a chunk in To The Max; misses only resample.
 const LATTICE_CACHE_LIMIT: usize = 1024;
@@ -1129,7 +1183,29 @@ where
             settings.legacy,
         )?;
         let final_density_id = router.function(RouterField::FinalDensity);
+        let surface_level_id = router.function(RouterField::ChunkSurfaceLevel);
+        // The six climate roots, for the biomes on the GPU.
+        let climate_roots = [
+            RouterField::Temperature,
+            RouterField::Vegetation,
+            RouterField::Continents,
+            RouterField::Erosion,
+            RouterField::Depth,
+            RouterField::Ridges,
+        ]
+        .map(|field| router.function(field));
         let router = library.compile_router(router)?;
+        // The aquifers too, when their positional factory is a Xoroshiro one.
+        let gpu_aquifer = aquifers.filter(|_| !settings.legacy).map(|config| {
+            let mut random = root.from_hash_of("minecraft:aquifer");
+            let lo = random.next_long() as u64;
+            let hi = random.next_long() as u64;
+            horizon_gpu::AquiferSetup {
+                roots: AquiferField::ALL.map(|field| config.function(field)),
+                positional: (lo, hi),
+                sea_level: settings.sea_level,
+            }
+        });
         let gpu = horizon_gpu::GpuFinalDensity::new(
             library.compiler(),
             final_density_id,
@@ -1143,6 +1219,7 @@ where
                 settings.noise_min_y,
                 settings.noise_min_y + settings.noise_height
             ),
+            gpu_aquifer,
         );
         let debug_density = debug_functions
             .into_iter()
@@ -1236,6 +1313,190 @@ where
             default("minecraft:lava")?,
             default("minecraft:air")?,
         );
+        let mut surface_gpu = None;
+        let surface_test = std::env::var_os("HORIZON_GPU_SURFACE_TEST").is_some();
+        let surface_integree = !surface_test && std::env::var("HORIZON_GPU_SURFACE").is_ok_and(|v| v == "1");
+        if (surface_test || surface_integree) && gpu.is_some() {
+            if surface_test {
+                surface_gpu_test(library.compiler(), &noises, &surface, &root, seed, settings.sea_level);
+            }
+            let generation =
+                WorldGenerationContext::new(settings.noise_min_y, settings.noise_height, settings.sea_level);
+            let mut ir = SurfaceIr {
+                rules: Vec::new(),
+                conditions: Vec::new(),
+                memo: HashMap::new(),
+                noises: Vec::new(),
+                noise_index: HashMap::new(),
+                all_noises: &noises,
+                data: &data,
+                generation,
+                root: &root,
+            };
+            let built = ir.rule(&rule).and_then(|racine| {
+                let state = |r: Option<(u64, u64)>| r.ok_or_else(|| "fabrique non Xoroshiro".to_string());
+                let mut ore = root.from_hash_of("minecraft:ore");
+                let ore = (ore.next_long() as u64, ore.next_long() as u64);
+                let get = |name: &str| noises.get(name).cloned().ok_or_else(|| format!("bruit {name} absent"));
+                let (surf, sec, clay) = (get("minecraft:surface")?, get("minecraft:surface_secondary")?, get("minecraft:clay_bands_offset")?);
+                // Les bruits des extensions, comme MaterialExtensions (Pipeline::new)
+                let bruits_ext = [
+                    "minecraft:badlands_surface",
+                    "minecraft:badlands_pillar",
+                    "minecraft:badlands_pillar_roof",
+                    "minecraft:iceberg_surface",
+                    "minecraft:iceberg_pillar",
+                    "minecraft:iceberg_pillar_roof",
+                ]
+                .map(get);
+                let mut ext = Vec::new();
+                for b in bruits_ext {
+                    ext.push(b?);
+                }
+                let bloc = |name: &str| {
+                    data.registry.default_state(name).map(|b| b.0).ok_or_else(|| format!("bloc {name} absent"))
+                };
+                let mut setup = horizon_gpu::SurfaceSetup {
+                    rules: ir.rules.clone(),
+                    conditions: ir.conditions.clone(),
+                    root: racine,
+                    noises: ir.noises.clone(),
+                    surface_noise: surf.as_ref(),
+                    secondary_noise: sec.as_ref(),
+                    clay_noise: clay.as_ref(),
+                    bands: surface.bands().states().map(|b| b.0),
+                    root_positional: state(root.xoroshiro_state())?,
+                    ore_positional: ore,
+                    surface_level: surface_level_id,
+                    temperatures: data
+                        .temperatures
+                        .iter()
+                        .map(|t| (t.base_temperature, t.modifier == super::biome_temperature::TemperatureModifier::Frozen))
+                        .collect(),
+                    temperature_noises: super::biome_temperature::temperature_noises(),
+                    zoom_seed: horizon_core::biome::obfuscate_seed(seed),
+                    sea_level: settings.sea_level,
+                    min_y: settings.noise_min_y,
+                    height: settings.noise_height,
+                    extensions: Some(horizon_gpu::SurfaceExtensions {
+                        eroded_badlands: data.biome_id("minecraft:eroded_badlands").map(|b| b.0),
+                        frozen_oceans: ["minecraft:frozen_ocean", "minecraft:deep_frozen_ocean"]
+                            .iter()
+                            .filter_map(|n| data.biome_id(n))
+                            .map(|b| b.0)
+                            .collect(),
+                        noises: std::array::from_fn(|i| ext[i].as_ref()),
+                        default_block: settings.default_block.0,
+                        packed_ice: bloc("minecraft:packed_ice")?,
+                        snow: bloc("minecraft:snow_block")?,
+                    }),
+                    fill_states: [
+                        settings.default_block.0,
+                        bloc("minecraft:air")?,
+                        settings.default_fluid.0,
+                        bloc("minecraft:lava")?,
+                    ],
+                    fluid_states: Vec::new(),
+                };
+                // Les etats finaux tiennent sur 30 bits ; les etats a fluide de la regle (l'eau des marais)
+                // sont marques par le GPU, les extensions et le remplissage par defaut n'en ont pas
+                let mut ecrits: Vec<u32> = setup.bands.to_vec();
+                for r in &setup.rules {
+                    match r {
+                        horizon_gpu::SurfaceRule::Block(b) => ecrits.push(*b),
+                        horizon_gpu::SurfaceRule::OreVein { blocks, .. } => ecrits.extend(blocks),
+                        _ => {}
+                    }
+                }
+                let fluide = |b: &u32| data.states.get(BlockStateId(*b)).has_fluid();
+                let mut fluides: Vec<u32> = ecrits.iter().copied().filter(fluide).collect();
+                fluides.sort_unstable();
+                fluides.dedup();
+                let mut sans_fluide = setup.fill_states[..1].to_vec();
+                if let Some(e) = &setup.extensions {
+                    sans_fluide.extend([e.default_block, e.packed_ice, e.snow]);
+                }
+                if ecrits.iter().chain(&sans_fluide).chain(&setup.fill_states).any(|&b| b >= 0x4000_0000) {
+                    return Err("un etat ne tient pas sur 30 bits".to_string());
+                }
+                if sans_fluide.iter().any(fluide) {
+                    return Err("une extension ou le bloc par defaut a un fluide".to_string());
+                }
+                setup.fluid_states = fluides;
+                eprintln!(
+                    "GPU surface S3 : regle traduite ({} regles, {} conditions, {} bruits)",
+                    setup.rules.len(),
+                    setup.conditions.len(),
+                    setup.noises.len()
+                );
+                horizon_gpu::SurfaceGpu::new(library.compiler(), &setup, seed)
+            });
+            match built {
+                Ok(g) => surface_gpu = Some(g),
+                Err(e) => eprintln!("GPU surface S3 : pas de surface GPU : {e}"),
+            }
+        }
+        let ores_gpu = match std::env::var("HORIZON_GPU_ORES").as_deref() {
+            Ok("1" | "test") => match horizon_gpu::OreGpu::new() {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    eprintln!("GPU minerais : pas de minerais sur GPU : {e}");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let (caves_gpu, caves_test) = match std::env::var("HORIZON_GPU_CAVES").as_deref() {
+            Ok(v @ ("1" | "test")) => {
+                match horizon_gpu::CaveGpu::new(horizon_core::geometry::trig::sine_table()) {
+                    Ok(g) => (Some(g), v == "test"),
+                    Err(e) => {
+                        eprintln!("GPU grottes : pas de grottes sur GPU : {e}");
+                        (None, false)
+                    }
+                }
+            }
+            _ => (None, false),
+        };
+        // HORIZON_GPU_BIOMES=1: the biomes of a multi-noise source on the GPU, by regions of
+        // HORIZON_GPU_BIOMES_REGION x HORIZON_GPU_BIOMES_REGION chunks (8); `test` checks each chunk
+        // against the CPU's.
+        let (biomes_gpu, biomes_test) = match (std::env::var("HORIZON_GPU_BIOMES").as_deref(), &source) {
+            (Ok(v @ ("1" | "test")), ResolvedBiomeSource::MultiNoise(multi)) if !settings.legacy => {
+                let index = multi.parameters();
+                let (spaces, links) = index.tree();
+                let entry_ids: Vec<u32> = index
+                    .entries()
+                    .iter()
+                    .map(|(_, name)| data.biome_ids.get(name).map_or(u32::MAX, |id| id.0))
+                    .collect();
+                let region = std::env::var("HORIZON_GPU_BIOMES_REGION")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8);
+                let tree = horizon_gpu::BiomeTree {
+                    spaces: &spaces,
+                    links,
+                    entry_ids: &entry_ids,
+                };
+                match horizon_gpu::BiomeGpu::new(
+                    library.compiler(),
+                    climate_roots,
+                    seed,
+                    &tree,
+                    settings.level_min_y,
+                    settings.level_height,
+                    region,
+                ) {
+                    Ok(g) => (Some(g), v == "test"),
+                    Err(e) => {
+                        eprintln!("GPU biomes : pas de biomes sur GPU : {e}");
+                        (None, false)
+                    }
+                }
+            }
+            _ => (None, false),
+        };
         let mut pipeline = Self {
             zoom: BiomeZoom::new(obfuscate_seed(seed)),
             data,
@@ -1266,6 +1527,21 @@ where
             flat: None,
             dimension: "minecraft:overworld".to_owned(),
             gpu,
+            surface_gpu,
+            surface_integree,
+            ores_gpu,
+            caves_gpu,
+            caves_test,
+            carver_plans: Mutex::new(HashMap::new()),
+            gpu_sections: match std::env::var("HORIZON_GPU_SECTIONS").as_deref() {
+                Ok("1") => 1,
+                Ok("test") => 2,
+                _ => 0,
+            },
+            section_flags: OnceLock::new(),
+            biomes_gpu,
+            biomes_test,
+            biome_regions: Mutex::new(GpuBiomeRegions::default()),
         };
         pipeline.decoration = pipeline
             .data
@@ -1419,6 +1695,129 @@ where
         }
         let (min, height) = (self.settings.level_min_y, self.settings.level_height);
         let mut chunk = BiomeChunk::new(pos, min, height, BiomeId(0)).map_err(stage("biomes"))?;
+        let blender = self.blender_at(pos);
+        // The GPU's region of the chunk, unless it blends with an old world's chunks.
+        let gpu = match &self.biomes_gpu {
+            Some(bg) if blender.is_empty() => match self.gpu_biome_chunk(bg, pos, wait) {
+                Some(gpu) => gpu,
+                None => return Ok(None),
+            },
+            _ => None,
+        };
+        if let Some(bg) = &self.biomes_gpu {
+            bg.note_chunk(gpu.is_some());
+        }
+        match gpu {
+            Some(gpu) if !self.biomes_test => chunk = gpu,
+            gpu => {
+                self.fill_biomes_cpu(worker, pos, &mut chunk, &blender)?;
+                if let (Some(gpu), Some(bg)) = (gpu, &self.biomes_gpu) {
+                    let sections = (height >> 4) as usize;
+                    let ecart = (0..sections).find(|&k| gpu.section(k) != chunk.section(k));
+                    let n = bg.note_test(ecart.is_some());
+                    if let Some(k) = ecart
+                        && bg.mismatches() <= 16
+                    {
+                        let (a, b) = (gpu.section(k).unwrap(), chunk.section(k).unwrap());
+                        let q = (0..64).find(|&q| a[q] != b[q]).unwrap_or(0);
+                        log::warn!(
+                            "GPU biomes test: chunk {:?} section {k} quart {q}: GPU {:?}, CPU {:?}",
+                            (pos.x, pos.z),
+                            a[q],
+                            b[q]
+                        );
+                    }
+                    if n.is_power_of_two() {
+                        log::info!("GPU biomes test: {n} chunks, {} mismatches", bg.mismatches());
+                    }
+                }
+            }
+        }
+        let chunk = Arc::new(chunk);
+        let mut cache = self.biome_cache.lock().unwrap();
+        cache.insert((pos.x, pos.z), chunk.clone());
+        Ok(Some(chunk))
+    }
+    /// The chunk's biomes from its region on the GPU, computed here if no other worker has. None
+    /// when `wait` is false and another worker is computing the region; Some(None) when the GPU
+    /// failed or chose an entry without a biome id: the CPU fills the chunk.
+    fn gpu_biome_chunk(
+        &self,
+        bg: &horizon_gpu::BiomeGpu,
+        pos: ChunkPos,
+        wait: bool,
+    ) -> Option<Option<BiomeChunk<BiomeId>>> {
+        let r = bg.region_side();
+        let key = (pos.x.div_euclid(r), pos.z.div_euclid(r));
+        let slot = {
+            let mut regions = self.biome_regions.lock().unwrap();
+            let regions = &mut *regions;
+            match regions.slots.get(&key) {
+                Some(slot) => slot.clone(),
+                None => {
+                    if regions.order.len() >= GPU_BIOME_REGIONS
+                        && let Some(old) = regions.order.pop_front()
+                    {
+                        regions.slots.remove(&old);
+                    }
+                    let slot = Arc::new(GpuBiomeRegion::default());
+                    regions.slots.insert(key, slot.clone());
+                    regions.order.push_back(key);
+                    slot
+                }
+            }
+        };
+        let values = match slot.done.get() {
+            Some(values) => values.clone(),
+            None => {
+                let _work = if wait {
+                    slot.work.lock().unwrap()
+                } else {
+                    match slot.work.try_lock() {
+                        Ok(guard) => guard,
+                        Err(std::sync::TryLockError::WouldBlock) => return None,
+                        Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
+                    }
+                };
+                slot.done
+                    .get_or_init(|| match bg.region(key.0.wrapping_mul(r), key.1.wrapping_mul(r)) {
+                        Ok(values) => Some(Arc::new(values)),
+                        Err(e) => {
+                            log::error!("GPU biomes: region {key:?}: {e}");
+                            None
+                        }
+                    })
+                    .clone()
+            }
+        };
+        let Some(values) = values else {
+            return Some(None);
+        };
+        let per = bg.quarts_per_chunk();
+        let c = (pos.z.rem_euclid(r) * r + pos.x.rem_euclid(r)) as usize;
+        let ids = &values[c * per..(c + 1) * per];
+        if ids.contains(&u32::MAX) {
+            return Some(None);
+        }
+        let (min, height) = (self.settings.level_min_y, self.settings.level_height);
+        let mut next = ids.iter();
+        let chunk = BiomeChunk::new(pos, min, height, BiomeId(0)).ok().and_then(|mut chunk| {
+            chunk
+                .fill(min, min + height - 1, |_| next.next().map(|&id| BiomeId(id)).ok_or(()))
+                .ok()
+                .map(|()| chunk)
+        });
+        Some(chunk)
+    }
+    /// The chunk's biomes from the CPU's climate and search, blended with an old world's chunks.
+    fn fill_biomes_cpu(
+        &self,
+        worker: &mut WorkerState,
+        pos: ChunkPos,
+        chunk: &mut BiomeChunk<BiomeId>,
+        blender: &super::blending::Blender,
+    ) -> Result<(), GeneratorError> {
+        let (min, height) = (self.settings.level_min_y, self.settings.level_height);
         let mut resolver = self.source.resolver(
             &self.climate,
             self.router.get(RouterField::Erosion).as_ref(),
@@ -1444,7 +1843,6 @@ where
             cache.insert((pos.x, pos.z), Arc::new(lattice));
         }
         let ids = &self.data.biome_ids;
-        let blender = self.blender_at(pos);
         // Names point into the source's parameter list: neighbouring quarts
         // mostly resolve to the same entry, so skip the map lookup for it.
         let mut last: Option<(*const str, BiomeId)> = None;
@@ -1469,10 +1867,222 @@ where
                 Ok(id)
             })
             .map_err(stage("biomes"))?;
-        let chunk = Arc::new(chunk);
-        let mut cache = self.biome_cache.lock().unwrap();
-        cache.insert((pos.x, pos.z), chunk.clone());
-        Ok(Some(chunk))
+        Ok(())
+    }
+    /// The carvers the 8 x 8 origins of a block start, planned without a target (shared and
+    /// worker caches).
+    fn carver_block(
+        &self,
+        worker: &mut WorkerState,
+        key: (i32, i32),
+        generation: WorldGenerationContext,
+    ) -> Result<Arc<OriginBlock>, String> {
+        if let Some(b) = worker.carver_plans.get(&key) {
+            return Ok(b.clone());
+        }
+        if worker.carver_plans.len() >= 256 {
+            worker.carver_plans.clear();
+        }
+        if let Some(b) = self.carver_plans.lock().unwrap().get(&key).cloned() {
+            worker.carver_plans.insert(key, b.clone());
+            return Ok(b);
+        }
+        let mut plans = Vec::with_capacity(64);
+        for i in 0..8 {
+            for j in 0..8 {
+                let origin = ChunkPos::new(
+                    key.0.wrapping_shl(3).wrapping_add(i),
+                    key.1.wrapping_shl(3).wrapping_add(j),
+                );
+                let id = self.carver_biome(worker, origin)?;
+                let carvers = &self.data.biome_carvers[id.0 as usize];
+                let mut calls = Vec::new();
+                let mut error = carvers.len() > 1024;
+                for (index, carver) in carvers.iter().enumerate() {
+                    let mut random =
+                        large_feature_random(self.seed.wrapping_add(index as i64), origin);
+                    if carver.is_start_chunk(&mut random) {
+                        let mut items = Vec::new();
+                        error |= carver.plan(generation, &mut random, origin, &mut items).is_err();
+                        calls.push((carver.clone(), items));
+                    }
+                }
+                plans.push(OriginCarvers { calls, error });
+            }
+        }
+        let b = Arc::new(OriginBlock { plans });
+        let mut cache = self.carver_plans.lock().unwrap();
+        if cache.len() >= CARVER_CACHE_LIMIT / 64 {
+            cache.clear();
+        }
+        cache.insert(key, b.clone());
+        drop(cache);
+        worker.carver_plans.insert(key, b.clone());
+        Ok(b)
+    }
+    /// HORIZON_GPU_CAVES: send the planned carvers of the 17 x 17 origins around `pos` that may
+    /// reach it, to trace its carving mask on the GPU. `None`: the CPU traces it.
+    fn submit_caves(
+        &self,
+        cg: &horizon_gpu::CaveGpu,
+        worker: &mut WorkerState,
+        pos: ChunkPos,
+        generation: WorldGenerationContext,
+    ) -> Option<horizon_gpu::CaveJob> {
+        use horizon_gpu::{CAVE_CANYON, CAVE_ROOM, CAVE_TUNNEL, CaveItem};
+        let cx = f64::from(pos.x.wrapping_shl(4).wrapping_add(8));
+        let cz = f64::from(pos.z.wrapping_shl(4).wrapping_add(8));
+        // A path moves at most one block a step, and `can_reach` allows its thickness + 18 more:
+        // a tunnel or canyon starting farther never reaches the chunk.
+        let may_reach = |p: &[f64; 3], end: i32, thickness: f32| {
+            let (dx, dz) = (p[0] - cx, p[2] - cz);
+            let r = f64::from(end) + f64::from(thickness.max(1.)) + 24.;
+            dx * dx + dz * dz <= r * r
+        };
+        let mut items = Vec::new();
+        let mut widths = Vec::new();
+        let mut calls = 0u32;
+        // The 3 x 3 blocks of origins the 17 x 17 neighbourhood spans
+        let mut blocks: Vec<((i32, i32), Arc<OriginBlock>)> = Vec::with_capacity(9);
+        for dx in -8..=8 {
+            for dz in -8..=8 {
+                let origin = ChunkPos::new(pos.x.wrapping_add(dx), pos.z.wrapping_add(dz));
+                let key = (origin.x >> 3, origin.z >> 3);
+                let k = match blocks.iter().position(|(c, _)| *c == key) {
+                    Some(k) => k,
+                    None => {
+                        blocks.push((key, self.carver_block(worker, key, generation).ok()?));
+                        blocks.len() - 1
+                    }
+                };
+                let plan = &blocks[k].1.plans[((origin.x & 7) * 8 + (origin.z & 7)) as usize];
+                if plan.error {
+                    return None;
+                }
+                for (carver, planned) in &plan.calls {
+                    let call = calls;
+                    let mut used = false;
+                    for item in planned {
+                        let it = match item {
+                            PlannedCarve::Room {
+                                center,
+                                horizontal,
+                                vertical,
+                                floor,
+                            } => {
+                                let reach = 16. + horizontal * 2.;
+                                if (center[0] - cx).abs() > reach || (center[2] - cz).abs() > reach {
+                                    continue;
+                                }
+                                CaveItem {
+                                    kind: CAVE_ROOM,
+                                    position: *center,
+                                    horizontal: *horizontal,
+                                    vertical: *vertical,
+                                    floor: *floor,
+                                    ..Default::default()
+                                }
+                            }
+                            PlannedCarve::Tunnel {
+                                seed,
+                                position,
+                                thickness,
+                                yaw,
+                                pitch,
+                                end,
+                                vertical_scale,
+                                horizontal,
+                                vertical,
+                                floor,
+                            } => {
+                                if !may_reach(position, *end, *thickness) {
+                                    continue;
+                                }
+                                CaveItem {
+                                    kind: CAVE_TUNNEL,
+                                    seed: *seed as u64,
+                                    position: *position,
+                                    thickness: *thickness,
+                                    yaw: *yaw,
+                                    pitch: *pitch,
+                                    end: *end,
+                                    scale: *vertical_scale,
+                                    horizontal: *horizontal,
+                                    vertical: *vertical,
+                                    floor: *floor,
+                                    ..Default::default()
+                                }
+                            }
+                            PlannedCarve::Canyon(c) => {
+                                let WorldCarver::Canyon(canyon) = &**carver else {
+                                    return None;
+                                };
+                                let s = &c.start;
+                                if !may_reach(&s.position, s.end, s.thickness) {
+                                    continue;
+                                }
+                                let shape = &canyon.shape;
+                                let (factor_kind, factor) = match shape.horizontal_radius_factor {
+                                    FloatProvider::Constant(v) => (0, [v, v]),
+                                    FloatProvider::Uniform { min, max } => (1, [min, max]),
+                                    _ => return None,
+                                };
+                                if c.width.len() != generation.height as usize {
+                                    return None;
+                                }
+                                let width = widths.len() as u32;
+                                widths.extend_from_slice(&c.width);
+                                CaveItem {
+                                    kind: CAVE_CANYON,
+                                    seed: c.local,
+                                    position: s.position,
+                                    thickness: s.thickness,
+                                    yaw: s.yaw,
+                                    pitch: s.pitch,
+                                    end: s.end,
+                                    scale: s.y_scale,
+                                    width,
+                                    factor_kind,
+                                    factor,
+                                    vertical_factors: [
+                                        shape.vertical_radius_default_factor,
+                                        shape.vertical_radius_center_factor,
+                                    ],
+                                    ..Default::default()
+                                }
+                            }
+                        };
+                        items.push(CaveItem { call, ..it });
+                        used = true;
+                    }
+                    if used {
+                        calls += 1;
+                    }
+                }
+            }
+        }
+        // generate_carving_mask's bounds (not upgrading)
+        let target = horizon_gpu::CaveTarget {
+            chunk: [pos.x, pos.z],
+            min_y: generation.min_y.wrapping_add(1),
+            max_y: generation
+                .min_y
+                .wrapping_add(generation.height)
+                .wrapping_sub(1)
+                .wrapping_sub(7),
+            generation_min_y: generation.min_y,
+            generation_height: generation.height,
+        };
+        match cg.submit(target, &items, &widths, calls as usize) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                static SIGNALEE: OnceLock<()> = OnceLock::new();
+                if SIGNALEE.set(()).is_ok() {
+                    log::error!("GPU grottes : envoi : {e}");
+                }
+                None
+            }
+        }
     }
     fn carver_biome(&self, worker: &mut WorkerState, origin: ChunkPos) -> Result<BiomeId, String> {
         let key = (origin.x, origin.z);
@@ -1748,10 +2358,11 @@ where
         let beard = self
             .structures
             .as_ref()
-            .and_then(|s| s.beardifier(&references, pos));
-        // The GPU final density knows no structures and no old chunks to blend.
+            .and_then(|s| s.beardifier(&references, pos))
+            .map(Arc::new);
+        // The GPU knows no old chunks to blend; it adds structures' beardifier itself.
         let gpu = self.gpu.as_ref().filter(|gpu| {
-            let free = beard.is_none() && blender.is_empty();
+            let free = blender.is_empty();
             if !free {
                 gpu.note_cpu_fallback();
             }
@@ -1759,10 +2370,10 @@ where
         });
         if beard.is_some() || !blender.is_empty() {
             let mut fields = horizon_core::density::WorldFields::default();
-            if let Some(beard) = beard {
+            if let Some(beard) = &beard {
                 fields = fields.with_field(
                     horizon_core::density::WorldField::Beardifier,
-                    Arc::new(beard),
+                    beard.clone(),
                 );
             }
             if !blender.is_empty() {
@@ -1785,26 +2396,51 @@ where
         }
         worker.timings.structures += lap(&mut clock);
         worker.timings.noise += lap(&mut clock);
-        let mut aquifer: Box<dyn TerrainAquifer> = match &self.aquifer {
-            Some(samplers) => Box::new(
-                NoiseBasedAquifer::new(
-                    AquiferSamplers::new(samplers.clone()),
+        // HORIZON_GPU_CAVES: the carving mask is traced on the GPU while the chunk fills.
+        let mut caves_job = match &self.caves_gpu {
+            Some(cg) if run_carvers => self.submit_caves(cg, worker, pos, self.generation()),
+            _ => None,
+        };
+        worker.timings.carvers += lap(&mut clock);
+        let cpu_aquifer = |context: &mut SamplerContext| -> Result<Box<dyn TerrainAquifer>, GeneratorError> {
+            Ok(match &self.aquifer {
+                Some(samplers) => Box::new(
+                    NoiseBasedAquifer::new(
+                        AquiferSamplers::new(samplers.clone()),
+                        self.picker,
+                        self.root
+                            .from_hash_of("minecraft:aquifer")
+                            .fork_positional(),
+                        RegistryAquiferBlockStates::new(data.registry).map_err(stage("aquifer"))?,
+                        volume,
+                        context,
+                    )
+                    .map_err(stage("aquifer"))?,
+                ),
+                None => Box::new(DisabledAquifer::new(
                     self.picker,
-                    self.root
-                        .from_hash_of("minecraft:aquifer")
-                        .fork_positional(),
-                    RegistryAquiferBlockStates::new(data.registry).map_err(stage("aquifer"))?,
-                    volume,
-                    context,
-                )
-                .map_err(stage("aquifer"))?,
-            ),
-            None => Box::new(DisabledAquifer::new(
-                self.picker,
-                data.registry.default_state("minecraft:air").unwrap(),
-            )),
+                    data.registry.default_state("minecraft:air").unwrap(),
+                )),
+            })
+        };
+        // With the carvers' cells on the GPU too, the CPU aquifer is only built for a chunk that
+        // needs it (CPU fill or carving). Its air limit then is the GPU's: the fluid picker is the
+        // same at every x/z, at sea level.
+        let lazy_aquifer = self.caves_gpu.is_some() && !self.caves_test && self.aquifer.is_some() && {
+            let levels = [[0, i32::MAX, 0], [i32::MAX; 3], [i32::MIN, i32::MAX, i32::MIN]]
+                .map(|p| self.picker.compute(p).level);
+            levels.iter().all(|&l| l == self.settings.sea_level)
+        };
+        let mut aquifer: Option<Box<dyn TerrainAquifer>> = if lazy_aquifer {
+            None
+        } else {
+            Some(cpu_aquifer(context)?)
         };
         worker.timings.noise += lap(&mut clock);
+        let mut codes_gpu: Option<Vec<i8>> = None;
+        let mut surface_faite = false;
+        let mut etats_gpu: Option<Vec<u32>> = None;
+        let mut sections_gpu: Option<Vec<u32>> = None;
         if native {
             // The mod's blocks stand where the noise's would: the surface rule
             // reads the heightmaps noise filling builds.
@@ -1825,17 +2461,145 @@ where
                     .collect()
             };
             context.set_lattice(lattice);
-            let filled = fill_noise_with(
-                &mut chunk,
-                volume,
-                self.router.get(RouterField::FinalDensity).as_ref(),
-                context,
-                aquifer.as_mut(),
-                self.settings.default_block,
-                |density| gpu.is_some_and(|gpu| gpu.fill_chunk(pos.x, pos.z, density)),
-            );
+            // With the aquifers on the GPU too, the chunk comes back as block codes; the CPU
+            // aquifer, still built for the carvers, must agree on the chunk's air limit.
+            let mut codes = Vec::new();
+            let lava = data.registry.default_state("minecraft:lava");
+            let from_codes = match (gpu.filter(|_| self.aquifer.is_some()), lava) {
+                (Some(gpu), Some(_)) => {
+                    codes.resize(volume.size(), 0i8);
+                    // HORIZON_GPU_SURFACE=1: the chunk's surface runs on the GPU stream of its codes,
+                    // which do not come back to the GPU; its final states are written below.
+                    let surface = self
+                        .surface_gpu
+                        .as_ref()
+                        .filter(|_| self.surface_integree && run_surface && !self.identity_end_surface(pos));
+                    let quarts = surface.and_then(|sg| surface_quarts(sg, pos, &biomes));
+                    let skip = match (surface, &quarts) {
+                        (Some(sg), Some(quarts)) => {
+                            let mut etats = vec![0u32; volume.size()];
+                            // HORIZON_GPU_SECTIONS: the GPU sends the fill's compact sections instead of
+                            // its states, for a fresh chunk of the whole height.
+                            let mut sections = (self.gpu_sections != 0
+                                && volume.minimum()[1] == chunk.min_y()
+                                && volume.sizes()[1] as i32 == chunk.height()
+                                && chunk.is_fresh()
+                                && sg.enable_sections(
+                                    self.section_flags.get_or_init(|| chunk.section_flags()),
+                                    chunk.air().0,
+                                    self.gpu_sections == 2,
+                                ))
+                            .then(Vec::new);
+                            let (skip, issue) = gpu.chunk_blocks_surface(
+                                pos.x,
+                                pos.z,
+                                beard.as_deref(),
+                                &mut codes,
+                                sg,
+                                quarts,
+                                &mut etats,
+                                caves_job.as_mut(),
+                                sections.as_mut(),
+                            );
+                            if beard.is_some() && skip.is_none() {
+                                gpu.note_cpu_fallback();
+                            }
+                            if issue == Some(true) {
+                                if let Some(v) = &sections {
+                                    sg.note_sections(!v.is_empty());
+                                }
+                                etats_gpu = Some(etats);
+                                sections_gpu = sections.filter(|v| !v.is_empty());
+                            } else {
+                                sg.note_cpu_fallback();
+                            }
+                            skip
+                        }
+                        _ => {
+                            if let Some(sg) = surface {
+                                sg.note_cpu_fallback();
+                            }
+                            match &beard {
+                                Some(beard) => {
+                                    let skip = gpu.chunk_blocks_beard(pos.x, pos.z, beard, &mut codes, caves_job.as_mut());
+                                    if skip.is_none() {
+                                        gpu.note_cpu_fallback();
+                                    }
+                                    skip
+                                }
+                                None => gpu.chunk_blocks(pos.x, pos.z, &mut codes, caves_job.as_mut()),
+                            }
+                        }
+                    };
+                    match skip {
+                        Some(skip)
+                            if aquifer.as_ref().is_none_or(|a| {
+                                a.air_above_y() == Some(skip.max(self.settings.sea_level))
+                            }) =>
+                        {
+                            true
+                        }
+                        Some(_) => {
+                            gpu.note_aquifer_mismatch();
+                            false
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            // HORIZON_GPU_SURFACE=1: the final states of the fill and the surface come from the GPU and
+            // are written once; the CPU surface is skipped for this chunk.
+            let etats = if from_codes { etats_gpu.take() } else { None };
+            let sections = if from_codes { sections_gpu.take() } else { None };
+            let filled = if let (Some(data), 1) = (&sections, self.gpu_sections) {
+                surface_faite = true;
+                fill_noise_sections(&mut chunk, volume, data)
+            } else if let Some(etats) = &etats {
+                surface_faite = true;
+                let filled = fill_noise_states(&mut chunk, volume, etats);
+                if let (Some(data), Some(sg)) = (&sections, &self.surface_gpu)
+                    && let Err(e) = check_noise_sections(&chunk, data)
+                {
+                    sg.note_sections_mismatch();
+                    static SIGNALE: OnceLock<()> = OnceLock::new();
+                    if SIGNALE.set(()).is_ok() {
+                        eprintln!("GPU sections : chunk {} {} : {e}", pos.x, pos.z);
+                    }
+                }
+                filled
+            } else if let (true, Some(lava)) = (from_codes, lava) {
+                fill_noise_codes(
+                    &mut chunk,
+                    volume,
+                    &codes,
+                    self.settings.default_block,
+                    self.settings.default_fluid,
+                    lava,
+                )
+            } else {
+                if aquifer.is_none() {
+                    aquifer = Some(cpu_aquifer(context)?);
+                }
+                fill_noise_with(
+                    &mut chunk,
+                    volume,
+                    self.router.get(RouterField::FinalDensity).as_ref(),
+                    context,
+                    aquifer.as_mut().unwrap().as_mut(),
+                    self.settings.default_block,
+                    // The GPU density alone knows no beardifier.
+                    |density| {
+                        beard.is_none()
+                            && gpu.is_some_and(|gpu| gpu.fill_chunk(pos.x, pos.z, density))
+                    },
+                )
+            };
             context.clear_lattice();
             filled.map_err(stage("noise"))?;
+            if from_codes && self.surface_gpu.is_some() {
+                codes_gpu = Some(std::mem::take(&mut codes));
+            }
         }
         let generation = self.generation();
         worker.timings.noise += lap(&mut clock);
@@ -1845,7 +2609,7 @@ where
             .take()
             .and_then(|cache| cache.downcast::<CompiledSurfaceRule<R>>().ok())
             .map(|cache| *cache);
-        if run_surface && !self.identity_end_surface(pos) {
+        if run_surface && !surface_faite && !self.identity_end_surface(pos) {
             build_surface_shared(
                 &mut chunk,
                 &self.rule,
@@ -1873,15 +2637,50 @@ where
                 &self.extensions,
             )
             .map_err(stage("surface"))?;
+            if let (Some(sg), Some(codes)) = (&self.surface_gpu, &codes_gpu) {
+                self.compare_surface_gpu(sg, &chunk, pos, codes, &biomes);
+            }
         }
         worker.timings.surface += lap(&mut clock);
         if run_carvers {
             let carvers = &data.biome_carvers;
-            let mask = generate_carving_mask(self.seed, pos, generation, false, |origin| {
-                self.carver_biome(worker, origin)
-                    .map(|id| carvers[id.0 as usize].as_slice())
-            })
-            .map_err(stage("carvers"))?;
+            // HORIZON_GPU_CAVES: the mask traced on the GPU, and the aquifer's substance of its
+            // cells when the GPU filled the chunk; the CPU traces a mask the GPU flagged.
+            let mut gpu_mask = None;
+            if let (Some(cg), Some(job)) = (&self.caves_gpu, caves_job.as_mut()) {
+                if cg.wait(job)
+                    && let Some(words) = cg.mask(job)
+                {
+                    let t = job.target();
+                    gpu_mask = CarvingMask::from_words(t.min_y, t.max_y, words.to_vec()).ok();
+                }
+                if gpu_mask.is_none() {
+                    cg.note_cpu_fallback();
+                }
+            }
+            let cpu_mask = |worker: &mut WorkerState| {
+                generate_carving_mask(self.seed, pos, generation, false, |origin| {
+                    self.carver_biome(worker, origin)
+                        .map(|id| carvers[id.0 as usize].as_slice())
+                })
+                .map_err(stage("carvers"))
+            };
+            let mask = match gpu_mask {
+                Some(gpu) if self.caves_test => {
+                    let cpu = cpu_mask(worker)?;
+                    if gpu.words() == cpu.words() {
+                        gpu
+                    } else {
+                        if let (Some(cg), Some(job)) = (&self.caves_gpu, caves_job.take()) {
+                            cg.note_mismatch(true);
+                            cg.finish(job);
+                        }
+                        cpu
+                    }
+                }
+                Some(gpu) => gpu,
+                None => cpu_mask(worker)?,
+            };
             worker.timings.carvers += lap(&mut clock);
             if !mask.is_empty() {
                 let mut resolver = self.source.resolver(
@@ -1889,29 +2688,133 @@ where
                     self.router.get(RouterField::Erosion).as_ref(),
                 );
                 let mut biome_context = SamplerContext::default();
-                apply_carving_mask_shared(
-                    &mut chunk,
-                    &mask,
-                    &self.rule,
-                    &mut shared,
-                    TopMaterialInputs::<R, _> {
-                        generation,
-                        root: self.root.clone(),
-                        surface: SurfaceQueries {
-                            pipeline: self,
-                            temperatures: &mut worker.temperatures,
-                            biome: Biomes::Resolver(&mut resolver, &mut biome_context),
-                            uniform_biomes: None,
-                            possible: None,
-                        },
-                        preliminary_surface: self.preliminary.clone(),
-                        density_context: context,
+                let inputs = TopMaterialInputs::<R, _> {
+                    generation,
+                    root: self.root.clone(),
+                    surface: SurfaceQueries {
+                        pipeline: self,
+                        temperatures: &mut worker.temperatures,
+                        biome: Biomes::Resolver(&mut resolver, &mut biome_context),
+                        uniform_biomes: None,
+                        possible: None,
                     },
-                    aquifer.as_mut(),
-                    &data.carving_blocks,
-                    |[x, y, z]| blender.carving_filter(x, y, z).unwrap_or(true),
-                )
+                    preliminary_surface: self.preliminary.clone(),
+                    density_context: context,
+                };
+                let filter = |[x, y, z]: [i32; 3]| blender.carving_filter(x, y, z).unwrap_or(true);
+                let words = mask.words();
+                let cells: usize = words.iter().map(|w| w.count_ones() as usize).sum();
+                let mut codes = match (&self.caves_gpu, caves_job.as_ref()) {
+                    (Some(cg), Some(job)) => cg.codes(job, cells),
+                    _ => None,
+                };
+                // The cells' ranks in the mask's bit order, as the GPU stored their codes
+                let mut ranks = Vec::new();
+                if codes.is_some() {
+                    let mut n = 0u32;
+                    ranks.extend(words.iter().map(|w| {
+                        let r = n;
+                        n += w.count_ones();
+                        r
+                    }));
+                }
+                let (min_y, height) = (mask.min_y(), mask.height());
+                let (cx, cz) = (pos.x.wrapping_shl(4), pos.z.wrapping_shl(4));
+                let rank = |[x, y, z]: [i32; 3]| {
+                    let index = (y - min_y + ((z - cz) + (x - cx) * 16) * height) as usize;
+                    let w = words[index / 64];
+                    (ranks[index / 64] + (w & ((1u64 << (index % 64)) - 1)).count_ones()) as usize
+                };
+                let air = data.registry.default_state("minecraft:air");
+                let lava = data.registry.default_state("minecraft:lava");
+                let fluid = self.settings.default_fluid;
+                let decode = |code: i8| -> CarvedSubstance {
+                    let state = if code & 8 != 0 {
+                        None
+                    } else {
+                        match code & 3 {
+                            1 => air,
+                            2 => Some(fluid),
+                            3 => lava,
+                            _ => None,
+                        }
+                    };
+                    (state, code & 4 != 0)
+                };
+                // Test mode: every cell's substance against the CPU aquifer (built eagerly)
+                if let (true, Some(c), Some(aq)) = (self.caves_test, codes, aquifer.as_mut()) {
+                    let mut same = true;
+                    'cells: for (w, &word) in words.iter().enumerate() {
+                        let mut bits = word;
+                        while bits != 0 {
+                            let index = w * 64 + bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            let column = index as i32 / height;
+                            let p = [
+                                cx + ((column >> 4) & 15),
+                                min_y + index as i32 % height,
+                                cz + (column & 15),
+                            ];
+                            let state = aq
+                                .compute_substance(inputs.density_context, p, 0.)
+                                .map_err(stage("carvers"))?;
+                            if decode(c[rank(p)]) != (state, aq.should_schedule_fluid_update()) {
+                                same = false;
+                                break 'cells;
+                            }
+                        }
+                    }
+                    if !same {
+                        if let Some(cg) = &self.caves_gpu {
+                            cg.note_mismatch(false);
+                        }
+                        codes = None;
+                    }
+                }
+                match codes {
+                    Some(c) => apply_carving_mask_with(
+                        &mut chunk,
+                        &mask,
+                        &self.rule,
+                        &mut shared,
+                        inputs,
+                        |_, p| Ok(decode(c[rank(p)])),
+                        &data.carving_blocks,
+                        filter,
+                    ),
+                    None => {
+                        let TopMaterialInputs {
+                            generation,
+                            root,
+                            surface,
+                            preliminary_surface,
+                            density_context,
+                        } = inputs;
+                        if aquifer.is_none() {
+                            aquifer = Some(cpu_aquifer(density_context)?);
+                        }
+                        apply_carving_mask_shared(
+                            &mut chunk,
+                            &mask,
+                            &self.rule,
+                            &mut shared,
+                            TopMaterialInputs::<R, _> {
+                                generation,
+                                root,
+                                surface,
+                                preliminary_surface,
+                                density_context,
+                            },
+                            aquifer.as_mut().unwrap().as_mut(),
+                            &data.carving_blocks,
+                            filter,
+                        )
+                    }
+                }
                 .map_err(stage("carvers"))?;
+            }
+            if let (Some(cg), Some(job)) = (&self.caves_gpu, caves_job.take()) {
+                cg.finish(job);
             }
         }
         worker.surface_rule = shared.map(|rule| Box::new(rule) as Box<dyn Any + Send>);
@@ -2487,6 +3390,472 @@ impl<R: RandomSource> MaterialSurfaceQueries for SurfaceQueries<'_, '_, R> {
     }
 }
 
+impl<R: RandomSource + 'static> Pipeline<R>
+where
+    R::Positional: Clone + Send + Sync,
+{
+    /// HORIZON_GPU_SURFACE_TEST: the GPU surface of this chunk, from the GPU fill codes, against the
+    /// blocks the CPU surface just wrote (extensions included; HORIZON_GPU_SURFACE_SKIP_EXT skips their columns).
+    fn compare_surface_gpu<B: TerrainBlockStates>(
+        &self,
+        sg: &horizon_gpu::SurfaceGpu,
+        chunk: &TerrainChunk<'_, B>,
+        pos: ChunkPos,
+        codes: &[i8],
+        biomes: &BiomeRegion<BiomeId>,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static CHUNKS: AtomicU64 = AtomicU64::new(0);
+        static BLOCS: AtomicU64 = AtomicU64::new(0);
+        static ECARTS: AtomicU64 = AtomicU64::new(0);
+        static IGNOREES: AtomicU64 = AtomicU64::new(0);
+        static ERREURS: AtomicU64 = AtomicU64::new(0);
+        static CHANGES: AtomicU64 = AtomicU64::new(0);
+        static EXTENSIONS: AtomicU64 = AtomicU64::new(0);
+        static BIOMES: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
+        let mut vus: BTreeMap<String, u64> = BTreeMap::new();
+        let mut quarts = Vec::new();
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let Ok(c) = biomes.chunk(ChunkPos::new(pos.x + dx, pos.z + dz)) else {
+                    return;
+                };
+                let mut k = 0;
+                while let Some(section) = c.section(k) {
+                    quarts.extend(section.iter().map(|id| id.0 as u16));
+                    k += 1;
+                }
+            }
+        }
+        let mut out = vec![0u32; codes.len()];
+        let erreur = match sg.chunk_states(pos.x, pos.z, codes, &quarts, &mut out) {
+            Ok(ok) => !ok,
+            Err(e) => {
+                eprintln!("GPU surface S3 : chunk {} {} : {e}", pos.x, pos.z);
+                return;
+            }
+        };
+        let (min, h) = (self.settings.noise_min_y, self.settings.noise_height as usize);
+        let air = self.data.registry.default_state("minecraft:air").unwrap();
+        let lava = self.data.registry.default_state("minecraft:lava").unwrap();
+        let avant = |code: i8| match code & 3 {
+            0 => self.settings.default_block,
+            1 => air,
+            2 => self.settings.default_fluid,
+            _ => lava,
+        };
+        let nom = |id: BlockStateId| self.data.registry.state(id).map_or("?".to_owned(), |s| s.name.clone());
+        let (mut ecarts, mut blocs, mut ignorees, mut changes, mut ext) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut exemple = None;
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                let lc = lx + lz * 16;
+                let col = &codes[lc * h..(lc + 1) * h];
+                let top = (0..h).rev().find(|&iy| col[iy] & 3 != 1).map_or(min, |iy| min + iy as i32 + 1);
+                let (x, z) = (pos.x * 16 + lx as i32, pos.z * 16 + lz as i32);
+                let biome = biomes
+                    .biome(BlockPos::new(x, top, z))
+                    .map(|id| self.data.biome_names[id.0 as usize].clone());
+                if let Ok(b) = &biome {
+                    *vus.entry(b.trim_start_matches("minecraft:").to_owned()).or_default() += 1;
+                }
+                if std::env::var_os("HORIZON_GPU_SURFACE_SKIP_EXT").is_some()
+                    && matches!(
+                        biome.as_deref(),
+                        Ok("minecraft:eroded_badlands" | "minecraft:frozen_ocean" | "minecraft:deep_frozen_ocean")
+                    )
+                {
+                    ignorees += 1;
+                    continue;
+                }
+                for iy in 0..h {
+                    let y = min + iy as i32;
+                    let cpu = chunk.block(x, y, z);
+                    let gpu = BlockStateId(out[lc * h + iy] & 0x3fff_ffff);
+                    blocs += 1;
+                    if gpu != avant(col[iy]) {
+                        changes += 1;
+                        // Dans l'air ou l'eau : seuls les piliers et les icebergs y ecrivent
+                        if matches!(col[iy] & 3, 1 | 2) {
+                            ext += 1;
+                        }
+                    }
+                    if gpu != cpu {
+                        ecarts += 1;
+                        if exemple.is_none() {
+                            exemple = Some(format!("({x}, {y}, {z}) gpu {} / cpu {}", nom(gpu), nom(cpu)));
+                        }
+                    }
+                }
+            }
+        }
+        let n = CHUNKS.fetch_add(1, Relaxed) + 1;
+        BLOCS.fetch_add(blocs, Relaxed);
+        ECARTS.fetch_add(ecarts, Relaxed);
+        IGNOREES.fetch_add(ignorees, Relaxed);
+        ERREURS.fetch_add(u64::from(erreur), Relaxed);
+        CHANGES.fetch_add(changes, Relaxed);
+        EXTENSIONS.fetch_add(ext, Relaxed);
+        let mut tous = BIOMES.lock().unwrap();
+        for (b, k) in vus {
+            *tous.entry(b).or_default() += k;
+        }
+        if ecarts > 0 && ECARTS.load(Relaxed) == ecarts {
+            eprintln!("GPU surface S3 : premier ecart, chunk {} {} : {ecarts} blocs, ex. {}", pos.x, pos.z, exemple.unwrap_or_default());
+        }
+        if n.is_power_of_two() || n % 256 == 0 || std::env::var_os("HORIZON_GPU_SURFACE_BIOMES").is_some() {
+            eprintln!(
+                "GPU surface S3 : {n} chunks, {} blocs compares dont {} changes par la surface ({} par les extensions), {} ecarts, {} colonnes ignorees (extensions), {} chunks avec condition non evaluable",
+                BLOCS.load(Relaxed),
+                CHANGES.load(Relaxed),
+                EXTENSIONS.load(Relaxed),
+                ECARTS.load(Relaxed),
+                IGNOREES.load(Relaxed),
+                ERREURS.load(Relaxed)
+            );
+            if std::env::var_os("HORIZON_GPU_SURFACE_BIOMES").is_some() {
+                eprintln!(
+                    "GPU surface S3 : colonnes par biome : {}",
+                    tous.iter().map(|(b, k)| format!("{b} {k}")).collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+    }
+}
+
+/// The biome quarts of the 3 x 3 chunks around `pos` (dz then dx, each chunk by sections), as
+/// `SurfaceGpu::chunk_states` reads them.
+fn surface_quarts(sg: &horizon_gpu::SurfaceGpu, pos: ChunkPos, biomes: &BiomeRegion<BiomeId>) -> Option<Vec<u16>> {
+    let mut quarts = Vec::with_capacity(sg.biome_count());
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let c = biomes.chunk(ChunkPos::new(pos.x + dx, pos.z + dz)).ok()?;
+            let mut k = 0;
+            while let Some(section) = c.section(k) {
+                quarts.extend(section.iter().map(|id| id.0 as u16));
+                k += 1;
+            }
+        }
+    }
+    (quarts.len() == sg.biome_count()).then_some(quarts)
+}
+
+/// HORIZON_GPU_SURFACE_TEST: the surface rule in the GPU's neutral form (jalon S3).
+struct SurfaceIr<'a, P> {
+    rules: Vec<horizon_gpu::SurfaceRule>,
+    conditions: Vec<horizon_gpu::SurfaceCondition>,
+    memo: HashMap<usize, usize>,
+    noises: Vec<&'a dyn Noise>,
+    noise_index: HashMap<String, usize>,
+    all_noises: &'a BTreeMap<String, Arc<dyn Noise>>,
+    data: &'a GeneratorData,
+    generation: WorldGenerationContext,
+    root: &'a P,
+}
+impl<'a, P: PositionalRandom> SurfaceIr<'a, P> {
+    fn push_rule(&mut self, r: horizon_gpu::SurfaceRule) -> usize {
+        self.rules.push(r);
+        self.rules.len() - 1
+    }
+    fn push_condition(&mut self, c: horizon_gpu::SurfaceCondition) -> usize {
+        self.conditions.push(c);
+        self.conditions.len() - 1
+    }
+    fn rule(&mut self, r: &super::material_condition::MaterialRule) -> Result<usize, String> {
+        use super::material_condition::MaterialRule as M;
+        use horizon_gpu::SurfaceRule as S;
+        Ok(match r {
+            M::Block(b) => self.push_rule(S::Block(b.0)),
+            M::Reference(arc) => {
+                let key = Arc::as_ptr(arc) as usize;
+                if let Some(&i) = self.memo.get(&key) {
+                    return Ok(i);
+                }
+                let i = self.rule(arc)?;
+                self.memo.insert(key, i);
+                i
+            }
+            M::OreVein { ore, raw_ore, filler, raw_ore_chance, roots, positive_y, .. } => {
+                let roots = roots.ok_or_else(|| "filon sans racines du graphe".to_string())?;
+                self.push_rule(S::OreVein {
+                blocks: [ore.0, raw_ore.0, filler.0],
+                raw_chance: *raw_ore_chance,
+                density: roots[0],
+                richness: roots[1],
+                gap: roots[2],
+                    positive_y: *positive_y,
+                })
+            }
+            M::Sequence(children) => {
+                let ids = children.iter().map(|c| self.rule(c)).collect::<Result<Vec<_>, _>>()?;
+                self.push_rule(S::Sequence(ids))
+            }
+            M::Condition { if_true, then_run } => {
+                let condition = self.condition(if_true)?;
+                let rule = self.rule(then_run)?;
+                self.push_rule(S::Condition { condition, rule })
+            }
+            M::Bandlands => self.push_rule(S::Bandlands),
+        })
+    }
+    fn biome_ids(&self, names: &[String]) -> Vec<u32> {
+        names
+            .iter()
+            .filter_map(|n| super::tags::identifier(n).ok())
+            .filter_map(|n| self.data.biome_id(&n))
+            .map(|id| id.0)
+            .collect()
+    }
+    fn condition(&mut self, c: &super::material_condition::MaterialCondition) -> Result<usize, String> {
+        use super::material_condition::MaterialCondition;
+        use horizon_gpu::SurfaceCondition as S;
+        Ok(match c {
+            MaterialCondition::Hole => self.push_condition(S::Hole),
+            MaterialCondition::Steep => self.push_condition(S::Steep),
+            MaterialCondition::Biome(names) => {
+                let ids = self.biome_ids(names);
+                self.push_condition(S::Biomes(ids))
+            }
+            MaterialCondition::BiomeTag(tag) => {
+                let ids = self.biome_ids(tag.members());
+                self.push_condition(S::Biomes(ids))
+            }
+            MaterialCondition::Temperature => self.push_condition(S::Temperature),
+            MaterialCondition::AbovePreliminarySurface => self.push_condition(S::AbovePreliminary),
+            MaterialCondition::NoiseThreshold { noise, min, max, is_3d } => {
+                let name = super::tags::identifier(noise).map_err(|e| format!("{e:?}"))?;
+                let index = match self.noise_index.get(&name) {
+                    Some(&i) => i,
+                    None => {
+                        let n = self.all_noises.get(&name).ok_or_else(|| format!("bruit {name} absent"))?;
+                        self.noises.push(n.as_ref());
+                        self.noise_index.insert(name, self.noises.len() - 1);
+                        self.noises.len() - 1
+                    }
+                };
+                self.push_condition(S::Noise { noise: index, min: *min, max: *max, is_3d: *is_3d })
+            }
+            MaterialCondition::YAbove { anchor, surface_depth_multiplier, add_stone_depth } => self.push_condition(S::YAbove {
+                anchor: anchor.resolve(self.generation),
+                multiplier: *surface_depth_multiplier,
+                add_stone: *add_stone_depth,
+            }),
+            MaterialCondition::Water { offset, surface_depth_multiplier, add_stone_depth } => self.push_condition(S::Water {
+                offset: *offset,
+                multiplier: *surface_depth_multiplier,
+                add_stone: *add_stone_depth,
+            }),
+            MaterialCondition::StoneDepth { offset, add_surface_depth, secondary_depth_range, ceiling } => self.push_condition(S::StoneDepth {
+                offset: *offset,
+                add_surface: *add_surface_depth,
+                secondary_range: *secondary_depth_range,
+                ceiling: *ceiling,
+            }),
+            MaterialCondition::VerticalGradient { random_name, true_at_and_below, false_at_and_above } => {
+                let name = super::tags::identifier(random_name).map_err(|e| format!("{e:?}"))?;
+                let mut r = self.root.from_hash_of(&name);
+                let positional = (r.next_long() as u64, r.next_long() as u64);
+                self.push_condition(S::Gradient {
+                    low: true_at_and_below.resolve(self.generation),
+                    high: false_at_and_above.resolve(self.generation),
+                    positional,
+                })
+            }
+            MaterialCondition::Not(inner) => {
+                let i = self.condition(inner)?;
+                self.push_condition(S::Not(i))
+            }
+            MaterialCondition::Reference(reference) => self.condition(reference.value())?,
+        })
+    }
+}
+
+/// HORIZON_GPU_SURFACE_TEST : the surface's inputs evaluated on the GPU (noises, positional
+/// draws, surface depth) compared bit for bit with the CPU, reported on stderr.
+fn surface_gpu_test<P: PositionalRandom + Clone>(
+    compiler: &horizon_core::density::graph::DensityCompiler,
+    noises: &BTreeMap<String, Arc<dyn Noise>>,
+    surface: &MaterialSurface<P>,
+    root: &P,
+    seed: i64,
+    sea_level: i32,
+) {
+    let mut h: u64 = 12345;
+    let mut suivant = || {
+        h = h.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = h;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let mut points = Vec::new();
+    for i in 0..20_000u64 {
+        let etendue = if i % 3 == 0 { 29_999_999 } else { 30_000 };
+        let x = (suivant() % (2 * etendue + 1)) as i64 - etendue as i64;
+        let z = (suivant() % (2 * etendue + 1)) as i64 - etendue as i64;
+        let y = if i % 2 == 0 { 0 } else { (suivant() % 450) as i64 - 64 };
+        points.push([x as i32, y as i32, z as i32]);
+    }
+    let reels: Vec<[f64; 3]> = points.iter().map(|p| p.map(f64::from)).collect();
+    let mut total = 0usize;
+    // 1. Every noise the surface may bind
+    let liste: Vec<(&String, &Arc<dyn Noise>)> = noises.iter().collect();
+    let refs: Vec<&dyn Noise> = liste.iter().map(|(_, n)| n.as_ref()).collect();
+    match horizon_gpu::evaluate_noises(compiler, &refs, &reels) {
+        Ok(gpu) => {
+            for (k, (nom, n)) in liste.iter().enumerate() {
+                let d = (0..reels.len())
+                    .filter(|&i| n.get3(reels[i][0], reels[i][1], reels[i][2]).to_bits() != gpu[k][i].to_bits())
+                    .count();
+                if d > 0 {
+                    eprintln!("GPU surface S1 : bruit {nom} : {d} differences sur {}", reels.len());
+                }
+                total += d;
+            }
+            eprintln!("GPU surface S1 : {} bruits compares sur {} points", liste.len(), reels.len());
+        }
+        Err(e) => {
+            eprintln!("GPU surface S1 : bruits : {e}");
+            total += 1;
+        }
+    }
+    // 2. Positional draws: the root (surface depth) and named factories (gradients, ore veins)
+    let mut fabriques: Vec<(String, Option<(u64, u64)>, P)> = vec![("racine".into(), root.xoroshiro_state(), root.clone())];
+    for nom in ["minecraft:ore", "minecraft:bedrock_floor", "minecraft:bedrock_roof", "minecraft:deepslate"] {
+        let mut r = root.from_hash_of(nom);
+        let etat = Some((r.next_long() as u64, r.next_long() as u64));
+        fabriques.push((nom.into(), etat, root.clone()));
+    }
+    for (nom, etat, _) in &fabriques {
+        let Some(etat) = *etat else {
+            eprintln!("GPU surface S1 : {nom} : fabrique non Xoroshiro");
+            total += 1;
+            continue;
+        };
+        match horizon_gpu::positional_draws(compiler, etat, &points) {
+            Ok((f, d, f3)) => {
+                let mut ecarts = 0;
+                for (i, p) in points.iter().enumerate() {
+                    let pos = BlockPos::new(p[0], p[1], p[2]);
+                    let (cf, cd, c3) = if nom == "racine" {
+                        let mut a = root.at(pos);
+                        let mut b = root.at(pos);
+                        let mut c = root.at(pos);
+                        (a.next_float(), b.next_double(), [c.next_float(), c.next_float(), c.next_float()])
+                    } else {
+                        let fab = root.from_hash_of(nom).fork_positional();
+                        let mut a = fab.at(pos);
+                        let mut b = fab.at(pos);
+                        let mut c = fab.at(pos);
+                        (a.next_float(), b.next_double(), [c.next_float(), c.next_float(), c.next_float()])
+                    };
+                    let g3 = [f3[3 * i], f3[3 * i + 1], f3[3 * i + 2]];
+                    ecarts += usize::from(cf.to_bits() != f[i].to_bits() || cd.to_bits() != d[i].to_bits() || c3.map(f32::to_bits) != g3.map(f32::to_bits));
+                }
+                if ecarts > 0 {
+                    eprintln!("GPU surface S1 : tirages {nom} : {ecarts} positions differentes");
+                }
+                total += ecarts;
+            }
+            Err(e) => {
+                eprintln!("GPU surface S1 : tirages {nom} : {e}");
+                total += 1;
+            }
+        }
+    }
+    // 3. Surface depth from the GPU's surface noise and root draws
+    if let (Some(n), Some(etat)) = (noises.get("minecraft:surface"), root.xoroshiro_state()) {
+        let colonnes: Vec<[i32; 3]> = points.iter().map(|p| [p[0], 0, p[2]]).collect();
+        let c3: Vec<[f64; 3]> = colonnes.iter().map(|p| p.map(f64::from)).collect();
+        if let (Ok(b), Ok((_, d, _))) = (
+            horizon_gpu::evaluate_noises(compiler, &[n.as_ref()], &c3),
+            horizon_gpu::positional_draws(compiler, etat, &colonnes),
+        ) {
+            let ecarts = (0..colonnes.len())
+                .filter(|&i| {
+                    let g = ((f64::from(b[0][i]) * 2.75 + 3.) + d[i] * 0.25) as i32;
+                    g != surface.surface_depth(colonnes[i][0], colonnes[i][2])
+                })
+                .count();
+            if ecarts > 0 {
+                eprintln!("GPU surface S1 : profondeur de surface : {ecarts} colonnes differentes");
+            }
+            total += ecarts;
+        }
+    }
+    eprintln!(
+        "GPU surface S1 : {}",
+        if total == 0 { "bruits, tirages et profondeur de surface identiques au CPU" } else { "DIFFERENCES TROUVEES" }
+    );
+    // S2 : zoom des biomes et temperature ajustee a la hauteur
+    let zoom = horizon_core::biome::BiomeZoom::new(horizon_core::biome::obfuscate_seed(seed));
+    let combos: Vec<(f32, bool)> = [-0.7f32, -0.5, 0.0, 0.05, 0.15, 0.2, 0.25, 0.5, 0.8, 2.0]
+        .into_iter()
+        .flat_map(|b| [(b, false), (b, true)])
+        .collect();
+    let (hauteur, gel, info) = super::biome_temperature::temperature_noises();
+    let mut points2 = points.clone();
+    for (i, p) in points2.iter_mut().enumerate() {
+        if i % 2 == 0 {
+            p[1] = 40 + (i % 260) as i32;
+        }
+    }
+    let mut total2 = 0usize;
+    match horizon_gpu::surface_s2_check(compiler, zoom_seed_of(&zoom), &points2, &combos, sea_level, hauteur, gel, info) {
+        Ok((quarts, temps)) => {
+            let dq = points2
+                .iter()
+                .zip(&quarts)
+                .filter(|(p, q)| zoom.quart_at_block(BlockPos::new(p[0], p[1], p[2])) != **q)
+                .count();
+            if dq > 0 {
+                eprintln!("GPU surface S2 : zoom des biomes : {dq} positions differentes");
+            }
+            total2 += dq;
+            for (k, &(base, gele)) in combos.iter().enumerate() {
+                let reglages = super::biome_temperature::BiomeTemperatureSettings {
+                    base_temperature: base,
+                    modifier: if gele {
+                        super::biome_temperature::TemperatureModifier::Frozen
+                    } else {
+                        super::biome_temperature::TemperatureModifier::None
+                    },
+                    has_precipitation: true,
+                    downfall: 0.5,
+                };
+                let d = points2
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, p)| {
+                        reglages.height_adjusted(BlockPos::new(p[0], p[1], p[2]), sea_level).to_bits()
+                            != temps[k][*i].to_bits()
+                    })
+                    .count();
+                if d > 0 {
+                    eprintln!("GPU surface S2 : temperature (base {base}, gele {gele}) : {d} differences");
+                }
+                total2 += d;
+            }
+        }
+        Err(e) => {
+            eprintln!("GPU surface S2 : {e}");
+            total2 += 1;
+        }
+    }
+    eprintln!(
+        "GPU surface S2 : {}",
+        if total2 == 0 {
+            "zoom des biomes et temperatures identiques au CPU"
+        } else {
+            "DIFFERENCES TROUVEES"
+        }
+    );
+}
+/// The obfuscated seed a `BiomeZoom` was built with.
+fn zoom_seed_of(zoom: &horizon_core::biome::BiomeZoom) -> i64 {
+    zoom.seed()
+}
+
 fn lap(clock: &mut std::time::Instant) -> std::time::Duration {
     let now = std::time::Instant::now();
     let elapsed = now - *clock;
@@ -2516,6 +3885,8 @@ pub(super) struct WorkerState {
     /// Seed/dimension-bound lookups avoid the shared mutex for overlapping
     /// carver neighborhoods. Bounded independently of the shared cache.
     carver_biomes: HashMap<(i32, i32), BiomeId>,
+    /// The planned carvers of origin blocks (HORIZON_GPU_CAVES), like `carver_biomes`.
+    carver_plans: HashMap<(i32, i32), Arc<OriginBlock>>,
     /// Noise biomes asked one at a time by structure placement checks
     /// (`StartContext::noise_biome`): several structures test the same
     /// quarts, column checks whole columns, and each is a full climate sample.
@@ -2680,6 +4051,7 @@ where
                     region,
                     &mut random,
                     self.structures.as_ref(),
+                    self.ores_gpu.as_ref(),
                 )
             }
             None => Err(resource("decoration resources were not loaded")),
@@ -2695,7 +4067,8 @@ where
         // Taken out under the lock, dropped after it.
         let biomes = std::mem::take(&mut *self.biome_cache.lock().unwrap());
         let carvers = std::mem::take(&mut *self.carver_cache.lock().unwrap());
-        drop((biomes, carvers));
+        let plans = std::mem::take(&mut *self.carver_plans.lock().unwrap());
+        drop((biomes, carvers, plans));
     }
     fn cache_census(&self) -> CacheCensus {
         let biomes = self.biome_cache.lock().unwrap();
@@ -3815,6 +5188,7 @@ impl OverworldGenerator {
                 biome_context: SamplerContext::cached(),
                 carver_context: SamplerContext::default(),
                 carver_biomes: HashMap::new(),
+                carver_plans: HashMap::new(),
                 structure_biomes: HashMap::new(),
                 timings: StageTimings::default(),
                 structures_only: false,
@@ -4032,6 +5406,7 @@ impl GeneratorWorker {
             context.clear_scratch();
         }
         state.carver_biomes = HashMap::new();
+        state.carver_plans = HashMap::new();
         state.structure_biomes = HashMap::new();
         state.heights = HashMap::new();
     }

@@ -16,6 +16,9 @@ pub trait Noise: std::fmt::Debug + Send + Sync {
     fn as_stack(&self) -> Option<&NoiseStack> {
         None
     }
+    fn as_simplex(&self) -> Option<&SimplexNoise> {
+        None
+    }
     fn range(&self) -> Result<[f32; 2], NanRange>;
     fn get2(&self, x: f64, z: f64) -> f32;
     fn get3(&self, x: f64, y: f64, z: f64) -> f32;
@@ -133,6 +136,9 @@ impl Noise for SmearedPerlinNoise {
     }
 }
 impl Noise for SimplexNoise {
+    fn as_simplex(&self) -> Option<&SimplexNoise> {
+        Some(self)
+    }
     fn range(&self) -> Result<[f32; 2], NanRange> {
         Ok(SimplexNoise::range(self))
     }

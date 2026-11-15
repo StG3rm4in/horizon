@@ -164,6 +164,10 @@ impl Pregen {
             .collect()
     }
 
+    /// The band's first row.
+    pub fn row(&self) -> i32 {
+        self.row
+    }
     pub fn finished(&self) -> bool {
         self.strip >= self.strips.len()
     }

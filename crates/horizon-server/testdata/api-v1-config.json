@@ -50,6 +50,7 @@
           "game_mode": "survival",
           "hardcore": false,
           "name": "world",
+          "region_deflate_level": 6,
           "seed": ""
         }
       }

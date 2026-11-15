@@ -92,6 +92,46 @@ pub fn apply_carving_mask_shared<
     inputs: TopMaterialInputs<'_, R, S>,
     aquifer: &mut (impl TerrainAquifer + ?Sized),
     blocks: &CarvingBlocks,
+    filter: impl FnMut([i32; 3]) -> bool,
+) -> Result<(), SurfaceError>
+where
+    R::Positional: Clone,
+{
+    apply_carving_mask_with(
+        chunk,
+        mask,
+        rule,
+        shared,
+        inputs,
+        |context, position| {
+            let state = aquifer
+                .compute_substance(context, position, 0.)
+                .map_err(TerrainError::from)?;
+            Ok((state, aquifer.should_schedule_fluid_update()))
+        },
+        blocks,
+        filter,
+    )
+}
+/// What a carved cell becomes (the aquifer's `compute_substance` with density 0: `None` keeps the
+/// block), and whether a fluid there schedules its update (`should_schedule_fluid_update`).
+pub type CarvedSubstance = (Option<BlockStateId>, bool);
+/// `apply_carving_mask_shared` with the substance of each carved cell from `substance`, asked in the
+/// order the aquifer would be. The material worker that restores exposed dirt is only built for a
+/// chunk that needs it.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_carving_mask_with<
+    R: RandomSource,
+    S: MaterialSurfaceQueries,
+    B: TerrainBlockStates,
+>(
+    chunk: &mut TerrainChunk<'_, B>,
+    mask: &CarvingMask,
+    rule: &MaterialRule,
+    shared: &mut Option<CompiledSurfaceRule<R>>,
+    inputs: TopMaterialInputs<'_, R, S>,
+    mut substance: impl FnMut(&mut SamplerContext, [i32; 3]) -> Result<CarvedSubstance, SurfaceError>,
+    blocks: &CarvingBlocks,
     mut filter: impl FnMut([i32; 3]) -> bool,
 ) -> Result<(), SurfaceError>
 where
@@ -110,17 +150,8 @@ where
         preliminary_surface,
         density_context,
     } = inputs;
-    let volume =
-        DensityVolume::new([1; 3], [0; 3], [1; 3]).map_err(|_| SurfaceError::InvalidVolume)?;
-    let sources = MaterialDensitySources::new(
-        surface,
-        volume,
-        preliminary_surface,
-        SamplerContext::default(),
-    )?;
-    let mut worker =
-        MaterialConditions::<R, _>::with_possible_biomes(generation, root, sources, None);
-    let rule = worker.add_shared_rule(rule, shared)?;
+    let mut parts = Some((root, surface, preliminary_surface));
+    let mut worker: Option<(MaterialConditions<R, _>, usize)> = None;
     let cx = chunk.position().x.wrapping_shl(4);
     let cz = chunk.position().z.wrapping_shl(4);
     for column in mask.columns() {
@@ -136,24 +167,38 @@ where
                 continue;
             }
             found_surface |= flags & 2 != 0;
-            let Some(state) = aquifer
-                .compute_substance(density_context, [x, y, z], 0.)
-                .map_err(TerrainError::from)?
-            else {
+            let (Some(state), schedule) = substance(density_context, [x, y, z])? else {
                 continue;
             };
             chunk.set_block_worldgen(x, y, z, state)?;
-            if aquifer.should_schedule_fluid_update() && chunk.block_properties(state).has_fluid() {
+            if schedule && chunk.block_properties(state).has_fluid() {
                 chunk.mark_postprocessing(x, y, z);
             }
             let below = y.wrapping_sub(1);
             if found_surface && blocks.flags(chunk.block(x, below, z))? & 4 != 0 {
                 let submerged = chunk.block_properties(state).has_fluid();
+                if worker.is_none() {
+                    let (root, surface, preliminary_surface) =
+                        parts.take().ok_or(SurfaceError::InvalidVolume)?;
+                    let volume = DensityVolume::new([1; 3], [0; 3], [1; 3])
+                        .map_err(|_| SurfaceError::InvalidVolume)?;
+                    let sources = MaterialDensitySources::new(
+                        surface,
+                        volume,
+                        preliminary_surface,
+                        SamplerContext::default(),
+                    )?;
+                    let mut w =
+                        MaterialConditions::<R, _>::with_possible_biomes(generation, root, sources, None);
+                    let rule = w.add_shared_rule(rule, shared)?;
+                    worker = Some((w, rule));
+                }
+                let (worker, rule) = worker.as_mut().unwrap();
                 worker.retarget_surface_densities([x, below, z])?;
                 let replacement = top_material_cell(
-                    &mut worker,
+                    worker,
                     chunk,
-                    rule,
+                    *rule,
                     BlockPos::new(x, below, z),
                     submerged,
                 )?;

@@ -39,11 +39,48 @@ impl Compression {
         SELECTED.store(compression as u8, Ordering::Relaxed);
         true
     }
+    /// The deflate level every zlib or gzip record written from here on uses: 0 (stored) to 9
+    /// (smallest), `horizon-region-deflate-level` in server.properties. Lower levels compress
+    /// faster into larger files; 1 saves most of the compression's CPU for ~27 % more disk than 6
+    /// (crates/horizon-gpu/SAUVEGARDE.md). False, and the level as it was, past 9.
+    pub fn configure_deflate_level(level: u32) -> bool {
+        let Ok(level) = u8::try_from(level) else {
+            return false;
+        };
+        if level > 9 {
+            return false;
+        }
+        DEFLATE_LEVEL.store(level, Ordering::Relaxed);
+        true
+    }
     /// `RegionFileVersion.getSelected`: the version a chunk or a poi region
     /// is written with.
     pub fn selected() -> Self {
         Self::try_from(SELECTED.load(Ordering::Relaxed)).unwrap_or(Self::Zlib)
     }
+}
+
+/// The server.properties key of the deflate level (server.toml's `[world] region_deflate_level`).
+pub const DEFLATE_LEVEL_PROPERTY: &str = "horizon-region-deflate-level";
+/// The deflate level [`Compression::configure_deflate_level`] set; above 9 when none was.
+static DEFLATE_LEVEL: AtomicU8 = AtomicU8::new(u8::MAX);
+
+/// The deflate level of what is written in zlib or gzip (region files in `deflate` or `gzip`):
+/// the one configured, else `HORIZON_ZLIB_LEVEL` (0 to 9, read once, for benches), else
+/// `Deflater`'s default, 6, as vanilla. Any level reads back the same.
+fn zlib_level() -> Level {
+    let configured = DEFLATE_LEVEL.load(Ordering::Relaxed);
+    if configured <= 9 {
+        return Level::new(u32::from(configured));
+    }
+    static LEVEL: std::sync::OnceLock<Level> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("HORIZON_ZLIB_LEVEL")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|level| *level <= 9)
+            .map_or(Level::default(), Level::new)
+    })
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
@@ -108,12 +145,12 @@ impl Compression {
         match self {
             Self::None => Ok(bytes.to_vec()),
             Self::Gzip => {
-                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Level::default());
+                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), zlib_level());
                 encoder.write_all(bytes)?;
                 encoder.finish()
             }
             Self::Zlib => {
-                let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Level::default());
+                let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), zlib_level());
                 encoder.write_all(bytes)?;
                 encoder.finish()
             }
@@ -382,6 +419,24 @@ fn encode_lz4(bytes: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// A configured deflate level writes records any level reads back; 6 is put back after.
+    #[test]
+    fn a_configured_deflate_level_reads_back() {
+        use super::*;
+        let raw: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8 ^ (i / 97) as u8).collect();
+        let mut sizes = Vec::new();
+        for level in [1, 9] {
+            assert!(Compression::configure_deflate_level(level));
+            let encoded = Compression::Zlib.encode(&raw).unwrap();
+            assert_eq!(Compression::Zlib.decode(&encoded, usize::MAX).unwrap(), raw);
+            let gz = Compression::Gzip.encode(&raw).unwrap();
+            assert_eq!(Compression::Gzip.decode(&gz, usize::MAX).unwrap(), raw);
+            sizes.push(encoded.len());
+        }
+        assert!(sizes[0] >= sizes[1], "level 1 is not smaller than 9: {sizes:?}");
+        assert!(!Compression::configure_deflate_level(10));
+        assert!(Compression::configure_deflate_level(6));
+    }
     use super::*;
     /// lz4-java's `LZ4BlockInputStream` decides which blocks are corrupted
     /// (#5064). Each stream below has a correct checksum; the results are

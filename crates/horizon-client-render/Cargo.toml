@@ -31,6 +31,7 @@ horizon-shaders = { path = "../horizon-shaders" }
 horizon-system = { path = "../horizon-system" }
 horizon-threads = { path = "../horizon-threads" }
 horizon-world = { path = "../horizon-world" }
+horizon-gpu = { path = "../horizon-gpu" }
 ab_glyph = "0.2.32"
 base64 = "0.22"
 bytemuck = { version = "1.24", features = ["derive"] }

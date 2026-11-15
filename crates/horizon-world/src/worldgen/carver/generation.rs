@@ -1,5 +1,5 @@
 //! Biome-selected neighboring carvers and their per-entry legacy seeds.
-use super::{CanyonCarver, CarverError, CaveCarver};
+use super::{CanyonCarver, CarverError, CaveCarver, PlannedCarve};
 use crate::worldgen::{
     DecodeError, Object, anchor::WorldGenerationContext, density::identifier, required,
 };
@@ -45,6 +45,44 @@ impl WorldCarver {
         match self {
             Self::Cave(c) => c.carve(context, random, target, origin, output),
             Self::Canyon(c) => c.carve(context, random, target, origin, output),
+        }
+    }
+    /// The draws of `carve` from `origin` that do not depend on the target, appended to `out` in
+    /// order (`PlannedCarve`). `execute` then carves the same cells as `carve` for any target.
+    pub fn plan(
+        &self,
+        context: WorldGenerationContext,
+        random: &mut impl RandomSource,
+        origin: ChunkPos,
+        out: &mut Vec<PlannedCarve>,
+    ) -> Result<(), CarverError<std::convert::Infallible>> {
+        match self {
+            Self::Cave(c) => c.plan(context, random, origin, out),
+            Self::Canyon(c) => {
+                out.push(PlannedCarve::Canyon(Box::new(c.plan(context, random, origin)?)));
+                Ok(())
+            }
+        }
+    }
+    /// Carve one planned call (the items `plan` gave for one start) for a target, with its budget.
+    pub fn execute<O: CarverOutput>(
+        &self,
+        context: WorldGenerationContext,
+        items: &[PlannedCarve],
+        target: ChunkPos,
+        output: &mut O,
+    ) -> Result<(), CarverError<O::Error>> {
+        match self {
+            Self::Cave(_) => super::execute_cave(items, target, output, &mut (1 << 24)),
+            Self::Canyon(c) => {
+                for item in items {
+                    match item {
+                        PlannedCarve::Canyon(p) => c.execute(context, p, target, output)?,
+                        _ => return Err(CarverError::InvalidBounds),
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }

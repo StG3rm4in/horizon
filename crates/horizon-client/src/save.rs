@@ -1321,8 +1321,121 @@ impl HeightmapChunk for HeightmapView<'_> {
         self.tables.heightmaps.heightmap_state(BlockStateId(state))
     }
 }
+impl horizon_world::heightmap::HeightmapSections for HeightmapView<'_> {
+    fn sections_min_y(&self) -> i32 {
+        self.column_min_y
+    }
+    /// Each cell's maps from its section's palette: a mask per palette entry, mapped over the stored
+    /// ids (`unpack_ids_mapped`); a state per cell for a global palette.
+    fn section_masks(&self, bottom: i32, kinds: &[HeightmapType], out: &mut [u8; 4096]) -> bool {
+        let Some(section) = usize::try_from((bottom - self.column_min_y) >> 4)
+            .ok()
+            .and_then(|s| self.sections.get(s))
+        else {
+            return false;
+        };
+        let mask = |state: u32| -> u8 {
+            let facts = self.tables.heightmaps.heightmap_state(BlockStateId(state));
+            kinds.iter().enumerate().fold(0, |m, (i, kind)| {
+                m | u8::from(!facts.is_air_block() && kind.is_opaque(facts)) << i
+            })
+        };
+        let blocks = &section.blocks;
+        if blocks.bits() == 0 {
+            let m = mask(blocks.get(0));
+            out.fill(m);
+            return m != 0;
+        }
+        match blocks.palette() {
+            Some(list) => {
+                let masks: Vec<u8> = list.iter().map(|&state| mask(state)).collect();
+                if masks.iter().all(|&m| m == 0) {
+                    return false;
+                }
+                blocks.unpack_ids_mapped(&mut out[..], &masks);
+                true
+            }
+            None => {
+                let mut any = false;
+                for (i, cell) in out.iter_mut().enumerate() {
+                    *cell = mask(blocks.get(i));
+                    any |= *cell != 0;
+                }
+                any
+            }
+        }
+    }
+}
+/// HORIZON_HEIGHTMAP_TEST=1: the saved heightmaps also primed cell by cell, and compared.
+fn heightmap_test() -> bool {
+    static TEST: OnceLock<bool> = OnceLock::new();
+    *TEST.get_or_init(|| std::env::var_os("HORIZON_HEIGHTMAP_TEST").is_some())
+}
+static HEIGHTMAP_TESTS: AtomicU64 = AtomicU64::new(0);
+static HEIGHTMAP_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+/// The heightmaps `heightmaps` saves, primed section by section (`fast`) or cell by cell.
+fn primed_heightmaps(chunk: &Chunk, tables: &SaveTables, shape: LevelShape, fast: bool) -> Option<Vec<Heightmap>> {
+    let kinds = [
+        HeightmapType::WorldSurface,
+        HeightmapType::OceanFloor,
+        HeightmapType::MotionBlocking,
+        HeightmapType::MotionBlockingNoLeaves,
+    ];
+    let mut maps: Vec<Heightmap> = kinds
+        .iter()
+        .filter_map(|k| Heightmap::new(*k, shape.min_y, shape.height).ok())
+        .collect();
+    let view = HeightmapView {
+        sections: &chunk.sections,
+        column_min_y: chunk.min_y(),
+        tables,
+        min_y: shape.min_y,
+        height: shape.height,
+    };
+    let mut refs: Vec<&mut Heightmap> = maps.iter_mut().collect();
+    let primed = if fast {
+        Heightmap::prime_sections(&view, &mut refs)
+    } else {
+        Heightmap::prime(&view, &mut refs)
+    };
+    primed.ok().map(|()| maps)
+}
 /// Heightmaps kept after world generation (`ChunkStatus.FULL.heightmapsAfter`).
 fn heightmaps(chunk: &Chunk, tables: &SaveTables, shape: LevelShape) -> Tag {
+    let fast = primed_heightmaps(chunk, tables, shape, true);
+    let maps = if heightmap_test() {
+        let slow = primed_heightmaps(chunk, tables, shape, false);
+        let same = match (&fast, &slow) {
+            (Some(a), Some(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.raw_data() == y.raw_data()),
+            (None, None) => true,
+            _ => false,
+        };
+        let n = HEIGHTMAP_TESTS.fetch_add(1, Ordering::Relaxed) + 1;
+        if !same {
+            let m = HEIGHTMAP_MISMATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+            if m <= 8 {
+                log::warn!("heightmap test: chunk {} {}: primed by sections, the heightmaps differ", chunk.x, chunk.z);
+            }
+        } else if n.is_power_of_two() {
+            log::info!("heightmap test: {n} chunks, {} mismatches", HEIGHTMAP_MISMATCHES.load(Ordering::Relaxed));
+        }
+        slow
+    } else {
+        fast
+    };
+    let Some(maps) = maps else {
+        return Tag::Compound(Compound::new());
+    };
+    Tag::compound(maps.iter().map(|m| {
+        (
+            m.kind().name(),
+            Tag::LongArray(m.raw_data().iter().map(|&w| w as i64).collect()),
+        )
+    }))
+}
+/// Heightmaps kept after world generation, primed cell by cell (the reference of [`heightmaps`]).
+#[cfg(test)]
+fn heightmaps_by_cells(chunk: &Chunk, tables: &SaveTables, shape: LevelShape) -> Tag {
     let kinds = [
         HeightmapType::WorldSurface,
         HeightmapType::OceanFloor,
@@ -1445,6 +1558,250 @@ fn put_calculated_blending(root: &mut NamedTag, data: &BlendingData) {
     }
     map.insert("blending_data".into(), Tag::compound(fields));
 }
+/// [`encode_saved`]'s bytes as `nbt::write_named` writes its tree, without the tags of its largest
+/// parts. The root's other entries go through the tree writer, in the root's key order; the sections
+/// ([`write_sections`]) and the scheduled ticks ([`write_ticks`]) are written as they are read from
+/// the chunk, in the order their compounds would sort them. None under limits with a node cap, which
+/// only the tree writer counts.
+fn encode_saved_bytes(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    biomes: &Biomes,
+    tables: Option<&SaveTables>,
+    shape: LevelShape,
+    blending: Option<&BlendingData>,
+    limits: Limits,
+) -> Option<std::result::Result<Vec<u8>, nbt::Error>> {
+    let mut root = encode_root(chunk, registry, biomes, tables, shape, false);
+    if let Some(data) = blending {
+        put_calculated_blending(&mut root, data);
+    }
+    let Tag::Compound(map) = &root.tag else {
+        return None;
+    };
+    let mut out = match nbt::RootWriter::compound(&root.name, limits) {
+        Ok(Some(out)) => out,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    let extras = chunk.saved.as_deref();
+    let (blocks, fluids) = extras.map_or((&[][..], &[][..]), |e| {
+        (&e.block_ticks[..], &e.fluid_ticks[..])
+    });
+    let written = (|| -> std::result::Result<(), nbt::Error> {
+        for (key, value) in map {
+            if is_key(key, "sections") {
+                out.named_java(9, key)?;
+                write_sections(&mut out, chunk, registry, biomes, tables, shape, limits)?;
+            } else if let Some(t) = tables
+                && is_key(key, "block_ticks")
+            {
+                out.named_java(9, key)?;
+                write_ticks(&mut out, blocks, |k| {
+                    t.block_names.get(k as usize).map(String::as_str)
+                })?;
+            } else if tables.is_some() && is_key(key, "fluid_ticks") {
+                out.named_java(9, key)?;
+                write_ticks(&mut out, fluids, fluid_str)?;
+            } else {
+                out.entry(key, value)?;
+            }
+        }
+        Ok(())
+    })();
+    Some(written.and_then(|()| out.finish()))
+}
+/// Whether a compound key is the ASCII `name`.
+fn is_key(key: &JavaString, name: &str) -> bool {
+    key.0.len() == name.len() && key.0.iter().zip(name.bytes()).all(|(&u, b)| u == u16::from(b))
+}
+/// [`fluid_name`] without the copy.
+fn fluid_str(kind: u32) -> Option<&'static str> {
+    use horizon_world::fluid::FluidKind;
+    let fluid = FluidKind::from_index(kind as usize)?;
+    (fluid != FluidKind::Empty).then(|| fluid.name())
+}
+/// The `sections` list [`encode_with`] builds, written as its tags would be: per section `BlockLight`,
+/// `SkyLight`, `Y`, `biomes` (`data`, `palette`), `block_states` (`data`, `palette`), their key order.
+fn write_sections(
+    out: &mut nbt::RootWriter,
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    biomes: &Biomes,
+    tables: Option<&SaveTables>,
+    shape: LevelShape,
+    limits: Limits,
+) -> std::result::Result<(), nbt::Error> {
+    let sky_light = shape.sky_light;
+    let top_sky = chunk
+        .sections
+        .iter()
+        .rposition(|s| s.light.any_not(0xF0, 0xF0));
+    let written: Vec<usize> = (0..chunk.sections.len())
+        .filter(|&si| shape.has_section((chunk.min_y() >> 4) + si as i32))
+        .collect();
+    out.list(if written.is_empty() { 0 } else { 10 }, written.len())?;
+    for si in written {
+        let section = &chunk.sections[si];
+        let y = (chunk.min_y() >> 4) + si as i32;
+        if chunk.lit {
+            if section.light.any(15) {
+                out.named(7, "BlockLight")?;
+                out.byte_array(&nibbles(&section.light, false))?;
+            }
+            if sky_light && top_sky.is_some_and(|top| si <= top + 1) {
+                out.named(7, "SkyLight")?;
+                out.byte_array(&nibbles(&section.light, true))?;
+            }
+        }
+        out.named(1, "Y")?;
+        out.byte(y as i8)?;
+        let biome_packed = section.biomes.pack();
+        out.named(10, "biomes")?;
+        if let Some(data) = &biome_packed.data {
+            out.named(12, "data")?;
+            out.long_array(data)?;
+        }
+        out.named(9, "palette")?;
+        let n = biome_packed.palette.len();
+        out.list(if n == 0 { 0 } else { 8 }, n)?;
+        for &b in &biome_packed.palette {
+            out.str(&biomes.get(b as u16).name)?;
+        }
+        out.end()?;
+        let packed = section.blocks.pack();
+        out.named(10, "block_states")?;
+        if let Some(data) = &packed.data {
+            out.named(12, "data")?;
+            out.long_array(data)?;
+        }
+        out.named(9, "palette")?;
+        write_state_palette(out, &packed.palette, registry, tables, limits)?;
+        out.end()?;
+        out.end()?;
+    }
+    Ok(())
+}
+thread_local! {
+    /// Per block state that a palette writes as its compound (not a default state): the tag's id,
+    /// whether a mixed list wraps it anyway, and its payload, for the registry at the address kept.
+    static STATE_PAYLOADS: std::cell::RefCell<(usize, HashMap<u32, (u8, bool, Vec<u8>)>)> =
+        Default::default();
+}
+/// A section's block state palette as [`encode_with`] builds it: the name of a default state (or of
+/// air for an unknown id), the compound of any other, in a list that wraps its strings in one-entry
+/// compounds when it mixes the two, as the tree writer does.
+fn write_state_palette(
+    out: &mut nbt::RootWriter,
+    palette: &[u32],
+    registry: &BlockRegistry,
+    tables: Option<&SaveTables>,
+    limits: Limits,
+) -> std::result::Result<(), nbt::Error> {
+    enum Entry<'a> {
+        Name(&'a str),
+        State(u32),
+    }
+    let entries: Vec<Entry> = palette
+        .iter()
+        .map(|&id| match registry.state(BlockStateId(id)) {
+            Some(s) if tables.is_some_and(|t| t.default_state.get(id as usize) == Some(&true)) => {
+                Entry::Name(&s.name)
+            }
+            Some(_) => Entry::State(id),
+            None => Entry::Name("minecraft:air"),
+        })
+        .collect();
+    STATE_PAYLOADS.with_borrow_mut(|(owner, cache)| {
+        let address = registry as *const BlockRegistry as usize;
+        if *owner != address || cache.len() > 1 << 16 {
+            cache.clear();
+            *owner = address;
+        }
+        for entry in &entries {
+            if let Entry::State(id) = entry
+                && !cache.contains_key(id)
+                && let Some(state) = registry.state(BlockStateId(*id))
+            {
+                let tag = state.to_nbt();
+                let payload = nbt::payload_bytes(&tag, limits)?;
+                cache.insert(*id, (tag.id(), nbt::wrapped_in_mixed_list(&tag), payload));
+            }
+        }
+        let id_of = |entry: &Entry| match entry {
+            Entry::Name(_) => 8,
+            Entry::State(id) => cache[id].0,
+        };
+        let first = entries.first().map_or(0, id_of);
+        let list = if entries.iter().any(|e| id_of(e) != first) {
+            10
+        } else {
+            first
+        };
+        out.list(list, entries.len())?;
+        for entry in &entries {
+            match entry {
+                Entry::Name(name) if list == 10 => out.wrapped_str(name)?,
+                Entry::Name(name) => out.str(name)?,
+                Entry::State(id) => {
+                    let (tag_id, wrapper, payload) = &cache[id];
+                    if list == 10 && (*tag_id != 10 || *wrapper) {
+                        out.wrapped(*tag_id, payload)?;
+                    } else {
+                        out.raw(payload)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+}
+/// [`tick_list`] written as its tags would be: per tick with a name, `i`, `p`, `t`, `x`, `y`, `z`.
+fn write_ticks<'a>(
+    out: &mut nbt::RootWriter,
+    ticks: &[SavedTick],
+    name: impl Fn(u32) -> Option<&'a str>,
+) -> std::result::Result<(), nbt::Error> {
+    let count = ticks.iter().filter(|t| name(t.kind.0).is_some()).count();
+    out.list(if count == 0 { 0 } else { 10 }, count)?;
+    for t in ticks {
+        let Some(id) = name(t.kind.0) else {
+            continue;
+        };
+        out.named(8, "i")?;
+        out.str(id)?;
+        out.named(3, "p")?;
+        out.int(t.priority as i32)?;
+        out.named(3, "t")?;
+        out.int(t.delay)?;
+        out.named(3, "x")?;
+        out.int(t.pos.x)?;
+        out.named(3, "y")?;
+        out.int(t.pos.y)?;
+        out.named(3, "z")?;
+        out.int(t.pos.z)?;
+        out.end()?;
+    }
+    Ok(())
+}
+/// How chunk records are written: straight from the chunk (by default), from its tag
+/// (`HORIZON_NBT=tree`), or both, compared (`HORIZON_NBT_TEST=1`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NbtMode {
+    Direct,
+    Tree,
+    Test,
+}
+fn nbt_mode() -> NbtMode {
+    static MODE: OnceLock<NbtMode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("HORIZON_NBT").as_deref() {
+        Ok("tree") => NbtMode::Tree,
+        _ if std::env::var_os("HORIZON_NBT_TEST").is_some() => NbtMode::Test,
+        _ => NbtMode::Direct,
+    })
+}
+static NBT_TESTS: AtomicU64 = AtomicU64::new(0);
+static NBT_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 /// The chunk NBT vanilla's `SerializableChunkData.write` produces for a full
 /// chunk in a level of `shape`.
 pub fn encode_with(
@@ -1453,6 +1810,18 @@ pub fn encode_with(
     biomes: &Biomes,
     tables: Option<&SaveTables>,
     shape: LevelShape,
+) -> NamedTag {
+    encode_root(chunk, registry, biomes, tables, shape, true)
+}
+/// [`encode_with`], its sections and scheduled ticks left as empty lists unless `heavy`:
+/// [`encode_saved_bytes`] writes them straight from the chunk, under the same keys.
+fn encode_root(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    biomes: &Biomes,
+    tables: Option<&SaveTables>,
+    shape: LevelShape,
+    heavy: bool,
 ) -> NamedTag {
     let sky_light = shape.sky_light;
     let mut sections = Vec::new();
@@ -1464,7 +1833,7 @@ pub fn encode_with(
         .sections
         .iter()
         .rposition(|s| s.light.any_not(0xF0, 0xF0));
-    for (si, section) in chunk.sections.iter().enumerate() {
+    for (si, section) in chunk.sections.iter().enumerate().filter(|_| heavy) {
         let y = (chunk.min_y() >> 4) + si as i32;
         if !shape.has_section(y) {
             continue;
@@ -1707,8 +2076,13 @@ pub fn encode_with(
         let (blocks, fluids) = extras.map_or((&[][..], &[][..]), |e| {
             (&e.block_ticks[..], &e.fluid_ticks[..])
         });
-        put(&mut root, "block_ticks", tick_list(blocks, names));
-        put(&mut root, "fluid_ticks", tick_list(fluids, fluid_name));
+        let (block_ticks, fluid_ticks) = if heavy {
+            (tick_list(blocks, names), tick_list(fluids, fluid_name))
+        } else {
+            (Tag::List(Vec::new()), Tag::List(Vec::new()))
+        };
+        put(&mut root, "block_ticks", block_ticks);
+        put(&mut root, "fluid_ticks", fluid_ticks);
     }
     NamedTag {
         name: "".into(),
@@ -2338,6 +2712,57 @@ impl Record {
             Record::Poi(c, t) => encode_poi(c, t).map(Arc::new),
             Record::Delete => None,
         }
+    }
+    /// The record's NBT, as `nbt::write_named` writes its tag; a chunk is written straight from its
+    /// data ([`encode_saved_bytes`], [`NbtMode`]).
+    fn encoded(&self, limits: Limits) -> Option<std::io::Result<Vec<u8>>> {
+        let invalid = |e: nbt::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
+        let tree = |record: &Self| record.tag().map(|tag| nbt::write_named(&tag, limits).map_err(invalid));
+        let mode = nbt_mode();
+        if let Record::Chunk(c, e, blending) = self
+            && mode != NbtMode::Tree
+            && let Some(direct) = encode_saved_bytes(
+                c,
+                e.registry,
+                &e.biomes,
+                e.tables.as_deref(),
+                e.shape,
+                blending.as_deref(),
+                limits,
+            )
+        {
+            let direct = direct.map_err(invalid);
+            if mode == NbtMode::Test {
+                let reference = tree(self);
+                let n = NBT_TESTS.fetch_add(1, Ordering::Relaxed) + 1;
+                let same = matches!((&direct, &reference), (Ok(a), Some(Ok(b))) if a == b);
+                if !same {
+                    let m = NBT_MISMATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+                    if m <= 8 {
+                        let at = match (&direct, &reference) {
+                            (Ok(a), Some(Ok(b))) => a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len())),
+                            _ => 0,
+                        };
+                        log::warn!(
+                            "NBT test: chunk {} {}: the direct bytes differ from the tree's at byte {at} ({:?} / {:?} bytes)",
+                            c.x,
+                            c.z,
+                            direct.as_ref().map(Vec::len).ok(),
+                            reference.as_ref().and_then(|r| r.as_ref().map(Vec::len).ok())
+                        );
+                    }
+                    return reference;
+                }
+                if n.is_power_of_two() {
+                    log::info!(
+                        "NBT test: {n} chunks, {} mismatches",
+                        NBT_MISMATCHES.load(Ordering::Relaxed)
+                    );
+                }
+            }
+            return Some(direct);
+        }
+        tree(self)
     }
 }
 /// A queued POI record as it is written: claims kept from the saved one, and
@@ -5274,6 +5699,87 @@ fn effect_details(e: &crate::effects::SavedEffect) -> Vec<(&'static str, Tag)> {
 #[cfg(test)]
 mod tests {
     use crate::mobs::spawner::SpawnDataExt;
+
+    /// The saved heightmaps primed section by section are those primed cell by cell.
+    #[test]
+    fn heightmaps_by_sections_match_cells() {
+        let Some(root) = std::env::var_os("HORIZON_TEST_RESOURCES") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let assets = crate::assets::Assets::load(&root).expect("assets");
+        let tables = super::SaveTables::new(&assets);
+        let shape = super::LevelShape::OVERWORLD;
+        let states = assets.registry.len() as u64;
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..6 {
+            let mut chunk = super::Chunk::with_layout(round, 2, shape.column());
+            let ground = 40 + round * 37;
+            for i in 0..(16 * 16 * 384) {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let y = -64 + i / 256;
+                if y < ground || (y < ground + 30 && seed % 11 == 0) {
+                    let state = if seed % 5 == 0 { (seed % states) as u32 } else { (seed % 60) as u32 };
+                    chunk.set(i % 16, y, (i / 16) % 16, state);
+                }
+            }
+            assert_eq!(
+                super::heightmaps(&chunk, &tables, shape),
+                super::heightmaps_by_cells(&chunk, &tables, shape),
+                "round {round}"
+            );
+        }
+    }
+
+    /// The chunk writer without tags writes the bytes the tree writer writes: random states (default
+    /// ones and others, so mixed palettes), with and without light, with and without the tables.
+    #[test]
+    fn direct_chunk_bytes_match_the_tree() {
+        let Some(root) = std::env::var_os("HORIZON_TEST_RESOURCES") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let assets = crate::assets::Assets::load(&root).expect("assets");
+        let biomes = super::Biomes::load(&root).expect("biomes");
+        let tables = super::SaveTables::new(&assets);
+        let shape = super::LevelShape::OVERWORLD;
+        let mut chunk = super::Chunk::with_layout(3, -7, shape.column());
+        let states = assets.registry.len() as u64;
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for i in 0..30_000i32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            // A few states per section, from all over the registry
+            let state = if i % 7 == 0 { (seed % states) as u32 } else { (seed % 40) as u32 };
+            chunk.set(i % 16, -64 + (i / 256) % 384, (i / 16) % 16, state);
+        }
+        let limits = super::Limits::saved();
+        for lit in [false, true] {
+            chunk.lit = lit;
+            for tables in [None, Some(&tables)] {
+                let tree = super::nbt::write_named(
+                    &super::encode_saved(&chunk, assets.registry, &biomes, tables, shape, None),
+                    limits,
+                )
+                .unwrap();
+                let direct = super::encode_saved_bytes(
+                    &chunk,
+                    assets.registry,
+                    &biomes,
+                    tables,
+                    shape,
+                    None,
+                    limits,
+                )
+                .expect("limits without a node cap")
+                .unwrap();
+                assert!(tree == direct, "lit {lit}, tables {}", tables.is_some());
+            }
+        }
+    }
 
     #[test]
     fn an_ender_chest_saves_none_of_the_players_items() {

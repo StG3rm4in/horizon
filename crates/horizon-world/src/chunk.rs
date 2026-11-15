@@ -10,7 +10,7 @@ use crate::{
 };
 use horizon_core::{
     position::{BlockPos, ChunkPos},
-    storage::PackedStorage,
+    storage::{PackedStorage, Slot},
     ticks::{ChunkTicks, SavedTick, TickTypeId},
 };
 use std::{collections::HashMap, io};
@@ -483,6 +483,115 @@ impl<'r> BlockSection<'r> {
             extra: Compound::new(),
         })
     }
+    /// A section from its parts as `set` leaves them: the palette with its dead slots, the count of
+    /// each slot, the dead slots, and the packed ids (`None`: a single state). Checked for coherence.
+    pub fn from_parts(
+        registry: &'r BlockRegistry,
+        palette: Vec<BlockStateId>,
+        counts: Vec<u16>,
+        free: Vec<u32>,
+        storage: Option<PackedStorage>,
+    ) -> io::Result<Self> {
+        let total: u32 = counts.iter().map(|&c| u32::from(c)).sum();
+        if palette.is_empty()
+            || palette.len() != counts.len()
+            || total != 4096
+            || palette.iter().any(|s| registry.state(*s).is_none())
+            || free
+                .iter()
+                .any(|&f| counts.get(f as usize).is_none_or(|&c| c != 0))
+        {
+            return Err(invalid("section parts"));
+        }
+        match &storage {
+            None if palette.len() != 1 => return Err(invalid("section parts")),
+            Some(s) if s.len() != 4096 || s.bits() != bits_for_palette(palette.len(), 4) => {
+                return Err(invalid("section parts"));
+            }
+            _ => {}
+        }
+        Ok(Self {
+            palette,
+            last: None,
+            counts,
+            free,
+            storage,
+            registry,
+            extra: Compound::new(),
+        })
+    }
+    /// The section as `horizon_core::paletted::PalettedContainer::from_values(strategy, ...)` builds it
+    /// from its 4,096 states, without unpacking them: the live slots ordered by their first cell (two
+    /// slots of one state merge), then each cell's id mapped.
+    pub fn to_container(
+        &self,
+        strategy: horizon_core::paletted::Strategy,
+    ) -> horizon_core::paletted::PalettedContainer {
+        use horizon_core::paletted::PalettedContainer as Container;
+        let Some(storage) = &self.storage else {
+            return Container::new(strategy, self.palette[0].0);
+        };
+        let n = self.palette.len();
+        let live = self.counts.iter().filter(|&&c| c != 0).count();
+        let mut first = vec![u32::MAX; n];
+        let mut seen = 0;
+        if storage.bits() == 4 && n <= 16 {
+            // A word holds 16 ids: the ids it holds as a mask, the cell only for one not seen before
+            let mut known = 0u32;
+            'words: for (w, &word) in storage.words().iter().enumerate() {
+                let mut held = 0u32;
+                for k in 0..16 {
+                    held |= 1 << ((word >> (4 * k)) & 15);
+                }
+                let mut new = held & !known;
+                known |= held;
+                while new != 0 {
+                    let id = new.trailing_zeros() as u64;
+                    new &= new - 1;
+                    let k = (0..16).find(|&k| (word >> (4 * k)) & 15 == id).unwrap_or(0);
+                    if let Some(f) = first.get_mut(id as usize) {
+                        *f = (w * 16 + k) as u32;
+                        seen += 1;
+                    }
+                }
+                if seen >= live {
+                    break 'words;
+                }
+            }
+        } else {
+            for i in 0..4096 {
+                let id = storage.read(i) as usize;
+                if let Some(f) = first.get_mut(id)
+                    && *f == u32::MAX
+                {
+                    *f = i as u32;
+                    seen += 1;
+                    if seen == live {
+                        break;
+                    }
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..n).filter(|&k| first[k] != u32::MAX).collect();
+        order.sort_unstable_by_key(|&k| first[k]);
+        let mut palette: Vec<u32> = Vec::with_capacity(order.len());
+        let mut map = vec![0u32; n];
+        for k in order {
+            let v = self.palette[k].0;
+            map[k] = match palette.iter().position(|&p| p == v) {
+                Some(j) => j as u32,
+                None => {
+                    palette.push(v);
+                    (palette.len() - 1) as u32
+                }
+            };
+        }
+        Container::from_mapped(strategy, palette, storage.bits(), storage.words(), &map)
+    }
+    /// Its parts, as `from_parts` takes them.
+    pub fn parts(&self) -> (&[BlockStateId], &[u16], &[u32], Option<&PackedStorage>) {
+        (&self.palette, &self.counts, &self.free, self.storage.as_ref())
+    }
     pub fn from_nbt(tag: &Tag, registry: &'r BlockRegistry) -> io::Result<Self> {
         let container = PalettedContainer::from_nbt(tag, 4096, 4)?;
         let resolved = container
@@ -575,8 +684,48 @@ impl<'r> BlockSection<'r> {
         // needed for it; only the new state has to be resolved. Reading and
         // writing that slot share one position computation; growing the palette
         // re-packs the storage, which looks the position up again.
-        let mut slot = storage.slot_of(index);
+        let slot = storage.slot_of(index);
         let old_id = storage.read_at(slot);
+        self.set_slot(index, slot, old_id, state)
+    }
+    /// `f` is given the state at `index`; when it returns a state, that state is written there as
+    /// [`set`](Self::set) writes it, the slot computed once for the read and the write. The old and
+    /// the new state when `f` returned one.
+    #[inline]
+    pub(crate) fn replace_with(
+        &mut self,
+        index: usize,
+        f: impl FnOnce(BlockStateId) -> Option<BlockStateId>,
+    ) -> io::Result<Option<(BlockStateId, BlockStateId)>> {
+        if index >= 4096 {
+            return Err(invalid("section index out of bounds"));
+        }
+        let Some(storage) = self.storage.as_ref() else {
+            return match f(self.palette[0]) {
+                Some(state) => self.set(index, state).map(|old| Some((old, state))),
+                None => Ok(None),
+            };
+        };
+        let slot = storage.slot_of(index);
+        let old_id = storage.read_at(slot);
+        let Some(state) = f(self.palette[old_id as usize]) else {
+            return Ok(None);
+        };
+        if state.0 as usize >= self.registry.len() {
+            return Err(invalid("state ID outside registry"));
+        }
+        self.set_slot(index, slot, old_id, state)
+            .map(|old| Some((old, state)))
+    }
+    /// The rest of [`set`](Self::set) in a section with a word array, once the slot of `index` and
+    /// the palette id it holds are read.
+    fn set_slot(
+        &mut self,
+        index: usize,
+        mut slot: Slot,
+        old_id: u32,
+        state: BlockStateId,
+    ) -> io::Result<BlockStateId> {
         let old = self.palette[old_id as usize];
         if old == state {
             return Ok(old);
@@ -1168,6 +1317,35 @@ mod tests {
             ("defaults", Tag::Compound(defaults)),
         ]);
         BlockRegistry::from_nbt(&tag).unwrap()
+    }
+
+    /// `to_container` builds what `from_values` builds from the section's states, word for word, from
+    /// a uniform section through list palettes (dead slots, reused slots) to the global palette.
+    #[test]
+    fn to_container_matches_from_values() {
+        use horizon_core::paletted::{PalettedContainer as Container, Strategy};
+        let registry = benchmark_registry(400);
+        let strategy = Strategy::blocks(9);
+        for &(distinct, seed) in &[(1u64, 1u64), (2, 2), (5, 9), (16, 3), (17, 4), (64, 6), (300, 8)] {
+            let mut section = BlockSection::uniform(BlockStateId(0), &registry).unwrap();
+            let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut out = [0u32; 4096];
+            for round in 0..6 {
+                section.fill_states(&mut out);
+                let a = section.to_container(strategy);
+                let b = Container::from_values(strategy, &out);
+                assert_eq!(a.to_wire(), b.to_wire(), "{distinct} states, round {round}");
+                // Overwrite most of the section with few states, then scatter more: slots die and are reused
+                for k in 0..3_000 {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    let index = if round % 2 == 0 { k } else { (rng % 4096) as usize };
+                    let value = ((rng >> 20) % distinct) as u32;
+                    section.set(index, BlockStateId(value)).unwrap();
+                }
+            }
+        }
     }
 
     /// `fill_states` reads what `state` reads at every index, from a uniform

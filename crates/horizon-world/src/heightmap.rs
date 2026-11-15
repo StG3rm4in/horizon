@@ -76,6 +76,18 @@ pub trait HeightmapChunk {
     fn block_state(&self, x: i32, y: i32, z: i32) -> Self::State;
 }
 
+/// What [`Heightmap::prime_sections`] reads of a column: a section at a time, each cell as the maps
+/// it tops.
+pub trait HeightmapSections: HeightmapChunk {
+    /// The lowest Y of the sections, one every 16 blocks up from it.
+    fn sections_min_y(&self) -> i32;
+    /// The cells of the section whose lowest Y is `bottom`, in `(y << 8) | (z << 4) | x` order: bit `i`
+    /// where the state `block_state` reads is not exactly air and `kinds[i].is_opaque` holds for it,
+    /// as [`Heightmap::prime`] tests them. False (and `out` unspecified) when no cell has a bit, or
+    /// there is no section there.
+    fn section_masks(&self, bottom: i32, kinds: &[HeightmapType], out: &mut [u8; 4096]) -> bool;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeightmapError {
     InvalidBounds,
@@ -168,6 +180,10 @@ impl Heightmap {
         })
     }
 
+    /// Set a column's first available y (`x` and `z` within 0..16), as `update` would have.
+    pub fn set_first_available(&mut self, x: i32, z: i32, y: i32) -> Result<(), HeightmapError> {
+        self.set_height(x, z, y)
+    }
     pub fn highest_taken(&self, x: i32, z: i32) -> Result<i32, HeightmapError> {
         Ok(self.first_available(x, z)?.wrapping_sub(1))
     }
@@ -237,6 +253,67 @@ impl Heightmap {
 
     /// Preserves caller map order and scans X, then Z, then descending Y.
     /// An unfound column retains its previous value, including during re-priming.
+    /// [`prime`](Self::prime) a section at a time: the same heights (each map at the highest cell its
+    /// kind tops, under the highest section that is not all air), from the masks of the sections
+    /// instead of a state per cell.
+    pub fn prime_sections(
+        chunk: &impl HeightmapSections,
+        maps: &mut [&mut Self],
+    ) -> Result<(), HeightmapError> {
+        if maps.is_empty() {
+            return Ok(());
+        }
+        if maps.len() > 8 {
+            return Self::prime(chunk, maps);
+        }
+        for map in maps.iter() {
+            map.check_chunk(chunk)?;
+        }
+        let kinds: Vec<HeightmapType> = maps.iter().map(|m| m.kind).collect();
+        let full = ((1u16 << maps.len()) - 1) as u8;
+        let mut remaining = [full; 256];
+        let mut open = 256usize;
+        let top = i64::from(chunk.highest_section_y().wrapping_add(16).wrapping_sub(1));
+        let bottom = i64::from(chunk.min_y());
+        let base = i64::from(chunk.sections_min_y());
+        let mut masks = [0u8; 4096];
+        let mut section = base + (top - base).div_euclid(16) * 16;
+        while open > 0 && section + 15 >= bottom && top >= bottom {
+            if let Ok(start) = i32::try_from(section)
+                && chunk.section_masks(start, &kinds, &mut masks)
+            {
+                let (hi, lo) = ((section + 15).min(top), section.max(bottom));
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let column = (z * 16 + x) as usize;
+                        if remaining[column] == 0 {
+                            continue;
+                        }
+                        let mut y = hi;
+                        while y >= lo {
+                            let cell = (((y - section) as usize) << 8) | ((z as usize) << 4) | x as usize;
+                            let m = masks[cell] & remaining[column];
+                            if m != 0 {
+                                for (i, map) in maps.iter_mut().enumerate() {
+                                    if m >> i & 1 != 0 {
+                                        map.set_height(x, z, (y as i32).wrapping_add(1))?;
+                                    }
+                                }
+                                remaining[column] &= !m;
+                                if remaining[column] == 0 {
+                                    open -= 1;
+                                    break;
+                                }
+                            }
+                            y -= 1;
+                        }
+                    }
+                }
+            }
+            section -= 16;
+        }
+        Ok(())
+    }
     pub fn prime(
         chunk: &impl HeightmapChunk,
         maps: &mut [&mut Self],
@@ -276,5 +353,107 @@ impl Heightmap {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prime_sections_tests {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct S(u8);
+    impl HeightmapState for S {
+        fn is_air(self) -> bool {
+            self.0 < 3
+        }
+        fn is_air_block(self) -> bool {
+            self.0 == 0
+        }
+        fn has_fluid(self) -> bool {
+            self.0 % 7 == 3
+        }
+        fn blocks_motion_in_heightmap(self) -> bool {
+            self.0 % 3 == 1
+        }
+        fn blocks_motion_in_heightmap_no_leaves(self) -> bool {
+            self.0 % 5 == 1
+        }
+    }
+    struct Column {
+        cells: Vec<u8>,
+    }
+    impl HeightmapChunk for Column {
+        type State = S;
+        fn min_y(&self) -> i32 {
+            -64
+        }
+        fn height(&self) -> i32 {
+            384
+        }
+        fn highest_section_y(&self) -> i32 {
+            let top = (0..24).rev().find(|&s| self.cells[s * 4096..(s + 1) * 4096].iter().any(|&c| c != 0));
+            -64 + top.unwrap_or(0) as i32 * 16
+        }
+        fn block_state(&self, x: i32, y: i32, z: i32) -> S {
+            S(self.cells[((y + 64) as usize) * 256 + (z as usize) * 16 + x as usize])
+        }
+    }
+    impl HeightmapSections for Column {
+        fn sections_min_y(&self) -> i32 {
+            -64
+        }
+        fn section_masks(&self, bottom: i32, kinds: &[HeightmapType], out: &mut [u8; 4096]) -> bool {
+            let mut any = false;
+            for (i, cell) in out.iter_mut().enumerate() {
+                let s = self.block_state((i & 15) as i32, bottom + (i >> 8) as i32, ((i >> 4) & 15) as i32);
+                *cell = kinds.iter().enumerate().fold(0, |m, (k, kind)| {
+                    m | u8::from(!s.is_air_block() && kind.is_opaque(s)) << k
+                });
+                any |= *cell != 0;
+            }
+            any
+        }
+    }
+
+    /// Section by section, the heights are those of the cell-by-cell prime.
+    #[test]
+    fn prime_sections_matches_prime() {
+        let kinds = [
+            HeightmapType::WorldSurface,
+            HeightmapType::OceanFloor,
+            HeightmapType::MotionBlocking,
+            HeightmapType::MotionBlockingNoLeaves,
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..40 {
+            // Ground up to a random height, then sparse blocks, air above
+            let ground = next(384) as usize;
+            let cells: Vec<u8> = (0..384 * 256)
+                .map(|i| {
+                    let y = i / 256;
+                    if y < ground {
+                        (next(30) + 1) as u8
+                    } else if y < ground + 40 && next(9) == 0 {
+                        next(30) as u8
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+            let column = Column { cells };
+            let mut a: Vec<Heightmap> = kinds.iter().map(|k| Heightmap::new(*k, -64, 384).unwrap()).collect();
+            let mut b: Vec<Heightmap> = kinds.iter().map(|k| Heightmap::new(*k, -64, 384).unwrap()).collect();
+            Heightmap::prime(&column, &mut a.iter_mut().collect::<Vec<_>>()).unwrap();
+            Heightmap::prime_sections(&column, &mut b.iter_mut().collect::<Vec<_>>()).unwrap();
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(x.raw_data(), y.raw_data(), "round {round}, {:?}", x.kind);
+            }
+        }
     }
 }

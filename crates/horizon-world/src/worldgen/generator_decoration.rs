@@ -20,13 +20,16 @@ use super::{
     decoration::{DecorationWorld, FeatureDecorationPlan},
     feature::{FeatureBlocks, FeatureWorld},
     feature_catalog::FeatureCatalog,
-    feature_graph::PlacedFeatureDefinition,
+    feature_graph::{FeatureDefinition, FeatureExecutionError, PlacedFeatureDefinition},
     feature_region::{RegionError, TerrainRegion},
     feature_sort::FeatureIdentity,
     generator::{
         DecorateStats, GenBlockStates, GeneratorData, GeneratorError, ProtoChunk, WorkerState,
     },
-    placement::{FeaturePlacer, LayerBlock, PlacementContext, PlacementQueryError},
+    ore_feature::{OreAttempt, OreFeature},
+    placement::{
+        FeaturePlacer, LayerBlock, PlacementContext, PlacementModifier, PlacementQueryError,
+    },
     tags::TagDefinitions,
     terrain::PreLightChunkStage,
     write_zone::GenerationWriteZone,
@@ -79,6 +82,92 @@ pub(super) struct Decoration {
     /// A superflat world's `FillLayerFeature`s (`TOP_LAYER_MODIFICATION`): the level Y and state
     /// of each layer that is not opaque to `MOTION_BLOCKING`, filled after the structures.
     pub(super) top_layers: Vec<(i32, BlockStateId)>,
+    times: Option<FeatureTimes>,
+}
+/// HORIZON_FEATURE_TIMES=1: the wall time of each placed feature, of each structure's pieces, of
+/// the ore prediction and of the rest of `Decoration::decorate`, summed over every decorated
+/// chunk; the list in latest.log every 10 000 chunks. Measurement only: nothing it places changes.
+struct FeatureTimes {
+    /// Per feature identity: nanoseconds, calls, calls that placed something
+    features: Vec<[std::sync::atomic::AtomicU64; 3]>,
+    /// Per structure index: nanoseconds, calls
+    structures: std::sync::Mutex<Vec<[u64; 2]>>,
+    /// Whole decorate, setup before the plan, ore prediction, top layers and after
+    stages: [std::sync::atomic::AtomicU64; 4],
+    chunks: std::sync::atomic::AtomicU64,
+}
+impl FeatureTimes {
+    fn from_env(features: usize) -> Option<Self> {
+        std::env::var_os("HORIZON_FEATURE_TIMES")?;
+        Some(Self {
+            features: (0..features).map(|_| Default::default()).collect(),
+            structures: std::sync::Mutex::new(Vec::new()),
+            stages: Default::default(),
+            chunks: Default::default(),
+        })
+    }
+    fn feature(&self, id: usize, ns: u64, placed: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(f) = self.features.get(id) {
+            f[0].fetch_add(ns, Relaxed);
+            f[1].fetch_add(1, Relaxed);
+            f[2].fetch_add(u64::from(placed), Relaxed);
+        }
+    }
+    fn structure(&self, index: usize, ns: u64) {
+        let mut s = self.structures.lock().unwrap();
+        if s.len() <= index {
+            s.resize(index + 1, [0; 2]);
+        }
+        s[index][0] += ns;
+        s[index][1] += 1;
+    }
+    fn stage(&self, stage: usize, ns: u64) {
+        self.stages[stage].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// One more decorated chunk; the list every 10 000.
+    fn chunk(&self, names: &[String], structures: Option<&super::generator_structures::StructureState>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = self.chunks.fetch_add(1, Relaxed) + 1;
+        if n % 10_000 != 0 {
+            return;
+        }
+        let total = self.stages[0].load(Relaxed).max(1) as f64;
+        let mut rows: Vec<(u64, u64, u64, String)> = self
+            .features
+            .iter()
+            .zip(names)
+            .map(|(f, name)| (f[0].load(Relaxed), f[1].load(Relaxed), f[2].load(Relaxed), name.clone()))
+            .collect();
+        if let Some(st) = structures {
+            for (i, [ns, calls]) in self.structures.lock().unwrap().iter().enumerate() {
+                let name = st.registry.structures.get(i).map_or("?", |d| d.name.as_str());
+                rows.push((*ns, *calls, *calls, format!("structure {name}")));
+            }
+        }
+        for (k, name) in ["(setup before the plan)", "(ore prediction)", "(top layers and after)"]
+            .iter()
+            .enumerate()
+        {
+            rows.push((self.stages[k + 1].load(Relaxed), n, n, name.to_string()));
+        }
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut out = format!(
+            "feature times: {n} chunks, decorate {:.0} us per chunk",
+            total / n as f64 / 1000.0
+        );
+        for (ns, calls, placed, name) in rows.iter().take(60).filter(|r| r.0 > 0) {
+            out.push_str(&format!(
+                "\n  {:5.2} %  {:7.1} us/chunk  {:6.2} us/call  {:8} calls  {:5.1} % placed  {name}",
+                100.0 * *ns as f64 / total,
+                *ns as f64 / n as f64 / 1000.0,
+                *ns as f64 / (*calls).max(1) as f64 / 1000.0,
+                calls,
+                100.0 * *placed as f64 / (*calls).max(1) as f64,
+            ));
+        }
+        log::info!("{out}");
+    }
 }
 fn resource(message: impl Into<String>) -> GeneratorError {
     GeneratorError::Resource(message.into())
@@ -306,6 +395,7 @@ impl Decoration {
             postprocess_self,
             postprocess_above,
             plan,
+            times: FeatureTimes::from_env(names.len()),
             names,
             features,
             biome_features,
@@ -387,6 +477,98 @@ impl Decoration {
             .filter_map(|(name, feature)| feature.as_ref().err().map(|e| (name.clone(), e.clone())))
             .collect()
     }
+    /// The chunk's ores planned on the GPU: the attempts of its plannable ores (pure targets, no
+    /// air-exposure chance, placement modifiers that read no block) predicted from the region as
+    /// it stands before any of the chunk's features, and their blobs sent to the GPU. Every draw
+    /// of such an attempt before its cells depends on the world only through its column search,
+    /// which is asked again at the ore step (earlier features may raise the floor).
+    fn predict_ores<'g>(
+        &self,
+        world: &mut World<'_>,
+        center: ChunkPos,
+        seed: i64,
+        gpu: &'g horizon_gpu::OreGpu,
+    ) -> Option<OrePlan<'g>> {
+        let step = STEPS.iter().position(|s| *s == "underground_ores")?;
+        let features = self.plan.step_features(world, center, step).ok()?;
+        let origin = [
+            center.x.wrapping_shl(4),
+            world.min_section_y().ok()?.wrapping_shl(4),
+            center.z.wrapping_shl(4),
+        ];
+        let mut random = WorldgenRandom::new(XoroshiroRandom::new(0));
+        let decoration_seed = random.set_decoration_seed(seed, origin[0], origin[2]);
+        let mut placer = FeaturePlacer::new();
+        let mut planned = Vec::new();
+        let mut attempts: Vec<OreAttempt> = Vec::new();
+        let mut spheres = Vec::new();
+        for (index, id) in features {
+            let Ok(feature) = &self.features[id.0 as usize] else {
+                continue;
+            };
+            let FeatureDefinition::Ore(ore) = &*feature.feature else {
+                continue;
+            };
+            if !ore.plannable() || !feature.placement.iter().all(static_modifier) {
+                continue;
+            }
+            random.set_feature_seed(decoration_seed, index as i32, step as i32);
+            let (first, first_sphere) = (attempts.len(), spheres.len());
+            let predicted = placer.place_with_biome_check(
+                &feature.placement,
+                world,
+                &mut random,
+                origin,
+                id,
+                |world, random, p| {
+                    let attempt = ore.predict(world, random, p, &mut spheres)?;
+                    attempts.push(attempt);
+                    Ok::<_, FeatureExecutionError<RegionError>>(attempt.found)
+                },
+            );
+            if predicted.is_err() {
+                attempts.truncate(first);
+                spheres.truncate(first_sphere);
+                continue;
+            }
+            planned.push((id, first..attempts.len(), ore.size() as usize));
+        }
+        if planned.is_empty() {
+            return None;
+        }
+        let mut blobs = vec![None; attempts.len()];
+        let mut sent = Vec::new();
+        let mut next = 0;
+        for (_, range, size) in &planned {
+            for i in range.clone() {
+                if attempts[i].found {
+                    blobs[i] = Some((sent.len(), next));
+                    sent.push(horizon_gpu::OreBlob {
+                        first: next as u32,
+                        count: *size as u32,
+                        start: attempts[i].start,
+                        size_xz: attempts[i].size_xz,
+                        size_y: attempts[i].size_y,
+                    });
+                    next += size;
+                }
+            }
+        }
+        if next != spheres.len() {
+            return None;
+        }
+        let job = gpu.submit(&sent, &spheres).ok()?;
+        Some(OrePlan {
+            gpu,
+            features: planned,
+            attempts,
+            blobs,
+            spheres,
+            job,
+            floor_writes: world.floor_writes,
+            test: ores_test(),
+        })
+    }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn decorate(
         &self,
@@ -397,7 +579,9 @@ impl Decoration {
         region: &mut [ProtoChunk; 9],
         level_random: &mut dyn super::structure::legacy::PieceRandom,
         structures: Option<&super::generator_structures::StructureState>,
+        ores: Option<&horizon_gpu::OreGpu>,
     ) -> Result<DecorateStats, GeneratorError> {
+        let debut = self.times.as_ref().map(|_| std::time::Instant::now());
         let center = region[4].position();
         for (i, chunk) in region.iter().enumerate() {
             let expected = ChunkPos::new(
@@ -477,9 +661,23 @@ impl Decoration {
             shape_ticks: std::cell::RefCell::new(crate::level::Ticks::new(0)),
             last_tag: None,
             floor_bounds: [None; 9],
+            floor_writes: 0,
             shape_capture: std::cell::RefCell::new(Vec::new()),
             full,
         };
+        // The chunk's GPU ores: predicted before any of its features, their blobs worked out on
+        // the GPU while the earlier steps run.
+        if let (Some(t), Some(d)) = (&self.times, debut) {
+            t.stage(1, d.elapsed().as_nanos() as u64);
+        }
+        let prediction = self.times.as_ref().map(|_| std::time::Instant::now());
+        let mut ore_plan = match ores {
+            Some(gpu) if !structures_only => self.predict_ores(&mut world, center, seed, gpu),
+            _ => None,
+        };
+        if let (Some(t), Some(d)) = (&self.times, prediction) {
+            t.stage(2, d.elapsed().as_nanos() as u64);
+        }
         let mut stats = DecorateStats::default();
         let blocks = self.blocks;
         // The blocks' facts: `BlockState.isSolidRender` and the rest, the
@@ -508,6 +706,11 @@ impl Decoration {
                 };
                 for (index, &structure) in in_step.iter().enumerate() {
                     random.set_feature_seed(decoration_seed, index as i32, step as i32);
+                    let mesure = self
+                        .times
+                        .as_ref()
+                        .filter(|_| references.iter().any(|s| s.structure == structure))
+                        .map(|t| (t, std::time::Instant::now()));
                     for start in references.iter().filter(|s| s.structure == structure) {
                         let mut place_feature =
                             |world: &mut World<'_>,
@@ -535,34 +738,58 @@ impl Decoration {
                             structure_errors += 1;
                         }
                     }
+                    if let Some((t, d)) = mesure {
+                        t.structure(structure, d.elapsed().as_nanos() as u64);
+                    }
                 }
                 Ok(())
             },
             |world, placer, random, id, origin| {
-                if structures_only {
-                    return Ok(false);
+                let mesure = self.times.as_ref().map(|t| (t, std::time::Instant::now()));
+                let resultat = (|| -> Result<bool, RegionError> {
+                    if structures_only {
+                        return Ok(false);
+                    }
+                    let Ok(feature) = &self.features[id.0 as usize] else {
+                        stats.unsupported += 1;
+                        stats.skipped.insert(self.names[id.0 as usize].clone());
+                        return Ok(false);
+                    };
+                    stats.placed += 1;
+                    if let Some(plan) = ore_plan.as_mut()
+                        && let FeatureDefinition::Ore(ore) = &*feature.feature
+                        && let Some(placed) = plan.place(world, random, id, ore)
+                    {
+                        if placed.is_err() {
+                            stats.failed += 1;
+                            stats.skipped.insert(self.names[id.0 as usize].clone());
+                        }
+                        return Ok(placed.unwrap_or(false));
+                    }
+                    let placed = placer.place_with_biome_check(
+                        &feature.placement,
+                        world,
+                        random,
+                        origin,
+                        id,
+                        |world, random, p| feature.feature.place(world, random, p, blocks),
+                    );
+                    if placed.is_err() {
+                        stats.failed += 1;
+                        stats.skipped.insert(self.names[id.0 as usize].clone());
+                    }
+                    Ok(placed.unwrap_or(false))
+                })();
+                if let (Some((t, d)), Ok(placed)) = (mesure, &resultat) {
+                    t.feature(id.0 as usize, d.elapsed().as_nanos() as u64, *placed);
                 }
-                let Ok(feature) = &self.features[id.0 as usize] else {
-                    stats.unsupported += 1;
-                    stats.skipped.insert(self.names[id.0 as usize].clone());
-                    return Ok(false);
-                };
-                stats.placed += 1;
-                let placed = placer.place_with_biome_check(
-                    &feature.placement,
-                    world,
-                    random,
-                    origin,
-                    id,
-                    |world, random, p| feature.feature.place(world, random, p, blocks),
-                );
-                if placed.is_err() {
-                    stats.failed += 1;
-                    stats.skipped.insert(self.names[id.0 as usize].clone());
-                }
-                Ok(placed.unwrap_or(false))
+                resultat
             },
         );
+        if let Some(plan) = ore_plan {
+            plan.gpu.finish(plan.job);
+        }
+        let apres = self.times.as_ref().map(|_| std::time::Instant::now());
         // `FillLayerFeature.place` for the chunk: air at the layer's Y becomes the layer.
         if result.is_ok() && !structures_only {
             for &(y, state) in &self.top_layers {
@@ -612,6 +839,11 @@ impl Decoration {
             .terrain
             .set_generation_stage(PreLightChunkStage::Features);
         region[4].set_decorated();
+        if let (Some(t), Some(d), Some(a)) = (&self.times, debut, apres) {
+            t.stage(3, a.elapsed().as_nanos() as u64);
+            t.stage(0, d.elapsed().as_nanos() as u64);
+            t.chunk(&self.names, structures);
+        }
         Ok(stats)
     }
 }
@@ -669,6 +901,7 @@ impl World<'_> {
     }
     /// A block write at `[x, y, z]` may raise its chunk's heights up to y + 1.
     fn raise_floor_bound(&mut self, [x, y, z]: [i32; 3]) {
+        self.floor_writes += 1;
         if let Some(slot) = self.chunk_slot(x >> 4, z >> 4)
             && let Some(bound) = &mut self.floor_bounds[slot]
         {
@@ -716,6 +949,99 @@ impl World<'_> {
             }
         }
         Some(found)
+    }
+}
+/// The ores of a chunk planned on the GPU (`HORIZON_GPU_ORES`): each planned feature's attempts as
+/// predicted at the start of the chunk's decoration, and the job working out their blobs' cells.
+struct OrePlan<'g> {
+    gpu: &'g horizon_gpu::OreGpu,
+    /// Each planned feature, the range of its attempts and the sphere count of its blobs.
+    features: Vec<(FeatureIdentity, std::ops::Range<usize>, usize)>,
+    attempts: Vec<OreAttempt>,
+    /// For each attempt that found a column, its blob in the job and its first sphere.
+    blobs: Vec<Option<(usize, usize)>>,
+    spheres: Vec<[f64; 4]>,
+    job: horizon_gpu::OreJob,
+    /// The world's `floor_writes` when the attempts were predicted.
+    floor_writes: u64,
+    /// `HORIZON_GPU_ORES=test`: each blob's cells are checked against the CPU's.
+    test: bool,
+}
+impl OrePlan<'_> {
+    /// Places the planned feature `id` from its plan; None when it is not planned, or when a
+    /// column search no longer answers as predicted (the feature then runs on the CPU: nothing
+    /// has been drawn or written).
+    fn place(
+        &mut self,
+        world: &mut World<'_>,
+        random: &mut WorldgenRandom<XoroshiroRandom>,
+        id: FeatureIdentity,
+        ore: &OreFeature,
+    ) -> Option<Result<bool, FeatureExecutionError<RegionError>>> {
+        let (_, range, size) = self.features.iter().find(|f| f.0 == id)?.clone();
+        // Ore writes leave the heightmaps alone: the column searches can all be made first, and
+        // answer as predicted when no write has moved a heightmap since.
+        let moved = world.floor_writes != self.floor_writes;
+        for attempt in self.attempts[range.clone()].iter().filter(|_| moved) {
+            if !OreFeature::column_under(world, attempt).is_ok_and(|found| found == attempt.found) {
+                self.gpu.note_cpu_fallback();
+                return None;
+            }
+        }
+        if !self.gpu.wait(&mut self.job) {
+            self.gpu.note_cpu_fallback();
+            return None;
+        }
+        for i in range.clone() {
+            let Some((blob, first)) = self.blobs[i] else {
+                continue;
+            };
+            let Some(rows) = self.gpu.rows(&self.job, blob) else {
+                self.gpu.note_cpu_fallback();
+                return None;
+            };
+            if self.test
+                && OreFeature::blob_rows(&self.spheres[first..first + size], &self.attempts[i])
+                    .as_deref()
+                    != Some(rows)
+            {
+                self.gpu.note_mismatch();
+                return None;
+            }
+        }
+        let mut placed = false;
+        for i in range {
+            let Some((blob, _)) = self.blobs[i] else {
+                continue;
+            };
+            let rows = self.gpu.rows(&self.job, blob)?;
+            match ore.place_cells(world, random, &self.attempts[i], rows) {
+                Ok(p) => placed |= p,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(Ok(placed))
+    }
+}
+/// `HORIZON_GPU_ORES=test`.
+fn ores_test() -> bool {
+    static TEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TEST.get_or_init(|| std::env::var("HORIZON_GPU_ORES").as_deref() == Ok("test"))
+}
+/// A placement modifier that reads nothing the chunk's features write (blocks, heightmaps): the
+/// positions it gives can be worked out before they run.
+fn static_modifier(modifier: &PlacementModifier) -> bool {
+    match modifier {
+        PlacementModifier::Biome
+        | PlacementModifier::Count(_)
+        | PlacementModifier::InSquare
+        | PlacementModifier::HeightRange(_)
+        | PlacementModifier::Rarity(_)
+        | PlacementModifier::RandomChance(_)
+        | PlacementModifier::Offset(_)
+        | PlacementModifier::Fixed(_) => true,
+        PlacementModifier::RandomlySelected(list) => list.iter().all(static_modifier),
+        _ => false,
     }
 }
 /// Advances a feature's random stream with no block storage; every write is
@@ -790,6 +1116,8 @@ struct World<'a> {
     /// OCEAN_FLOOR_WG first-available height in it exceeds, once asked.
     /// Heightmaps change only through this world's writes, which raise it.
     floor_bounds: [Option<i32>; 9],
+    /// Writes that may have moved a heightmap (each one raises `floor_bounds`).
+    floor_writes: u64,
     /// Reusable capture storage for shape updates in this decoration region.
     shape_capture: std::cell::RefCell<Vec<crate::level::ticks::CapturedTick>>,
 }
@@ -1485,6 +1813,40 @@ impl PlacementContext for World<'_> {
             .map_err(|e| query(format!("{e:?}")))?;
         Ok(())
     }
+    /// The trait's per-cell `replace_row`, one chunk's part of the row at a time: the write zone
+    /// holds whole chunks, and the build height is the row's.
+    fn replace_row(
+        &mut self,
+        [x, y, z]: [i32; 3],
+        bits: u32,
+        cell: &mut dyn FnMut([i32; 3], BlockStateId) -> Option<BlockStateId>,
+    ) -> Result<bool, PlacementQueryError> {
+        if self.outside_build_height(y)? {
+            return Ok(false);
+        }
+        let mut wrote = false;
+        let mut rest = bits;
+        while rest != 0 {
+            let first = z.wrapping_add(rest.trailing_zeros() as i32);
+            // The bits up to the last cell of `first`'s chunk
+            let last = (first | 15).wrapping_sub(z);
+            let part = if last >= 31 {
+                rest
+            } else {
+                rest & ((2u32 << last) - 1)
+            };
+            rest &= !part;
+            if !self.zone.contains_block(BlockPos::new(x, y, first)) {
+                continue;
+            }
+            wrote |= self
+                .region
+                .chunk_mut(x >> 4, first >> 4)?
+                .replace_row_raw([x, y, z], part, |zz, state| cell([x, y, zz], state))
+                .map_err(|e| query(format!("{e:?}")))?;
+        }
+        Ok(wrote)
+    }
     /// Generation regions contain no entities.
     fn unobstructed_block(&mut self, _: [i32; 3]) -> Result<bool, PlacementQueryError> {
         Ok(true)
@@ -1513,38 +1875,34 @@ impl PlacementContext for World<'_> {
         position: [i32; 3],
         require_edge: bool,
     ) -> Result<bool, PlacementQueryError> {
-        let weather = self
-            .decoration
+        // The bindings live as long as the decoration: no clone of their shared sets per call.
+        let decoration = self.decoration;
+        let weather = decoration
             .weather
-            .clone()
+            .as_ref()
             .ok_or(PlacementQueryError::Unavailable)?;
-        let settings = self.temperatures[biome.0 as usize].settings();
-        let mut temperature = std::mem::replace(
-            &mut self.temperatures[biome.0 as usize],
-            BiomeTemperature::new(settings),
-        );
-        let result = weather.should_freeze(self, &mut temperature, position, require_edge);
-        self.temperatures[biome.0 as usize] = temperature;
-        result
+        // A pure function of the position within the generator: computed, not cached (the
+        // queries of a column do not come back).
+        let mut temperature =
+            BiomeTemperature::uncached(self.temperatures[biome.0 as usize].settings());
+        weather.should_freeze(self, &mut temperature, position, require_edge)
     }
     fn biome_should_snow(
         &mut self,
         biome: BiomeId,
         position: [i32; 3],
     ) -> Result<bool, PlacementQueryError> {
-        let weather = self
-            .decoration
+        // The bindings live as long as the decoration: no clone of their shared sets per call.
+        let decoration = self.decoration;
+        let weather = decoration
             .weather
-            .clone()
+            .as_ref()
             .ok_or(PlacementQueryError::Unavailable)?;
-        let settings = self.temperatures[biome.0 as usize].settings();
-        let mut temperature = std::mem::replace(
-            &mut self.temperatures[biome.0 as usize],
-            BiomeTemperature::new(settings),
-        );
-        let result = weather.should_snow(self, &mut temperature, position);
-        self.temperatures[biome.0 as usize] = temperature;
-        result
+        // A pure function of the position within the generator: computed, not cached (the
+        // queries of a column do not come back).
+        let mut temperature =
+            BiomeTemperature::uncached(self.temperatures[biome.0 as usize].settings());
+        weather.should_snow(self, &mut temperature, position)
     }
     /// Lighting has not run during FEATURES; block light reads zero.
     fn block_brightness(&mut self, _: [i32; 3]) -> Result<i32, PlacementQueryError> {

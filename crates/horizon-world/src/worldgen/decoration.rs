@@ -136,34 +136,14 @@ impl FeatureDecorationPlan {
         {
             return Err(DecorationError::WorkLimit);
         }
-        let mut present = BTreeSet::new();
-        for z in chunk.z - 1..=chunk.z + 1 {
-            for x in chunk.x - 1..=chunk.x + 1 {
-                let values = world
-                    .chunk_biomes(ChunkPos::new(x, z))
-                    .map_err(DecorationError::World)?;
-                if values.len() > 65536 {
-                    return Err(DecorationError::WorkLimit);
-                }
-                present.extend(values.into_iter().filter(|id| self.biomes.contains_key(id)));
-            }
-        }
+        let present = self.present_biomes(world, chunk)?;
         let mut placer = FeaturePlacer::new();
         for step in 0..structure_steps.max(self.steps.len()) {
             structures(world, &mut random, seed, step).map_err(DecorationError::World)?;
             let Some(data) = self.steps.get(step) else {
                 continue;
             };
-            let mut selected = BTreeSet::new();
-            for biome in &present {
-                if let Some(features) = self.biomes[biome].get(step) {
-                    selected.extend(features.iter().map(|feature| {
-                        data.index(*feature)
-                            .expect("plan owns complete biome feature lists")
-                    }));
-                }
-            }
-            for index in selected {
+            for index in self.selected(&present, step) {
                 let feature = data.features()[index];
                 random.set_feature_seed(seed, index as i32, step as i32);
                 world
@@ -176,5 +156,62 @@ impl FeatureDecorationPlan {
         world
             .set_currently_generating(None)
             .map_err(DecorationError::World)
+    }
+
+    /// The features `decorate` places at `step` around `chunk`, in their order, each with the
+    /// step-local index mixed into `set_feature_seed`.
+    pub fn step_features<W: DecorationWorld>(
+        &self,
+        world: &mut W,
+        chunk: ChunkPos,
+        step: usize,
+    ) -> Result<Vec<(usize, FeatureIdentity)>, DecorationError<W::Error>> {
+        let Some(data) = self.steps.get(step) else {
+            return Ok(Vec::new());
+        };
+        let present = self.present_biomes(world, chunk)?;
+        Ok(self
+            .selected(&present, step)
+            .into_iter()
+            .map(|index| (index, data.features()[index]))
+            .collect())
+    }
+
+    /// The plan's biomes found in the 3x3 chunks around `chunk`.
+    fn present_biomes<W: DecorationWorld>(
+        &self,
+        world: &mut W,
+        chunk: ChunkPos,
+    ) -> Result<BTreeSet<DecorationBiome>, DecorationError<W::Error>> {
+        let mut present = BTreeSet::new();
+        for z in chunk.z - 1..=chunk.z + 1 {
+            for x in chunk.x - 1..=chunk.x + 1 {
+                let values = world
+                    .chunk_biomes(ChunkPos::new(x, z))
+                    .map_err(DecorationError::World)?;
+                if values.len() > 65536 {
+                    return Err(DecorationError::WorkLimit);
+                }
+                present.extend(values.into_iter().filter(|id| self.biomes.contains_key(id)));
+            }
+        }
+        Ok(present)
+    }
+
+    /// The step-local indices of the features of `step` one of the `present` biomes lists.
+    fn selected(&self, present: &BTreeSet<DecorationBiome>, step: usize) -> BTreeSet<usize> {
+        let mut selected = BTreeSet::new();
+        let Some(data) = self.steps.get(step) else {
+            return selected;
+        };
+        for biome in present {
+            if let Some(features) = self.biomes[biome].get(step) {
+                selected.extend(features.iter().map(|feature| {
+                    data.index(*feature)
+                        .expect("plan owns complete biome feature lists")
+                }));
+            }
+        }
+        selected
     }
 }

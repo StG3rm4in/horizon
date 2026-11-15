@@ -191,6 +191,17 @@ impl<B: TerrainBlockStates> HeightmapChunk for TerrainBlocks<'_, B> {
     }
 }
 impl<B: TerrainBlockStates> TerrainBlocks<'_, B> {
+    /// Section `index`'s count of non-air blocks after a write of `new` over `old`.
+    #[inline]
+    fn count_write(&mut self, index: usize, old: BlockStateId, new: BlockStateId) {
+        let old_air = self.properties.heightmap_state(old).is_air();
+        let new_air = self.properties.heightmap_state(new).is_air();
+        if old_air && !new_air {
+            self.non_air[index] += 1;
+        } else if !old_air && new_air {
+            self.non_air[index] -= 1;
+        }
+    }
     #[inline]
     fn section_index(&self, y: i32) -> Option<usize> {
         let dy = i64::from(y) - i64::from(self.min_y);
@@ -492,6 +503,22 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     /// The states of the 16-block section starting at block `y` (a multiple
     /// of 16 inside this chunk), in `(y << 8) | (z << 4) | x` order, read in
     /// one pass; false (and `out` untouched) when `y` is not such a start.
+    /// The section at `y` (a section's lowest Y) as `PalettedContainer::from_values` builds it from
+    /// what `section_states` fills, without unpacking it (`BlockSection::to_container`).
+    pub fn section_container(
+        &self,
+        y: i32,
+        strategy: horizon_core::paletted::Strategy,
+    ) -> Option<horizon_core::paletted::PalettedContainer> {
+        match self.blocks.section_index(y) {
+            Some(index) if y & 15 == 0 => Some(if self.blocks.non_air[index] == 0 {
+                horizon_core::paletted::PalettedContainer::new(strategy, self.blocks.air.0)
+            } else {
+                self.blocks.sections[index].to_container(strategy)
+            }),
+            _ => None,
+        }
+    }
     pub fn section_states(&self, y: i32, out: &mut [u32; 4096]) -> bool {
         match self.blocks.section_index(y) {
             Some(index) if y & 15 == 0 => {
@@ -633,6 +660,48 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
             self.blocks.non_air[section] -= 1;
         }
         Ok(old)
+    }
+    /// `set_block_raw` along one row of cells in this chunk: for each set bit `i` of `bits`, the
+    /// cell `(x, y, z + i)` is read as `block` reads it, and written with the state `f` returns
+    /// for it (given its Z), if any. Whether a cell was written.
+    pub fn replace_row_raw(
+        &mut self,
+        [x, y, z]: [i32; 3],
+        bits: u32,
+        mut f: impl FnMut(i32, BlockStateId) -> Option<BlockStateId>,
+    ) -> Result<bool, TerrainError> {
+        let section = self.blocks.section_index(y);
+        let mut wrote = false;
+        let mut bits = bits;
+        while bits != 0 {
+            let zz = z.wrapping_add(bits.trailing_zeros() as i32);
+            bits &= bits - 1;
+            // A section with non-air blocks: read, test and write at one slot. Otherwise `f` sees
+            // what `block` reads (void air outside the height, air in a section of air).
+            let Some(index) = section.filter(|&s| self.blocks.non_air[s] != 0) else {
+                let read = if section.is_some() {
+                    self.blocks.air
+                } else {
+                    self.blocks.void_air
+                };
+                let Some(state) = f(zz, read) else {
+                    continue;
+                };
+                let section = section.ok_or(TerrainError::OutsideBuildHeight)?;
+                let old = self.blocks.sections[section].set(local_index(x, y, zz), state)?;
+                self.blocks.count_write(section, old, state);
+                wrote = true;
+                continue;
+            };
+            let Some((old, state)) = self.blocks.sections[index]
+                .replace_with(local_index(x, y, zz), |old| f(zz, old))?
+            else {
+                continue;
+            };
+            self.blocks.count_write(index, old, state);
+            wrote = true;
+        }
+        Ok(wrote)
     }
     /// Write a vertical run of one non-air state from `y_top` downward, all
     /// inside the chunk. Returns how many blocks changed from air; section
@@ -781,6 +850,412 @@ pub fn fill_noise_with<B: TerrainBlockStates>(
             &mut scratch[..size],
         )
     })
+}
+
+/// [`fill_noise`] from block codes the GPU decided from the final density and
+/// the aquifer: 0 positive density (written in runs, as the CPU fill does), 8
+/// default block by aquifer pressure, 1 air, 2 default fluid, 3 lava, plus 4
+/// for a scheduled fluid update. Writes the same blocks, in the same order and
+/// with the same heightmap updates, as the CPU fill.
+pub fn fill_noise_codes<B: TerrainBlockStates>(
+    chunk: &mut TerrainChunk<'_, B>,
+    volume: DensityVolume,
+    codes: &[i8],
+    default_block: BlockStateId,
+    fluid: BlockStateId,
+    lava: BlockStateId,
+) -> Result<(), TerrainError> {
+    let [sx, sy, sz] = volume.sizes();
+    let [bx, by, bz] = volume.minimum();
+    if sx != 16
+        || sz != 16
+        || volume.steps() != [1; 3]
+        || codes.len() != volume.size()
+        || bx != chunk.position.x.wrapping_shl(4)
+        || bz != chunk.position.z.wrapping_shl(4)
+        || by < chunk.min_y()
+        || i64::from(by) + sy as i64 > i64::from(chunk.min_y()) + i64::from(chunk.height())
+        || chunk.blocks.registry.state(default_block).is_none()
+    {
+        return Err(TerrainError::InvalidVolume);
+    }
+    chunk.ensure_heightmap(HeightmapType::OceanFloorWg);
+    chunk.ensure_heightmap(HeightmapType::WorldSurfaceWg);
+    let solid_runs = default_block != chunk.blocks.air
+        && !chunk
+            .blocks
+            .properties
+            .heightmap_state(default_block)
+            .has_fluid();
+    const MAPS: [HeightmapType; 2] = [HeightmapType::OceanFloorWg, HeightmapType::WorldSurfaceWg];
+    for z in 0..sz {
+        let world_z = bz.wrapping_add(z as i32);
+        for x in 0..sx {
+            let world_x = bx.wrapping_add(x as i32);
+            let col_base = (x + z * sx) * sy;
+            let col = &codes[col_base..col_base + sy];
+            let mut bounds = MAPS.map(|kind| {
+                chunk.heightmaps[kind as usize]
+                    .as_ref()
+                    .expect("ensured heightmap")
+                    .first_available(x as i32, z as i32)
+                    .map(|first| first.wrapping_sub(2))
+            });
+            let mut y = sy;
+            while y > 0 {
+                y -= 1;
+                let world_y = by.wrapping_add(y as i32);
+                let code = col[y];
+                if solid_runs && code == 0 {
+                    let mut run = 1usize;
+                    while run <= y && col[y - run] == 0 {
+                        run += 1;
+                    }
+                    chunk.fill_solid_run(x as i32, world_y, z as i32, run as i32, default_block)?;
+                    for (kind, bound) in MAPS.into_iter().zip(&mut bounds) {
+                        if matches!(bound, Ok(current) if world_y <= *current) {
+                            continue;
+                        }
+                        chunk.update_heightmap(kind, x as i32, world_y, z as i32, default_block)?;
+                        *bound = chunk.heightmaps[kind as usize]
+                            .as_ref()
+                            .expect("ensured heightmap")
+                            .first_available(x as i32, z as i32)
+                            .map(|first| first.wrapping_sub(2));
+                    }
+                    y -= run - 1;
+                    continue;
+                }
+                let state = match code & 3 {
+                    0 => default_block,
+                    1 => continue,
+                    2 => fluid,
+                    _ => lava,
+                };
+                if state == chunk.blocks.air {
+                    continue;
+                }
+                chunk.set_block_raw(x as i32, world_y, z as i32, state)?;
+                for (kind, bound) in MAPS.into_iter().zip(&mut bounds) {
+                    if matches!(bound, Ok(current) if world_y <= *current) {
+                        continue;
+                    }
+                    chunk.update_heightmap(kind, x as i32, world_y, z as i32, state)?;
+                    *bound = chunk.heightmaps[kind as usize]
+                        .as_ref()
+                        .expect("ensured heightmap")
+                        .first_available(x as i32, z as i32)
+                        .map(|first| first.wrapping_sub(2));
+                }
+                if code & 4 != 0 && chunk.blocks.properties.heightmap_state(state).has_fluid() {
+                    chunk.mark_postprocessing(world_x, world_y, world_z);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Like `fill_noise_codes`, from the chunk's final states after the fill and the surface, computed on
+/// the GPU (`horizon_gpu::SurfaceGpu::chunk_states`): the state in the low 30 bits, bit 31 where the
+/// fill scheduled a fluid update, bit 30 where the surface wrote a state with fluid. The surface only
+/// replaces solid blocks and fills air or water, so one pass in the fill's order gives the fill's
+/// post-processing marks and the heightmaps of the final blocks; the surface's own marks follow, in
+/// its order (x then z, descending y), as the fill followed by the surface leaves them.
+pub fn fill_noise_states<B: TerrainBlockStates>(
+    chunk: &mut TerrainChunk<'_, B>,
+    volume: DensityVolume,
+    states: &[u32],
+) -> Result<(), TerrainError> {
+    let [sx, sy, sz] = volume.sizes();
+    let [bx, by, bz] = volume.minimum();
+    if sx != 16
+        || sz != 16
+        || volume.steps() != [1; 3]
+        || states.len() != volume.size()
+        || bx != chunk.position.x.wrapping_shl(4)
+        || bz != chunk.position.z.wrapping_shl(4)
+        || by < chunk.min_y()
+        || i64::from(by) + sy as i64 > i64::from(chunk.min_y()) + i64::from(chunk.height())
+    {
+        return Err(TerrainError::InvalidVolume);
+    }
+    chunk.ensure_heightmap(HeightmapType::OceanFloorWg);
+    chunk.ensure_heightmap(HeightmapType::WorldSurfaceWg);
+    const MAPS: [HeightmapType; 2] = [HeightmapType::OceanFloorWg, HeightmapType::WorldSurfaceWg];
+    let air = chunk.blocks.air;
+    for z in 0..sz {
+        let world_z = bz.wrapping_add(z as i32);
+        for x in 0..sx {
+            let world_x = bx.wrapping_add(x as i32);
+            let col_base = (x + z * sx) * sy;
+            let col = &states[col_base..col_base + sy];
+            let mut bounds = MAPS.map(|kind| {
+                chunk.heightmaps[kind as usize]
+                    .as_ref()
+                    .expect("ensured heightmap")
+                    .first_available(x as i32, z as i32)
+                    .map(|first| first.wrapping_sub(2))
+            });
+            let mut y = sy;
+            while y > 0 {
+                y -= 1;
+                let world_y = by.wrapping_add(y as i32);
+                let value = col[y];
+                let state = BlockStateId(value & 0x3fff_ffff);
+                if state == air {
+                    continue;
+                }
+                let fluid = chunk.blocks.properties.heightmap_state(state).has_fluid();
+                // A run of one state without fluid nor mark: written through the section fill, the
+                // heightmaps updated at its top (the column is filled downwards).
+                let mut run = 1usize;
+                if !fluid && value & 0xc000_0000 == 0 {
+                    while run <= y && col[y - run] == value {
+                        run += 1;
+                    }
+                    chunk.fill_solid_run(x as i32, world_y, z as i32, run as i32, state)?;
+                } else {
+                    chunk.set_block_raw(x as i32, world_y, z as i32, state)?;
+                }
+                for (kind, bound) in MAPS.into_iter().zip(&mut bounds) {
+                    if matches!(bound, Ok(current) if world_y <= *current) {
+                        continue;
+                    }
+                    chunk.update_heightmap(kind, x as i32, world_y, z as i32, state)?;
+                    *bound = chunk.heightmaps[kind as usize]
+                        .as_ref()
+                        .expect("ensured heightmap")
+                        .first_available(x as i32, z as i32)
+                        .map(|first| first.wrapping_sub(2));
+                }
+                // The fill's mark stays where the surface later froze the water.
+                if value & 0x8000_0000 != 0 {
+                    chunk.mark_postprocessing(world_x, world_y, world_z);
+                }
+                y -= run - 1;
+            }
+        }
+    }
+    if states.iter().any(|v| v & 0x4000_0000 != 0) {
+        for x in 0..sx {
+            for z in 0..sz {
+                let col_base = (x + z * sx) * sy;
+                for y in (0..sy).rev() {
+                    if states[col_base + y] & 0x4000_0000 != 0 {
+                        chunk.mark_postprocessing(
+                            bx.wrapping_add(x as i32),
+                            by.wrapping_add(y as i32),
+                            bz.wrapping_add(z as i32),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl<B: TerrainBlockStates> TerrainChunk<'_, B> {
+    /// Per state of the registry, what the GPU's compact sections read
+    /// (`horizon_gpu::SurfaceGpu::enable_sections`): 1 air, 2 fluid, 4 blocks motion in a heightmap.
+    pub fn section_flags(&self) -> Vec<u8> {
+        (0..self.blocks.registry.len())
+            .map(|i| {
+                let s = self.blocks.properties.heightmap_state(BlockStateId(i as u32));
+                u8::from(s.is_air())
+                    | u8::from(s.has_fluid()) << 1
+                    | u8::from(s.blocks_motion_in_heightmap()) << 2
+            })
+            .collect()
+    }
+    /// The chunk's `minecraft:air`.
+    pub fn air(&self) -> BlockStateId {
+        self.blocks.air
+    }
+    /// Nothing written yet: every section air, no generation heightmap, no post-processing mark.
+    pub fn is_fresh(&self) -> bool {
+        self.blocks.non_air.iter().all(|&n| n == 0)
+            && self
+                .blocks
+                .sections
+                .iter()
+                .all(|s| s.uniform_state() == Some(self.blocks.air))
+            && self.heightmaps[HeightmapType::OceanFloorWg as usize].is_none()
+            && self.heightmaps[HeightmapType::WorldSurfaceWg as usize].is_none()
+            && self.postprocessing.iter().all(Vec::is_empty)
+    }
+}
+
+/// One section of the GPU's compact output (`horizon_gpu::SECTION_WORDS` words, sections.cu).
+fn gpu_section<'r>(
+    data: &[u32],
+    s: usize,
+    air: BlockStateId,
+    registry: &'r BlockRegistry,
+) -> Result<(BlockSection<'r>, u16), TerrainError> {
+    let o = &data[s * horizon_gpu::SECTION_WORDS..(s + 1) * horizon_gpu::SECTION_WORDS];
+    let (genre, bits, len) = (o[0] & 0xFF, ((o[0] >> 8) & 0xFF) as u8, (o[0] >> 16) as usize);
+    let non_air = u16::try_from(o[1]).map_err(|_| TerrainError::InvalidState)?;
+    let section = match genre {
+        0 => BlockSection::uniform(air, registry)?,
+        1 => BlockSection::uniform(BlockStateId(o[2]), registry)?,
+        2 => {
+            const K: usize = 128;
+            if len == 0 || len > K + 1 {
+                return Err(TerrainError::InvalidState);
+            }
+            let palette = o[5..5 + len].iter().map(|&v| BlockStateId(v)).collect();
+            let counts = o[5 + K..5 + K + len]
+                .iter()
+                .map(|&c| u16::try_from(c).map_err(|_| TerrainError::InvalidState))
+                .collect::<Result<Vec<_>, _>>()?;
+            let free = if o[4] != 0 { vec![0] } else { Vec::new() };
+            let mots = o[3] as usize;
+            let d = &o[5 + 2 * K..];
+            if mots * 2 > d.len() {
+                return Err(TerrainError::InvalidState);
+            }
+            let words = (0..mots)
+                .map(|w| u64::from(d[2 * w]) | (u64::from(d[2 * w + 1]) << 32))
+                .collect();
+            let storage = horizon_core::storage::PackedStorage::from_words(bits, 4096, words)
+                .map_err(|_| TerrainError::InvalidState)?;
+            BlockSection::from_parts(registry, palette, counts, free, Some(storage))?
+        }
+        _ => return Err(TerrainError::InvalidState),
+    };
+    Ok((section, non_air))
+}
+
+/// Where the parts of the GPU's compact output start: heights, then the two mark lists.
+fn gpu_layout(data: &[u32], sections: usize) -> Result<(usize, usize), TerrainError> {
+    let hm = sections * horizon_gpu::SECTION_WORDS;
+    let mq = hm + 512;
+    if data.len() != mq + 2 + 2 * horizon_gpu::SECTION_MARKS + 1 || data[data.len() - 1] != 0 {
+        return Err(TerrainError::InvalidVolume);
+    }
+    Ok((hm, mq))
+}
+
+/// `fill_noise_states` from the sections the GPU built (`horizon_gpu::SurfaceGpu::enable_sections`):
+/// each section as `BlockSection::set` would have left it, its non-air count, the generation
+/// heightmaps and the post-processing marks in `fill_noise_states`' order. The chunk must be fresh
+/// (`TerrainChunk::is_fresh`) and the volume its whole height.
+pub fn fill_noise_sections<B: TerrainBlockStates>(
+    chunk: &mut TerrainChunk<'_, B>,
+    volume: DensityVolume,
+    data: &[u32],
+) -> Result<(), TerrainError> {
+    let [sx, sy, sz] = volume.sizes();
+    let [bx, by, bz] = volume.minimum();
+    let sections = chunk.blocks.sections.len();
+    if sx != 16
+        || sz != 16
+        || volume.steps() != [1; 3]
+        || bx != chunk.position.x.wrapping_shl(4)
+        || bz != chunk.position.z.wrapping_shl(4)
+        || by != chunk.min_y()
+        || sy as i32 != chunk.height()
+        || sy != 16 * sections
+        || !chunk.is_fresh()
+    {
+        return Err(TerrainError::InvalidVolume);
+    }
+    let (hm, mq) = gpu_layout(data, sections)?;
+    let (air, registry) = (chunk.blocks.air, chunk.blocks.registry);
+    let mut built = Vec::with_capacity(sections);
+    for s in 0..sections {
+        built.push(gpu_section(data, s, air, registry)?);
+    }
+    for (s, (section, non_air)) in built.into_iter().enumerate() {
+        chunk.blocks.sections[s] = section;
+        chunk.blocks.non_air[s] = non_air;
+    }
+    let min_y = chunk.min_y();
+    for (i, kind) in [HeightmapType::OceanFloorWg, HeightmapType::WorldSurfaceWg]
+        .into_iter()
+        .enumerate()
+    {
+        let map = chunk.ensure_heightmap(kind);
+        for t in 0..256 {
+            let value = data[hm + 256 * i + t] as i32;
+            map.set_first_available((t & 15) as i32, (t >> 4) as i32, min_y.wrapping_add(value))?;
+        }
+    }
+    let (na, nb) = (data[mq] as usize, data[mq + 1] as usize);
+    if na > horizon_gpu::SECTION_MARKS || nb > horizon_gpu::SECTION_MARKS {
+        return Err(TerrainError::InvalidVolume);
+    }
+    let a = &data[mq + 2..mq + 2 + na];
+    let b = &data[mq + 2 + horizon_gpu::SECTION_MARKS..mq + 2 + horizon_gpu::SECTION_MARKS + nb];
+    for &m in a.iter().chain(b) {
+        let section = (m >> 16) as usize;
+        chunk
+            .postprocessing
+            .get_mut(section)
+            .ok_or(TerrainError::InvalidVolume)?
+            .push(m as u16);
+    }
+    Ok(())
+}
+
+/// HORIZON_GPU_SECTIONS=test: whether a chunk `fill_noise_states` just filled holds what the GPU's
+/// compact output describes (sections and their parts, non-air counts, generation heightmaps,
+/// post-processing marks); the first difference otherwise.
+pub fn check_noise_sections<B: TerrainBlockStates>(
+    chunk: &TerrainChunk<'_, B>,
+    data: &[u32],
+) -> Result<(), String> {
+    let sections = chunk.blocks.sections.len();
+    let (hm, mq) = gpu_layout(data, sections).map_err(|e| format!("{e:?}"))?;
+    for s in 0..sections {
+        let (gpu, non_air) = gpu_section(data, s, chunk.blocks.air, chunk.blocks.registry)
+            .map_err(|e| format!("section {s} : {e:?}"))?;
+        let cpu = &chunk.blocks.sections[s];
+        let (pg, cg, fg, sg) = gpu.parts();
+        let (pc, cc, fc, sc) = cpu.parts();
+        if pg != pc || cg != cc || fg != fc {
+            return Err(format!("section {s} : palette {pg:?} {cg:?} {fg:?} contre {pc:?} {cc:?} {fc:?}"));
+        }
+        if sg.map(|s| (s.bits(), s.words())) != sc.map(|s| (s.bits(), s.words())) {
+            return Err(format!("section {s} : mots differents"));
+        }
+        if non_air != chunk.blocks.non_air[s] {
+            return Err(format!("section {s} : non air {non_air} contre {}", chunk.blocks.non_air[s]));
+        }
+    }
+    let min_y = chunk.min_y();
+    for (i, kind) in [HeightmapType::OceanFloorWg, HeightmapType::WorldSurfaceWg]
+        .into_iter()
+        .enumerate()
+    {
+        let map = chunk.heightmaps[kind as usize].as_ref().ok_or("carte absente")?;
+        for t in 0..256 {
+            let gpu = min_y.wrapping_add(data[hm + 256 * i + t] as i32);
+            let cpu = map
+                .first_available((t & 15) as i32, (t >> 4) as i32)
+                .map_err(|e| format!("{e:?}"))?;
+            if gpu != cpu {
+                return Err(format!("carte {kind:?} colonne {t} : {gpu} contre {cpu}"));
+            }
+        }
+    }
+    let (na, nb) = (data[mq] as usize, data[mq + 1] as usize);
+    let mut marks = vec![Vec::new(); sections];
+    let m = horizon_gpu::SECTION_MARKS;
+    for &v in data[mq + 2..mq + 2 + na.min(m)]
+        .iter()
+        .chain(&data[mq + 2 + m..mq + 2 + m + nb.min(m)])
+    {
+        if let Some(l) = marks.get_mut((v >> 16) as usize) {
+            l.push(v as u16);
+        }
+    }
+    if marks != chunk.postprocessing {
+        return Err(format!("marques : {na} + {nb} contre {:?}", chunk.postprocessing.iter().map(Vec::len).collect::<Vec<_>>()));
+    }
+    Ok(())
 }
 
 fn fill_noise_inner<B: TerrainBlockStates>(

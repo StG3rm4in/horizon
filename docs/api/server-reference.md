@@ -103,6 +103,7 @@ Horizon server settings (docs/server.md). The server writes them into server.pro
 | `game_mode` | `"survival"` | `gamemode` | survival, creative, adventure or spectator |
 | `difficulty` | `"easy"` | `difficulty` | peaceful, easy, normal or hard |
 | `hardcore` | `false` | `hardcore` | one life: a player who dies becomes a spectator |
+| `region_deflate_level` | `6` | `horizon-region-deflate-level` | 0 to 9: how hard deflate region files are compressed; 1 pregenerates ~8 % faster for ~27 % more disk |
 
 ### `[properties]`
 
