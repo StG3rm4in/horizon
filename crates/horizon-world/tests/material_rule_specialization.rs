@@ -92,6 +92,7 @@ fn vein(positive_y: [i32; 2]) -> MaterialRule {
         density: Arc::new(ConstantSampler(1.)),
         richness: Arc::new(ConstantSampler(1.)),
         filler_gap: Arc::new(ConstantSampler(-1.)),
+        roots: None,
         positive_y,
     }
 }

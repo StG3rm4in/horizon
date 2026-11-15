@@ -1,67 +1,67 @@
-# Palettes des chunks finis
+# Palettes of finished chunks
 
-## Ce qui coûte
+## What it costs
 
-`block_column` (horizon-client, vanillagen.rs) convertit les sections de génération (`BlockSection`)
-en sections de chunk (`PalettedContainer` de horizon-core). Elle sert aux vues des chunks voisins pour
-la lumière et à la colonne finale d'un chunk. Profil du 15/11, tout sur GPU : **5,7 % du CPU**, dont
-3,9 % dans `PalettedContainer::from_values` et 1,1 % dans `BlockSection::fill_states`.
+`block_column` (horizon-client, vanillagen.rs) converts the generation sections (`BlockSection`) into
+chunk sections (horizon-core's `PalettedContainer`). It serves the views of the neighbouring chunks
+for light and the final column of a chunk. Profile of 15/11, everything on the GPU: **5.7% of the
+CPU**, of which 3.9% in `PalettedContainer::from_values` and 1.1% in `BlockSection::fill_states`.
 
-Le chemin passait par les valeurs : décompacter les 4 096 états de la section, puis reconstruire une
-palette dans l'ordre de première apparition par index (`palette_ids`) et recompacter tous les ids.
+The path went through the values: unpacking the 4,096 states of the section, then rebuilding a
+palette in order of first appearance by index (`palette_ids`) and repacking all the ids.
 
-## Le chemin direct
+## The direct path
 
-`TerrainChunk::section_container` → `BlockSection::to_container` :
+`TerrainChunk::section_container` → `BlockSection::to_container`:
 
-1. les cases vivantes de la palette de génération, rangées par leur première cellule (deux cases du
-   même état fusionnent) : c'est l'ordre de première apparition que `from_values` trouve ;
-2. chaque id renuméroté vers cette palette, directement dans les mots
-   (`PalettedContainer::from_mapped`). De 4 à 4 bits, le cas courant, une table de 256 octets traduit
-   les deux entrées d'un octet d'un coup ; sinon entrée par entrée. La palette globale (plus de 256
-   états) reçoit les valeurs, comme dans `from_values`.
+1. the live entries of the generation palette, sorted by their first cell (two entries of the same
+   state merge): that is the order of first appearance `from_values` finds;
+2. each id renumbered to this palette, directly in the words (`PalettedContainer::from_mapped`). From
+   4 to 4 bits, the common case, a 256-byte table translates the two entries of a byte at once;
+   otherwise entry by entry. The global palette (more than 256 states) receives the values, as in
+   `from_values`.
 
-Pour des mots de 4 bits, la recherche des premières cellules lit un mot à la fois : le masque des ids
-qu'il contient, puis la position seulement pour un id vu pour la première fois.
+For 4-bit words, the search for the first cells reads one word at a time: the mask of the ids it
+holds, then the position only for an id seen for the first time.
 
-Le résultat est le même conteneur, mot pour mot (`to_wire` : largeur, palette, mots), pas seulement les
-mêmes valeurs.
+The result is the same container, word for word (`to_wire`: width, palette, words), not only the same
+values.
 
 ## Variables
 
-- `HORIZON_COLUMN=values` : l'ancien chemin (banc).
-- `HORIZON_COLUMN_TEST=1` : les deux chemins, comparés par `to_wire` ; une ligne `column test:` dans
-  latest.log aux puissances de deux.
+- `HORIZON_COLUMN=values`: the old path (bench).
+- `HORIZON_COLUMN_TEST=1`: both paths, compared by `to_wire`; a `column test:` line in latest.log at
+  powers of two.
 
-## Vérifications
+## Checks
 
-- Test unitaire `to_container_matches_from_values` (horizon-world, chunk.rs) : sections aléatoires de
-  1 à 300 états, avec des cases mortes et réutilisées, jusqu'à la palette globale.
-- `/pregen` en mode test (zone 2100000/−2120000, rayon 800, tout sur GPU) : **262 144 sections, 0
-  différence**.
-- La sonde et le harnais de parité vanilla ne passent pas par `block_column`.
+- Unit test `to_container_matches_from_values` (horizon-world, chunk.rs): random sections of 1 to 300
+  states, with dead and reused entries, up to the global palette.
+- `/pregen` in test mode (zone 2100000/−2120000, radius 800, everything on the GPU): **262,144
+  sections, 0 differences**.
+- The probe and the vanilla parity harness do not go through `block_column`.
 
-## Mesures
+## Measurements
 
-Première version (lecture des cellules une à une pour les premières apparitions), bancs `/tmp/ab17.sh`
-(release, rayon 1 600 blocs, zones neuves, tout sur GPU dont les sections) :
+First version (reading the cells one by one for the first appearances), benches `/tmp/ab17.sh`
+(release, radius 1,600 blocks, fresh zones, everything on the GPU, sections included):
 
-| Zone | Par les valeurs | Directe | CPU par chunk |
+| Zone | Through the values | Direct | CPU per chunk |
 |---|---|---|---|
-| 2200000/−2220000 | 1 432 chunks/s | 1 410 (−1,6 %) | 6,59 → 6,45 ms (−2,1 %) |
-| −2230000/2240000 | 1 527 chunks/s | 1 530 (+0,2 %) | 6,10 → 5,95 ms (−2,5 %) |
-| 2250000/−2270000 | 1 590 chunks/s | 1 697 (+6,7 %) | 5,80 → 5,37 ms (−7,4 %) |
+| 2200000/−2220000 | 1,432 chunks/s | 1,410 (−1.6%) | 6.59 → 6.45 ms (−2.1%) |
+| −2230000/2240000 | 1,527 chunks/s | 1,530 (+0.2%) | 6.10 → 5.95 ms (−2.5%) |
+| 2250000/−2270000 | 1,590 chunks/s | 1,697 (+6.7%) | 5.80 → 5.37 ms (−7.4%) |
 
-Profil de cette version (zone 2300000/−2320000, 1 593 chunks/s avec les binaires de profil) :
-`block_column` tombe à 3,4 % du CPU, dont 3,1 % dans `to_container`. `fill_noise_states` est à 0 %
-(sections GPU). Les plus gros postes sont maintenant les décorations (31,5 %), la sauvegarde (15,7 %),
-zlib (8,9 %), l'attente et le pilote du GPU (8,7 %), les biomes (8,6 %) et le thread principal (7,2 %).
+Profile of this version (zone 2300000/−2320000, 1,593 chunks/s with the profiling binaries):
+`block_column` drops to 3.4% of the CPU, of which 3.1% in `to_container`. `fill_noise_states` is at
+0% (GPU sections). The biggest items are now the decorations (31.5%), saving (15.7%), zlib (8.9%),
+GPU wait and driver (8.7%), the biomes (8.6%) and the main thread (7.2%).
 
-Version avec recherche des premières apparitions par mot (mêmes vérifications : test unitaire,
-`/pregen` en mode test sur la zone 2400000/−2420000 : 262 144 sections, 0 différence) :
+Version with the search for first appearances by word (same checks: unit test, `/pregen` in test
+mode on zone 2400000/−2420000: 262,144 sections, 0 differences):
 
-| Zone | Par les valeurs | Directe | CPU par chunk |
+| Zone | Through the values | Direct | CPU per chunk |
 |---|---|---|---|
-| 2500000/−2520000 | 1 544 chunks/s | **1 584 (+2,6 %)** | 6,06 → 5,80 ms (−4,3 %) |
-| −2530000/2540000 | 1 524 chunks/s | **1 548 (+1,5 %)** | 6,29 → 6,05 ms (−3,8 %) |
-| 2550000/−2570000 | 1 422 chunks/s | **1 521 (+7,0 %)** | 6,47 → 6,16 ms (−4,8 %) |
+| 2500000/−2520000 | 1,544 chunks/s | **1,584 (+2.6%)** | 6.06 → 5.80 ms (−4.3%) |
+| −2530000/2540000 | 1,524 chunks/s | **1,548 (+1.5%)** | 6.29 → 6.05 ms (−3.8%) |
+| 2550000/−2570000 | 1,422 chunks/s | **1,521 (+7.0%)** | 6.47 → 6.16 ms (−4.8%) |

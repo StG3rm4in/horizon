@@ -1,20 +1,20 @@
-// Blobs de minerai (OreFeature.doPlace de Horizon, identique a vanilla) : un bloc de 128 threads par
-// blob. Elagage des spheres dans l'ordre du CPU, puis, pour chaque rangee (x, y) de la boite du blob,
-// le masque des z dont la cellule est dans une sphere restante. L'ordre des cellules n'est pas garde :
-// le CPU ne s'en sert que pour les minerais sans test d'exposition a l'air ni tirage par cellule.
+// Ore blobs (Horizon's OreFeature.doPlace, identical to vanilla): one block of 128 threads per
+// blob. Sphere pruning in the CPU's order, then, for each row (x, y) of the blob's box, the mask of
+// the z whose cell is in a remaining sphere. The order of the cells is not kept: the CPU only uses
+// it for ores without an air exposure test or a per-cell draw.
 //
-// Entree IN (un seul envoi) : BH (nb int4), BS (nb int4), puis SP (doubles). Par blob b :
-// BH[b] = {premiere sphere, nombre de spheres, premiere rangee de MK, sx | sy << 8} ;
-// BS[b] = {x_start, y_start, z_start, 0}. SP : x, y, z, r de chaque sphere (avant elagage).
-// Sortie OUT (un seul retour) : ER (nb int) puis MK, sx * sy masques par blob (rangee x * sy + y,
-// bit z). ER[b] != 0 : cellule hors de la boite (le CPU aurait leve WorkLimit), le blob doit passer
-// par le CPU.
+// Input IN (a single upload): BH (nb int4), BS (nb int4), then SP (doubles). Per blob b: BH[b] =
+// {first sphere, number of spheres, first row of MK, sx | sy << 8}; BS[b] = {x_start, y_start,
+// z_start, 0}. SP: x, y, z, r of each sphere (before pruning).
+// Output OUT (a single readback): ER (nb int) then MK, sx * sy masks per blob (row x * sy + y, bit
+// z). ER[b] != 0: a cell outside the box (the CPU would have raised WorkLimit), the blob must go
+// through the CPU.
 
-#define MS_MAX 64   // spheres par blob (size <= 64)
-#define MS_AXE 12   // valeurs par axe et par sphere : floor(c + r) - floor(c - r) + 1 <= 2r + 2, r < 4.5
-#define MS_RANGEES (26 * 14)  // sx <= 26, sy <= 14 pour size <= 64
+#define MS_MAX 64   // spheres per blob (size <= 64)
+#define MS_AXIS 12   // values per axis and per sphere: floor(c + r) - floor(c - r) + 1 <= 2r + 2, r < 4.5
+#define MS_ROWS (26 * 14)  // sx <= 26, sy <= 14 for size <= 64
 
-extern "C" __global__ void kmin_blobs(const unsigned *IN, unsigned *OUT, int nb)
+extern "C" __global__ void kore_blobs(const unsigned *IN, unsigned *OUT, int nb)
 {
     const int b = blockIdx.x;
     if (b >= nb)
@@ -32,17 +32,17 @@ extern "C" __global__ void kmin_blobs(const unsigned *IN, unsigned *OUT, int nb)
     __shared__ double R[MS_MAX];
     __shared__ int LO[MS_MAX][3];
     __shared__ int NB[MS_MAX][3];
-    __shared__ double Q[MS_MAX][3][MS_AXE];
-    __shared__ unsigned M[MS_RANGEES];
-    __shared__ int DEBUT[MS_MAX + 1];
-    __shared__ int erreur;
-    if (n > MS_MAX || sx * sy > MS_RANGEES || sx > 32) {
+    __shared__ double Q[MS_MAX][3][MS_AXIS];
+    __shared__ unsigned M[MS_ROWS];
+    __shared__ int START[MS_MAX + 1];
+    __shared__ int error;
+    if (n > MS_MAX || sx * sy > MS_ROWS || sx > 32) {
         if (t == 0)
             ER[b] = 1;
         return;
     }
     if (t == 0)
-        erreur = 0;
+        error = 0;
     for (int i = t; i < n; i += blockDim.x) {
         const double *v = SP + 4 * (long)(h.x + i);
         C[i][0] = v[0];
@@ -54,9 +54,10 @@ extern "C" __global__ void kmin_blobs(const unsigned *IN, unsigned *OUT, int nb)
         M[i] = 0;
     __syncthreads();
 
-    // Elagage : i1 dans l'ordre. Pour i1 fixe, la boucle i2 (croissante) retire chaque i2 plus petit
-    // qui verifie dr * dr > d jusqu'au premier i2 plus grand qui le verifie, lequel retire i1 : apres
-    // quoi i1 (rayon -1) ne retire plus rien. Les rayons lus par la boucle i2 sont ceux d'avant elle.
+    // Pruning: i1 in order. For a fixed i1, the (increasing) i2 loop removes each smaller i2 that
+    // satisfies dr * dr > d up to the first larger i2 that satisfies it, which removes i1: after
+    // that, i1 (radius -1) removes nothing more. The radii the i2 loop reads are those from before
+    // it.
     if (t < 32) {
         for (int i1 = 0; i1 + 1 < n; i1++) {
             const double r1 = R[i1];
@@ -64,7 +65,7 @@ extern "C" __global__ void kmin_blobs(const unsigned *IN, unsigned *OUT, int nb)
                 continue;
             for (int j0 = i1 + 1; j0 < n; j0 += 32) {
                 const int i2 = j0 + t;
-                bool retire = false, moi = false;
+                bool removed = false, mine = false;
                 if (i2 < n) {
                     const double r2 = R[i2];
                     if (r2 > 0.0) {
@@ -75,15 +76,15 @@ extern "C" __global__ void kmin_blobs(const unsigned *IN, unsigned *OUT, int nb)
                         const double d = __dadd_rn(__dadd_rn(__dmul_rn(dx, dx), __dmul_rn(dy, dy)), __dmul_rn(dz, dz));
                         if (__dmul_rn(dr, dr) > d) {
                             if (dr > 0.0)
-                                retire = true;
+                                removed = true;
                             else
-                                moi = true;
+                                mine = true;
                         }
                     }
                 }
-                const unsigned bm = __ballot_sync(0xffffffffu, moi);
+                const unsigned bm = __ballot_sync(0xffffffffu, mine);
                 const int k = bm ? __ffs(bm) - 1 : 32;
-                if (retire && t < k)
+                if (removed && t < k)
                     R[i2] = -1.0;
                 __syncwarp();
                 if (bm) {
@@ -98,7 +99,8 @@ extern "C" __global__ void kmin_blobs(const unsigned *IN, unsigned *OUT, int nb)
     }
     __syncthreads();
 
-    // Carres par axe (SphereSquares::each_cell) : low = max(floor(c - r), start), high = max(floor(c + r), low)
+    // Squares per axis (SphereSquares::each_cell): low = max(floor(c - r), start), high =
+    // max(floor(c + r), low)
     for (int q = t; q < 3 * n; q += blockDim.x) {
         const int i = q / 3, a = q - 3 * (q / 3);
         const double r = R[i];
@@ -109,7 +111,7 @@ extern "C" __global__ void kmin_blobs(const unsigned *IN, unsigned *OUT, int nb)
         }
         const double c = C[i][a];
         const int st = a == 0 ? s.x : a == 1 ? s.y : s.z;
-        const int taille = a == 1 ? sy : sx;
+        const int size = a == 1 ? sy : sx;
         int lo = __double2int_rd(__dsub_rn(c, r));
         if (lo < st)
             lo = st;
@@ -117,8 +119,8 @@ extern "C" __global__ void kmin_blobs(const unsigned *IN, unsigned *OUT, int nb)
         if (hi < lo)
             hi = lo;
         int nv = hi - lo + 1;
-        if (nv > MS_AXE || hi - st >= taille) {
-            erreur = 1;
+        if (nv > MS_AXIS || hi - st >= size) {
+            error = 1;
             nv = 0;
         }
         LO[i][a] = lo;
@@ -132,20 +134,20 @@ extern "C" __global__ void kmin_blobs(const unsigned *IN, unsigned *OUT, int nb)
     if (t == 0) {
         int acc = 0;
         for (int i = 0; i < n; i++) {
-            DEBUT[i] = acc;
+            START[i] = acc;
             acc += NB[i][0] * NB[i][1];
         }
-        DEBUT[n] = acc;
+        START[n] = acc;
     }
     __syncthreads();
 
-    // Rangees : xd * xd < 1, puis xd * xd + yd * yd < 1, puis (xd * xd + yd * yd) + zd * zd < 1
-    const int total = DEBUT[n];
+    // Rows: xd * xd < 1, then xd * xd + yd * yd < 1, then (xd * xd + yd * yd) + zd * zd < 1
+    const int total = START[n];
     for (int w = t; w < total; w += blockDim.x) {
         int i = 0;
-        while (DEBUT[i + 1] <= w)
+        while (START[i + 1] <= w)
             i++;
-        const int k = w - DEBUT[i];
+        const int k = w - START[i];
         const int ny = NB[i][1];
         const int ix = k / ny, iy = k - ny * (k / ny);
         const double xd2 = Q[i][0][ix];
@@ -166,5 +168,5 @@ extern "C" __global__ void kmin_blobs(const unsigned *IN, unsigned *OUT, int nb)
     for (int r = t; r < sx * sy; r += blockDim.x)
         MK[h.z + r] = M[r];
     if (t == 0)
-        ER[b] = erreur;
+        ER[b] = error;
 }

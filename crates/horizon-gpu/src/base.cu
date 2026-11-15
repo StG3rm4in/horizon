@@ -1,5 +1,5 @@
-// Primitives communes, reproduites operation par operation depuis horizon_core::noise.
-// Toutes les operations passent par des intrinsics *_rn : aucune fusion multiplication-addition.
+// Shared primitives, reproduced operation by operation from horizon_core::noise.
+// Every operation goes through *_rn intrinsics: no fused multiply-add.
 
 __constant__ float GRAD[16][3] = {
     {1, 1, 0}, {-1, 1, 0}, {1, -1, 0}, {-1, -1, 0},
@@ -8,9 +8,9 @@ __constant__ float GRAD[16][3] = {
     {1, 1, 0}, {0, -1, 1}, {-1, 1, 0}, {0, -1, -1},
 };
 
-// noise::wrap : reduction periodique de vanilla (Far Lands desactivees)
+// noise::wrap: vanilla's periodic reduction (Far Lands disabled)
 __device__ __forceinline__ double wrapd(double v) {
-    const double half = __longlong_as_double(0x416FFFFFFFFFFFFFLL);  // juste sous 2^24
+    const double half = __longlong_as_double(0x416FFFFFFFFFFFFFLL);  // just below 2^24
     if (v >= -half && v < half) return v;
     return __dsub_rn(v, __dmul_rn(floor(__dadd_rn(__ddiv_rn(v, 33554432.0), 0.5)), 33554432.0));
 }
@@ -42,8 +42,8 @@ __device__ __forceinline__ void indices(const unsigned char *P, int k0, int k1, 
     for (int i = 0; i < 8; ++i) g[i] = P[(rows[i] + k2 + (i >> 2)) & 255] & 15;
 }
 
-// PerlinNoise::add_volume (chemin volumique) pour un point : coordonnee * echelle par axe,
-// valeur de coin = (gx*(dx-bx) + gz*(dz-bz)) + gy*(dy-by)
+// PerlinNoise::add_volume (volume path) for one point: coordinate * scale per axis,
+// corner value = (gx*(dx-bx) + gz*(dz-bz)) + gy*(dy-by)
 __device__ float perlin_vol(const unsigned char *P, const double *O,
                             int c0, double s0, int c1, double s1, int c2, double s2) {
     double h0 = __dadd_rn(wrapd(__dmul_rn((double)c0, s0)), O[0]);
@@ -65,8 +65,8 @@ __device__ float perlin_vol(const unsigned char *P, const double *O,
     return lerp3(smooth(d0), smooth(d1), smooth(d2), v);
 }
 
-// SmearedPerlinNoise : chemin volumique avec fudge en Y (PerlinNoise::add_volume, fudge_y_scale) :
-// le lissage utilise dy, les valeurs de coins utilisent dy - compute_fudge_y(entree_y, dy, echelle)
+// SmearedPerlinNoise: volume path with a Y fudge (PerlinNoise::add_volume, fudge_y_scale):
+// the smoothing uses dy, the corner values use dy - compute_fudge_y(input_y, dy, scale)
 __device__ float perlin_vol_smeared(const unsigned char *P, const double *O,
                                     int c0, double s0, int c1, double s1, int c2, double s2, double fudge) {
     double h0 = __dadd_rn(wrapd(__dmul_rn((double)c0, s0)), O[0]);
@@ -94,8 +94,9 @@ __device__ float perlin_vol_smeared(const unsigned char *P, const double *O,
     return lerp3(smooth(d0), fy, smooth(d2), v);
 }
 
-// Chemin volumique avec la partie double deja calculee par axe (cellule k, position d, lissage f).
-// Pour un bruit etale, d1 est la position en Y corrigee du fudge et f1 le lissage de la position brute.
+// Volume path with the double part already computed per axis (cell k, position d, smoothing f).
+// For a smeared noise, d1 is the Y position corrected by the fudge and f1 the smoothing of the raw
+// position.
 __device__ __forceinline__ float perlin_core(const unsigned char *P, int k0, float d0, float f0,
                                              int k1, float d1, float f1, int k2, float d2, float f2) {
     int g[8];
@@ -110,7 +111,7 @@ __device__ __forceinline__ float perlin_core(const unsigned char *P, int k0, flo
     return lerp3(f0, f1, f2, v);
 }
 
-// PerlinNoise::get3 (chemin point par point) : produit scalaire ((g0*a + g1*b) + g2*c)
+// PerlinNoise::get3 (point by point path): dot product ((g0*a + g1*b) + g2*c)
 __device__ float perlin_get3(const unsigned char *P, const double *O, double x, double y, double z) {
     double h0 = __dadd_rn(wrapd(x), O[0]);
     double h1 = __dadd_rn(wrapd(y), O[1]);

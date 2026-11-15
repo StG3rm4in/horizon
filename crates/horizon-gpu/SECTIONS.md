@@ -1,85 +1,86 @@
-# Sections compactes sur GPU (`HORIZON_GPU_SECTIONS`)
+# Compact sections on the GPU (`HORIZON_GPU_SECTIONS`)
 
-## Ce qui coûte
+## What it costs
 
-Profil `/pregen` du 15/11, tout sur GPU (`/tmp/sous_etats.py`) : `fill_noise_states`, qui écrit les
-états finaux du GPU (remplissage puis surface) dans le `TerrainChunk`, pèse **9,1 % du CPU** :
-`fill_solid_run` 4,9 %, la boucle elle-même 2,7 % (dont 0,85 % pour relire les 98 304 états à la
-recherche du bit 30), `set_block_raw` 0,7 %, les cartes de hauteur 0,5 %. Le GPU renvoyait pour cela
-les 98 304 états en u32 (393 Ko par chunk).
+`/pregen` profile of 15/11, everything on the GPU (`/tmp/sous_etats.py`): `fill_noise_states`, which
+writes the GPU's final states (fill then surface) into the `TerrainChunk`, weighs **9.1% of the
+CPU**: `fill_solid_run` 4.9%, the loop itself 2.7% (of which 0.85% for rereading the 98,304 states
+looking for bit 30), `set_block_raw` 0.7%, the heightmaps 0.5%. For this, the GPU sent back the
+98,304 states as u32 (393 KB per chunk).
 
-## Pourquoi le GPU peut rendre la section exacte
+## Why the GPU can return the exact section
 
-Une section de génération (`BlockSection`) garde une palette dynamique : ordre d'arrivée des états,
-compteur par case, cases libres, largeur des mots qui ne fait que grandir. Sa sauvegarde de proto chunk
-(`BlockSection::to_nbt`) écrit cette palette telle quelle, cases libres comprises : pour rester
-identique à l'octet près, le GPU doit rendre exactement ce que `set` aurait laissé.
+A generation section (`BlockSection`) keeps a dynamic palette: order of arrival of the states, a
+counter per entry, free entries, a word width that only grows. Its proto chunk save
+(`BlockSection::to_nbt`) writes this palette as it is, free entries included: to stay byte-identical,
+the GPU must return exactly what `set` would have left.
 
-`fill_noise_states` écrit chaque cellule non air une seule fois, dans une section neuve (uniforme air),
-colonne après colonne (z puis x), de haut en bas ; `fill_run` équivaut à des `set` dans le même ordre.
-Le résultat ne dépend donc que de cette suite d'écritures :
+`fill_noise_states` writes each non-air cell only once, into a fresh section (uniform air), column
+after column (z then x), from top to bottom; `fill_run` is equivalent to `set`s in the same order.
+So the result only depends on this sequence of writes:
 
-- s'il reste de l'air : palette [air, états dans l'ordre de leur première écriture], leurs compteurs,
-  pas de case libre ;
-- plus d'air et un seul état : section uniforme ;
-- plus d'air, et l'état de la dernière écriture était déjà dans la palette : l'air garde sa case, à 0,
-  qui est libre ;
-- plus d'air, et l'état de la dernière écriture est nouveau : il prend la case de l'air ;
-- la largeur des mots est `bits_for_palette(longueur, 4)` de la palette finale.
+- if some air is left: palette [air, states in the order of their first write], their counters, no
+  free entry;
+- no air left and a single state: uniform section;
+- no air left, and the state of the last write was already in the palette: air keeps its entry, at
+  0, which is free;
+- no air left, and the state of the last write is new: it takes the air's entry;
+- the word width is `bits_for_palette(length, 4)` of the final palette.
 
-Le compte non air suit les deux chemins d'écriture : +1 par cellule d'une suite (`fill_solid_run`),
-+1 si l'état n'est pas de l'air pour une cellule écrite seule (fluide ou marquée). Les cartes
-`OCEAN_FLOOR_WG` et `WORLD_SURFACE_WG` valent 1 + la plus haute cellule opaque. Les marques de
-post-traitement gardent leur ordre : bit 31 des cellules écrites, colonnes en z puis x, y descendant ;
-puis bit 30 de toutes les cellules, colonnes en x puis z, y descendant.
+The non-air count follows both write paths: +1 per cell of a run (`fill_solid_run`), +1 if the state
+is not air for a cell written alone (fluid or marked). The `OCEAN_FLOOR_WG` and `WORLD_SURFACE_WG`
+maps are 1 + the highest opaque cell. The post-processing marks keep their order: bit 31 of the
+written cells, columns by z then x, y going down; then bit 30 of all the cells, columns by x then z,
+y going down.
 
-## Déroulement
+## How it runs
 
-1. Après `ksf_blocs` (les états finaux sur le GPU), sur le même flux (`SurfaceGpu::enfiler`) :
-   - `ksec_hauteurs` : un bloc par colonne, les deux cartes et le nombre de marques ;
-   - `ksec_marques` : les rangs des colonnes, puis les marques des seules colonnes qui en ont ;
-   - `ksec_sections` : un bloc par section ; une table de 128 états (première position d'écriture,
-     compteur), leurs rangs, les règles de la dernière écriture, les mots compactés.
-2. Le GPU renvoie 1 285 mots u32 par section, les hauteurs et les marques (environ 125 Ko par chunk au
-   lieu de 393 Ko).
-3. `fill_noise_sections` (terrain.rs) pose chaque section par `BlockSection::from_parts`, ses compteurs
-   non air, les cartes (`Heightmap::set_first_available`) et les marques.
+1. After `ksf_blocks` (the final states on the GPU), on the same stream (`SurfaceGpu::enqueue`):
+   - `ksec_heights`: one block per column, the two maps and the number of marks;
+   - `ksec_marks`: the ranks of the columns, then the marks of only the columns that have some;
+   - `ksec_sections`: one block per section; a table of 128 states (first write position, counter),
+     their ranks, the rules of the last write, the packed words.
+2. The GPU sends back 1,285 u32 words per section, the heights and the marks (about 125 KB per chunk
+   instead of 393 KB).
+3. `fill_noise_sections` (terrain.rs) places each section through `BlockSection::from_parts`, its
+   non-air counters, the maps (`Heightmap::set_first_available`) and the marks.
 
-Plus de 128 états dans une section ou plus de 2 048 marques d'une sorte : les états bruts reviennent et
-`fill_noise_states` les écrit comme avant. Seul un chunk neuf de toute la hauteur prend ce chemin
+More than 128 states in a section or more than 2,048 marks of one kind: the raw states come back and
+`fill_noise_states` writes them as before. Only a fresh chunk of the whole height takes this path
 (`TerrainChunk::is_fresh`).
 
 ## Variables
 
-- `HORIZON_GPU_SECTIONS=1` : sections compactes du GPU (avec `HORIZON_GPU_SURFACE=1`).
-- `HORIZON_GPU_SECTIONS=test` : les états bruts reviennent aussi ; `fill_noise_states` les écrit, puis
-  `check_noise_sections` compare chaque section (palette, compteurs, cases libres, mots), les compteurs
-  non air, les cartes et les marques.
+- `HORIZON_GPU_SECTIONS=1`: compact sections from the GPU (with `HORIZON_GPU_SURFACE=1`).
+- `HORIZON_GPU_SECTIONS=test`: the raw states come back too; `fill_noise_states` writes them, then
+  `check_noise_sections` compares each section (palette, counters, free entries, words), the non-air
+  counters, the maps and the marks.
 
-La ligne `GPU surface :` donne les chunks posés, les replis par les états bruts et les écarts.
+The `GPU surface:` line gives the chunks placed, the fallbacks through the raw states and the
+mismatches.
 
-## Vérifications
+## Checks
 
-- Sonde `chunk_dump` (`/tmp/sec1.sh`), 3 zones de 256 chunks (0,0 ; −1250,940 ; badlands érodés
-  −320,−295) : identique au CPU à l'octet près en mode test et avec les sections ; 0 écart et 0 repli
-  sur 1 200 chunks en mode test.
-- Parité vanilla : **0 différence sur 785 chunks** avec les sections ; overworld en mode test :
-  3 479 chunks, 0 écart, 0 repli.
-- Tests unitaires de horizon-world (chunk, heightmap, terrain) : 34 passent.
+- `chunk_dump` probe (`/tmp/sec1.sh`), 3 zones of 256 chunks (0,0; −1250,940; eroded badlands
+  −320,−295): byte-identical to the CPU in test mode and with the sections; 0 mismatches and
+  0 fallbacks over 1,200 chunks in test mode.
+- Vanilla parity: **0 differences on 785 chunks** with the sections; overworld in test mode:
+  3,479 chunks, 0 mismatches, 0 fallbacks.
+- horizon-world unit tests (chunk, heightmap, terrain): 34 pass.
 
-## Mesures
+## Measurements
 
-La première version (un seul bloc pour les cartes et les marques, lectures non coalescées) allongeait
-l'appel de surface de 140 µs (537 → 676 µs, sonde sans contention). Avec un bloc par colonne pour les
-cartes, les marques relues seulement dans les colonnes qui en ont et des lectures coalescées dans
-`ksec_sections`, le surcoût tombe à 48 µs (498 → 546 µs).
+The first version (a single block for the maps and the marks, uncoalesced reads) made the surface
+call 140 µs longer (537 → 676 µs, probe without contention). With one block per column for the maps,
+the marks reread only in the columns that have some, and coalesced reads in `ksec_sections`, the
+overhead drops to 48 µs (498 → 546 µs).
 
-Bancs `/pregen` (`/tmp/ab16.sh`, release, rayon 1 600 blocs, zones neuves, tout sur GPU) :
+`/pregen` benches (`/tmp/ab16.sh`, release, radius 1,600 blocks, fresh zones, everything on the GPU):
 
-| Zone | Sans sections | Avec | CPU par chunk |
+| Zone | Without sections | With | CPU per chunk |
 |---|---|---|---|
-| 2000000/−2020000 | 1 574 chunks/s | **1 690 (+7,3 %)** | 5,96 → 5,31 ms (−10,9 %) |
-| −2030000/2040000 | 1 524 chunks/s | **1 665 (+9,3 %)** | 6,34 → 5,60 ms (−11,7 %) |
-| 2050000/−2070000 | 1 303 chunks/s | **1 387 (+6,5 %)** | 7,48 → 6,93 ms (−7,4 %) |
+| 2000000/−2020000 | 1,574 chunks/s | **1,690 (+7.3%)** | 5.96 → 5.31 ms (−10.9%) |
+| −2030000/2040000 | 1,524 chunks/s | **1,665 (+9.3%)** | 6.34 → 5.60 ms (−11.7%) |
+| 2050000/−2070000 | 1,303 chunks/s | **1,387 (+6.5%)** | 7.48 → 6.93 ms (−7.4%) |
 
-(Première version : +3,0 / +5,2 / +6,1 % ; CPU −6,8 / −11,4 / −9,2 %.)
+(First version: +3.0 / +5.2 / +6.1%; CPU −6.8 / −11.4 / −9.2%.)

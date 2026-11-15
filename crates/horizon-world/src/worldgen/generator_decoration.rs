@@ -581,7 +581,7 @@ impl Decoration {
         structures: Option<&super::generator_structures::StructureState>,
         ores: Option<&horizon_gpu::OreGpu>,
     ) -> Result<DecorateStats, GeneratorError> {
-        let debut = self.times.as_ref().map(|_| std::time::Instant::now());
+        let started = self.times.as_ref().map(|_| std::time::Instant::now());
         let center = region[4].position();
         for (i, chunk) in region.iter().enumerate() {
             let expected = ChunkPos::new(
@@ -667,7 +667,7 @@ impl Decoration {
         };
         // The chunk's GPU ores: predicted before any of its features, their blobs worked out on
         // the GPU while the earlier steps run.
-        if let (Some(t), Some(d)) = (&self.times, debut) {
+        if let (Some(t), Some(d)) = (&self.times, started) {
             t.stage(1, d.elapsed().as_nanos() as u64);
         }
         let prediction = self.times.as_ref().map(|_| std::time::Instant::now());
@@ -706,7 +706,7 @@ impl Decoration {
                 };
                 for (index, &structure) in in_step.iter().enumerate() {
                     random.set_feature_seed(decoration_seed, index as i32, step as i32);
-                    let mesure = self
+                    let measure = self
                         .times
                         .as_ref()
                         .filter(|_| references.iter().any(|s| s.structure == structure))
@@ -738,15 +738,15 @@ impl Decoration {
                             structure_errors += 1;
                         }
                     }
-                    if let Some((t, d)) = mesure {
+                    if let Some((t, d)) = measure {
                         t.structure(structure, d.elapsed().as_nanos() as u64);
                     }
                 }
                 Ok(())
             },
             |world, placer, random, id, origin| {
-                let mesure = self.times.as_ref().map(|t| (t, std::time::Instant::now()));
-                let resultat = (|| -> Result<bool, RegionError> {
+                let measure = self.times.as_ref().map(|t| (t, std::time::Instant::now()));
+                let outcome = (|| -> Result<bool, RegionError> {
                     if structures_only {
                         return Ok(false);
                     }
@@ -780,16 +780,16 @@ impl Decoration {
                     }
                     Ok(placed.unwrap_or(false))
                 })();
-                if let (Some((t, d)), Ok(placed)) = (mesure, &resultat) {
+                if let (Some((t, d)), Ok(placed)) = (measure, &outcome) {
                     t.feature(id.0 as usize, d.elapsed().as_nanos() as u64, *placed);
                 }
-                resultat
+                outcome
             },
         );
         if let Some(plan) = ore_plan {
             plan.gpu.finish(plan.job);
         }
-        let apres = self.times.as_ref().map(|_| std::time::Instant::now());
+        let after = self.times.as_ref().map(|_| std::time::Instant::now());
         // `FillLayerFeature.place` for the chunk: air at the layer's Y becomes the layer.
         if result.is_ok() && !structures_only {
             for &(y, state) in &self.top_layers {
@@ -839,7 +839,7 @@ impl Decoration {
             .terrain
             .set_generation_stage(PreLightChunkStage::Features);
         region[4].set_decorated();
-        if let (Some(t), Some(d), Some(a)) = (&self.times, debut, apres) {
+        if let (Some(t), Some(d), Some(a)) = (&self.times, started, after) {
             t.stage(3, a.elapsed().as_nanos() as u64);
             t.stage(0, d.elapsed().as_nanos() as u64);
             t.chunk(&self.names, structures);

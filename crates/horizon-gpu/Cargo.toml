@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "final_density sur GPU CUDA, au bit pres identique au CPU"
+description = "Chunk generation stages on the GPU (CUDA), bit-identical to the CPU"
 
 [dependencies]
 horizon-core = { path = "../horizon-core" }

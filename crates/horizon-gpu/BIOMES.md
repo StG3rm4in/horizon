@@ -1,110 +1,110 @@
-# Biomes sur GPU
+# Biomes on the GPU
 
-## Ce qui coûte
+## What it costs
 
-`biome_chunk_or_busy` (horizon-world, generator.rs) construit le `BiomeChunk` d'un chunk : 4 × 4 × 96
-quarts dans l'overworld (1 536). Pour chacun, les six champs du climat (température, humidité,
-continentalité, érosion, profondeur, bizarrerie), échantillonnés en volume sur le CPU, puis la
-recherche du biome le plus proche dans l'arbre du climat (`ClimateIndex`). Profil du 15/11, tout le
-reste sur GPU : **8,6 % du CPU**, dont 2,0 % dans `distance_until` et 0,7 % dans `search`.
+`biome_chunk_or_busy` (horizon-world, generator.rs) builds the `BiomeChunk` of a chunk: 4 × 4 × 96
+quarts in the overworld (1,536). For each one, the six climate fields (temperature, humidity,
+continentalness, erosion, depth, weirdness), sampled as a volume on the CPU, then the search for the
+closest biome in the climate tree (`ClimateIndex`). Profile of 15/11, everything else on the GPU:
+**8.6% of the CPU**, of which 2.0% in `distance_until` and 0.7% in `search`.
 
-## Ce que fait le GPU
+## What the GPU does
 
-`HORIZON_GPU_BIOMES=1` : pour une source multi-noise, le GPU calcule une région de R × R chunks
-(`HORIZON_GPU_BIOMES_REGION`, 8 par défaut) d'un coup, au premier chunk demandé de la région.
+`HORIZON_GPU_BIOMES=1`: for a multi-noise source, the GPU computes a region of R × R chunks
+(`HORIZON_GPU_BIOMES_REGION`, 8 by default) at once, at the first chunk of the region asked for.
 
-1. `kbi_climat`, un thread par colonne de quarts : les six racines du climat du routeur en mode point
-   (`ClimateSampler::sample` : position = quart << 2), par une fonction générée
-   (`Gen::colonne_points`, traduction.rs). Comme dans la descente de la surface, les sous-graphes sans
-   Y (`domain_axes`) sont calculés une fois avant la boucle sur les quarts Y, et partagés entre les six
-   racines : cinq des six champs, et la partie de la profondeur qui n'est pas le gradient en Y.
-2. `kbi_recherche`, un thread par quart : la quantification `(v * 10000f) as i64` (saturée, NaN → 0),
-   puis la recherche dans l'arbre **sans point de départ** : parcours en profondeur, enfants dans
-   l'ordre, un nœud n'est visité que si sa distance est strictement sous la meilleure. Le noyau garde
-   la première feuille au minimum, et ce minimum.
-3. `kbi_ordre`, un bloc par chunk : la recherche du CPU part du résultat précédent du chunk
-   (`ClimateSearch::last`, un résolveur neuf par chunk). Elle rend ce résultat précédent si sa distance
-   vaut le minimum du quart, sinon la première feuille au minimum, celle d'une recherche sans point de
-   départ : toutes les feuilles vues avant elle sont plus loin, et ses ancêtres sont au plus à sa
-   distance. Le bloc applique donc `last` quart par quart, dans l'ordre du remplissage (sections de bas
-   en haut, puis x, y, z), par tuiles de 128 quarts en mémoire partagée, et écrit l'identifiant du biome.
+1. `kbi_climate`, one thread per column of quarts: the six climate roots of the router in point mode
+   (`ClimateSampler::sample`: position = quart << 2), through a generated function
+   (`Gen::column_points`, codegen.rs). As in the surface descent, the Y-free subgraphs
+   (`domain_axes`) are computed once before the loop over the Y quarts, and shared between the six
+   roots: five of the six fields, and the part of the depth that is not the Y gradient.
+2. `kbi_search`, one thread per quart: the quantization `(v * 10000f) as i64` (saturating, NaN → 0),
+   then the tree search **without a starting point**: depth first, children in order, a node is
+   visited only if its distance is strictly below the best one. The kernel keeps the first leaf at
+   the minimum, and that minimum.
+3. `kbi_order`, one block per chunk: the CPU search starts from the chunk's previous result
+   (`ClimateSearch::last`, a fresh resolver per chunk). It returns that previous result if its
+   distance equals the minimum of the quart, otherwise the first leaf at the minimum, the one a
+   search without a starting point finds: every leaf seen before it is farther, and its ancestors are
+   at most at its distance. So the block applies `last` quart by quart, in fill order (sections from
+   bottom to top, then x, y, z), by tiles of 128 quarts in shared memory, and writes the biome id.
 
-L'arbre vient de `ClimateIndex::tree` (index.rs) : par nœud, les six intervalles et le carré de la
-distance du décalage ; et les liens (premier enfant et nombre d'enfants ; une feuille : son entrée et
-0). La distance est celle du CPU, en arithmétique 64 bits modulaire ; l'arrêt anticipé de
-`distance_until` ne change aucune comparaison.
+The tree comes from `ClimateIndex::tree` (index.rs): per node, the six intervals and the squared
+offset distance; and the links (first child and number of children; for a leaf: its entry and 0).
+The distance is the CPU's, in modular 64-bit arithmetic; the early exit of `distance_until` does not
+change any comparison.
 
-Côté CPU (`gpu_biome_chunk`) : une région par `OnceLock`, dans un cache des 128 dernières régions
-(`GpuBiomeRegions`). Le premier worker qui en a besoin la calcule ; les autres attendent, ou rendent
-« occupé » quand `biome_chunk_or_busy` est appelé sans attente. Chaque `BiomeChunk` est rempli depuis
-la région, dans l'ordre de `fill`.
+On the CPU side (`gpu_biome_chunk`): one region per `OnceLock`, in a cache of the last 128 regions
+(`GpuBiomeRegions`). The first worker that needs it computes it; the others wait, or return "busy"
+when `biome_chunk_or_busy` is called without waiting. Each `BiomeChunk` is filled from the region, in
+`fill` order.
 
-Repli sur le CPU :
+Fallback to the CPU:
 
-- chunk qui se fond avec un ancien monde (blender non vide) ;
-- entrée sans identifiant de biome (le CPU lève l'erreur) ;
-- région en erreur (pile du parcours, recherche sans résultat, erreur CUDA) ;
-- source qui n'est pas multi-noise ;
-- aléatoire legacy (le Nether), comme pour la densité.
+- a chunk that blends with an old world (non-empty blender);
+- an entry without a biome id (the CPU raises the error);
+- a failed region (traversal stack, search without a result, CUDA error);
+- a source that is not multi-noise;
+- legacy randomness (the Nether), as for the density.
 
 ## Variables
 
-- `HORIZON_GPU_BIOMES=1` : biomes sur GPU.
-- `HORIZON_GPU_BIOMES=test` : les deux chemins, comparés section par section ; le CPU fait foi. Des
-  lignes `GPU biomes test:` sont écrites dans latest.log aux puissances de deux, avec les 16 premiers
-  écarts.
-- `HORIZON_GPU_BIOMES_REGION` : côté d'une région en chunks (8).
-- `HORIZON_GPU_DUMP_BIOMES=fichier` : le source CUDA généré.
+- `HORIZON_GPU_BIOMES=1`: biomes on the GPU.
+- `HORIZON_GPU_BIOMES=test`: both paths, compared section by section; the CPU is authoritative.
+  `GPU biomes test:` lines are written to latest.log at powers of two, with the first 16 mismatches.
+- `HORIZON_GPU_BIOMES_REGION`: side of a region in chunks (8).
+- `HORIZON_GPU_DUMP_BIOMES=file`: the generated CUDA source.
 
-## Vérifications
+## Checks
 
-- Sonde `chunk_dump` (graine 12345, phase full, tout sur GPU) sur 3 zones de 256 chunks : identique à
-  l'octet près au CPU, en `test` comme en `1` ; 484 chunks par zone comparés en mode test, 0 écart.
-- Parité vanilla : overworld en mode test, 627 chunks, **0 différence**, 5 473 chunks de biomes
-  comparés, 0 écart ; complète, tout sur GPU, **0 différence sur 785 chunks**. Le Nether (aléatoire
-  legacy) reste sur le CPU : 0 différence sur 113 chunks.
-- `/pregen` en mode test (rayon 800, zones neuves 2600000/−2620000 puis 2650000/−2670000) : plus de
-  8 192 chunks comparés, 0 écart.
+- `chunk_dump` probe (seed 12345, full phase, everything on the GPU) on 3 zones of 256 chunks:
+  byte-identical to the CPU, in `test` as in `1`; 484 chunks per zone compared in test mode,
+  0 mismatches.
+- Vanilla parity: overworld in test mode, 627 chunks, **0 differences**, 5,473 biome chunks compared,
+  0 mismatches; full, everything on the GPU, **0 differences on 785 chunks**. The Nether (legacy
+  randomness) stays on the CPU: 0 differences on 113 chunks.
+- `/pregen` in test mode (radius 800, fresh zones 2600000/−2620000 then 2650000/−2670000): more than
+  8,192 chunks compared, 0 mismatches.
 
-## Mesures
+## Measurements
 
-Temps GPU d'une région de 8 × 8 chunks (nsys, sonde sur 32 × 32 chunks) :
+GPU time of a region of 8 × 8 chunks (nsys, probe on 32 × 32 chunks):
 
-| Version | Climat | Recherche | Ordre | Région entière |
+| Version | Climate | Search | Order | Whole region |
 |---|---|---|---|---|
-| 1 : climat et recherche par quart, ordre par un thread par chunk | 3,46 ms (avec la recherche) | | 0,97 ms | ~5 ms |
-| 2 : climat par colonne, ordre par tuiles | 0,11 ms | 0,33 ms | 0,23 ms | ~1,0 ms (max 1,4) |
+| 1: climate and search per quart, order by one thread per chunk | 3.46 ms (with the search) | | 0.97 ms | ~5 ms |
+| 2: climate per column, order by tiles | 0.11 ms | 0.33 ms | 0.23 ms | ~1.0 ms (max 1.4) |
 
-Le bruit est en f64, que la 3080 calcule lentement : en version 1, c'est le climat évalué en chaque
-quart qui coûtait. Avec des régions de 16 × 16, une région prend 2,0 ms : moins par chunk, mais une
-attente plus longue pour le premier chunk demandé ; 8 reste la valeur par défaut.
+The noise is in f64, which the 3080 computes slowly: in version 1, the climate evaluated at every
+quart was the cost. With regions of 16 × 16, a region takes 2.0 ms: less per chunk, but a longer wait
+for the first chunk asked for; 8 stays the default.
 
-Bancs `/tmp/ab18.sh` (release, rayon 1 600 blocs, zones neuves, tout le reste sur GPU dont les
-sections) :
+`/tmp/ab18.sh` benches (release, radius 1,600 blocks, fresh zones, everything else on the GPU,
+sections included):
 
-| Zone | Biomes CPU | Biomes GPU | CPU par chunk |
+| Zone | CPU biomes | GPU biomes | CPU per chunk |
 |---|---|---|---|
-| 2700000/−2720000 | 1 669 chunks/s | 1 648 (−1,2 %) | 5,43 → 5,29 ms (−2,6 %) |
-| −2730000/2740000 | 1 435 chunks/s | 1 485 (+3,5 %) | 6,46 → 6,05 ms (−6,3 %) |
-| 2750000/−2770000 | 1 415 chunks/s | 1 393 (−1,5 %) | 6,56 → 6,39 ms (−2,6 %) |
+| 2700000/−2720000 | 1,669 chunks/s | 1,648 (−1.2%) | 5.43 → 5.29 ms (−2.6%) |
+| −2730000/2740000 | 1,435 chunks/s | 1,485 (+3.5%) | 6.46 → 6.05 ms (−6.3%) |
+| 2750000/−2770000 | 1,415 chunks/s | 1,393 (−1.5%) | 6.56 → 6.39 ms (−2.6%) |
 
-Le débit ne bouge pas : `/pregen` n'est pas limité par le CPU (8,4 à 9,2 cœurs occupés sur 12). Le
-CPU par chunk baisse de 2,6 à 6,3 % selon la zone.
+The throughput does not move: `/pregen` is not limited by the CPU (8.4 to 9.2 cores busy out of
+12). The CPU per chunk drops by 2.6 to 6.3% depending on the zone.
 
-Profil (zone 2800000/−2820000, 1 714 chunks/s avec les binaires de profil) :
+Profile (zone 2800000/−2820000, 1,714 chunks/s with the profiling binaries):
 
-- `biome_chunk_or_busy` passe de 5,7 % du CPU à 0,1 %, et le chemin GPU (`gpu_biome_chunk`,
-  `BiomeGpu::region`) coûte 0,18 % ;
-- la catégorie « biomes et climat » passe de 8,6 % à 2,8 %. Le reste vient des appels hors des
-  chunks de biomes : `fold` 1,4 %, `carver_biome` 0,4 %, `biome_id` 0,3 %.
-- Les plus gros postes sont maintenant :
+- `biome_chunk_or_busy` goes from 5.7% of the CPU to 0.1%, and the GPU path (`gpu_biome_chunk`,
+  `BiomeGpu::region`) costs 0.18%;
+- the "biomes and climate" category goes from 8.6% to 2.8%. The rest comes from calls outside the
+  biome chunks: `fold` 1.4%, `carver_biome` 0.4%, `biome_id` 0.3%.
+- The biggest items are now:
 
-| Poste | Part du CPU |
+| Item | Share of the CPU |
 |---|---|
-| Décorations | 29,6 % |
-| Sauvegarde | 17,9 % |
-| Attente et pilote du GPU | 11,2 % |
-| zlib | 9,9 % |
-| Thread principal | 7,8 % |
-| Génération (reste) | 6,3 % |
-| Structures | 5,1 % |
+| Decorations | 29.6% |
+| Saving | 17.9% |
+| GPU wait and driver | 11.2% |
+| zlib | 9.9% |
+| Main thread | 7.8% |
+| Generation (rest) | 6.3% |
+| Structures | 5.1% |

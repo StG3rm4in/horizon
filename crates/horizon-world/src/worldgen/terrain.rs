@@ -1095,9 +1095,9 @@ fn gpu_section<'r>(
     registry: &'r BlockRegistry,
 ) -> Result<(BlockSection<'r>, u16), TerrainError> {
     let o = &data[s * horizon_gpu::SECTION_WORDS..(s + 1) * horizon_gpu::SECTION_WORDS];
-    let (genre, bits, len) = (o[0] & 0xFF, ((o[0] >> 8) & 0xFF) as u8, (o[0] >> 16) as usize);
+    let (kind, bits, len) = (o[0] & 0xFF, ((o[0] >> 8) & 0xFF) as u8, (o[0] >> 16) as usize);
     let non_air = u16::try_from(o[1]).map_err(|_| TerrainError::InvalidState)?;
-    let section = match genre {
+    let section = match kind {
         0 => BlockSection::uniform(air, registry)?,
         1 => BlockSection::uniform(BlockStateId(o[2]), registry)?,
         2 => {
@@ -1111,12 +1111,12 @@ fn gpu_section<'r>(
                 .map(|&c| u16::try_from(c).map_err(|_| TerrainError::InvalidState))
                 .collect::<Result<Vec<_>, _>>()?;
             let free = if o[4] != 0 { vec![0] } else { Vec::new() };
-            let mots = o[3] as usize;
+            let word_count = o[3] as usize;
             let d = &o[5 + 2 * K..];
-            if mots * 2 > d.len() {
+            if word_count * 2 > d.len() {
                 return Err(TerrainError::InvalidState);
             }
-            let words = (0..mots)
+            let words = (0..word_count)
                 .map(|w| u64::from(d[2 * w]) | (u64::from(d[2 * w + 1]) << 32))
                 .collect();
             let storage = horizon_core::storage::PackedStorage::from_words(bits, 4096, words)
@@ -1211,18 +1211,18 @@ pub fn check_noise_sections<B: TerrainBlockStates>(
     let (hm, mq) = gpu_layout(data, sections).map_err(|e| format!("{e:?}"))?;
     for s in 0..sections {
         let (gpu, non_air) = gpu_section(data, s, chunk.blocks.air, chunk.blocks.registry)
-            .map_err(|e| format!("section {s} : {e:?}"))?;
+            .map_err(|e| format!("section {s}: {e:?}"))?;
         let cpu = &chunk.blocks.sections[s];
         let (pg, cg, fg, sg) = gpu.parts();
         let (pc, cc, fc, sc) = cpu.parts();
         if pg != pc || cg != cc || fg != fc {
-            return Err(format!("section {s} : palette {pg:?} {cg:?} {fg:?} contre {pc:?} {cc:?} {fc:?}"));
+            return Err(format!("section {s}: palette {pg:?} {cg:?} {fg:?} against {pc:?} {cc:?} {fc:?}"));
         }
         if sg.map(|s| (s.bits(), s.words())) != sc.map(|s| (s.bits(), s.words())) {
-            return Err(format!("section {s} : mots differents"));
+            return Err(format!("section {s}: different words"));
         }
         if non_air != chunk.blocks.non_air[s] {
-            return Err(format!("section {s} : non air {non_air} contre {}", chunk.blocks.non_air[s]));
+            return Err(format!("section {s}: non-air {non_air} against {}", chunk.blocks.non_air[s]));
         }
     }
     let min_y = chunk.min_y();
@@ -1230,14 +1230,14 @@ pub fn check_noise_sections<B: TerrainBlockStates>(
         .into_iter()
         .enumerate()
     {
-        let map = chunk.heightmaps[kind as usize].as_ref().ok_or("carte absente")?;
+        let map = chunk.heightmaps[kind as usize].as_ref().ok_or("missing heightmap")?;
         for t in 0..256 {
             let gpu = min_y.wrapping_add(data[hm + 256 * i + t] as i32);
             let cpu = map
                 .first_available((t & 15) as i32, (t >> 4) as i32)
                 .map_err(|e| format!("{e:?}"))?;
             if gpu != cpu {
-                return Err(format!("carte {kind:?} colonne {t} : {gpu} contre {cpu}"));
+                return Err(format!("heightmap {kind:?} column {t}: {gpu} against {cpu}"));
             }
         }
     }
@@ -1253,7 +1253,7 @@ pub fn check_noise_sections<B: TerrainBlockStates>(
         }
     }
     if marks != chunk.postprocessing {
-        return Err(format!("marques : {na} + {nb} contre {:?}", chunk.postprocessing.iter().map(Vec::len).collect::<Vec<_>>()));
+        return Err(format!("marks: {na} + {nb} against {:?}", chunk.postprocessing.iter().map(Vec::len).collect::<Vec<_>>()));
     }
     Ok(())
 }

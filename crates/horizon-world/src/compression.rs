@@ -42,7 +42,7 @@ impl Compression {
     /// The deflate level every zlib or gzip record written from here on uses: 0 (stored) to 9
     /// (smallest), `horizon-region-deflate-level` in server.properties. Lower levels compress
     /// faster into larger files; 1 saves most of the compression's CPU for ~27 % more disk than 6
-    /// (crates/horizon-gpu/SAUVEGARDE.md). False, and the level as it was, past 9.
+    /// (crates/horizon-gpu/SAVING.md). False, and the level as it was, past 9.
     pub fn configure_deflate_level(level: u32) -> bool {
         let Ok(level) = u8::try_from(level) else {
             return false;

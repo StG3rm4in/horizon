@@ -215,7 +215,7 @@ impl Game<'_> {
                     .map(|((name, _), sum)| format!("{name} {:.1}", *sum as f64 / *n as f64))
                     .collect();
                 log::info!(
-                    "pregen trace: row {} done {} ; {} ; queue empty {:.0} % of {} updates",
+                    "pregen trace: row {} done {}; {}; queue empty {:.0} % of {} updates",
                     task.pregen.row(),
                     task.pregen.done,
                     avg.join(", "),

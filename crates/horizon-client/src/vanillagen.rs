@@ -421,10 +421,10 @@ impl VanillaTerrain {
             // (it runs on the server thread for every light view); a partly generated one block by
             // block.
             // HORIZON_COLUMN=values: the states unpacked and converted as before (banc).
-            static PAR_VALEURS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let par_valeurs = *PAR_VALEURS
+            static BY_VALUES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let by_values = *BY_VALUES
                 .get_or_init(|| std::env::var("HORIZON_COLUMN").as_deref() == Ok("values"));
-            if par_valeurs && base >= lo && base + 16 <= hi && chunk.terrain.section_states(base, &mut values) {
+            if by_values && base >= lo && base + 16 <= hi && chunk.terrain.section_states(base, &mut values) {
                 if values.iter().any(|&id| id != 0) {
                     Arc::make_mut(&mut out.sections[si as usize]).blocks = Section::from_blocks(&values);
                 }
@@ -443,16 +443,16 @@ impl VanillaTerrain {
                 {
                     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
                     static SECTIONS: AtomicU64 = AtomicU64::new(0);
-                    static ECARTS: AtomicU64 = AtomicU64::new(0);
+                    static MISMATCHES: AtomicU64 = AtomicU64::new(0);
                     let before = Section::from_blocks(&values);
                     if before.to_wire() != blocks.to_wire() {
-                        ECARTS.fetch_add(1, Relaxed);
+                        MISMATCHES.fetch_add(1, Relaxed);
                     }
                     let n = SECTIONS.fetch_add(1, Relaxed) + 1;
                     if n.is_power_of_two() && n >= 1024 {
                         log::info!(
                             "column test: {n} sections converted, {} differ from from_values",
-                            ECARTS.load(Relaxed)
+                            MISMATCHES.load(Relaxed)
                         );
                     }
                 }

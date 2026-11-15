@@ -1,28 +1,28 @@
-//! final_density sur GPU (CUDA), identique au bit pres au sampler CPU de Horizon.
+//! final_density on the GPU (CUDA), bit-identical to Horizon's CPU sampler.
 //!
-//! Le GPU calcule d'un coup une region de R x R chunks (8 x 8 par defaut) et la garde en memoire
-//! GPU ; chaque chunk demande ensuite par un worker est copie (393 Ko en 16 x 384 x 16) dans le
-//! tampon de `fill_noise`, qui fait le reste sur le CPU comme avant (aquiferes, blocs, heightmaps).
+//! The GPU computes a region of R x R chunks at once (8 x 8 by default) and keeps it in GPU memory;
+//! each chunk a worker then asks for is copied (393 KB for 16 x 384 x 16) into the `fill_noise`
+//! buffer, which does the rest on the CPU as before (aquifers, blocks, heightmaps).
 //!
-//! Active par la variable d'environnement `HORIZON_GPU_DENSITY` :
-//! - `1` : compilation en arriere-plan, le CPU sert les chunks en attendant ;
-//! - `wait` : compilation avant le premier chunk (tests de parite).
+//! Enabled by the `HORIZON_GPU_DENSITY` environment variable:
+//! - `1`: compilation in the background, the CPU serves the chunks meanwhile;
+//! - `wait`: compilation before the first chunk (parity tests).
 //!
-//! Reglages : `HORIZON_GPU_SYNC` (attente : block par defaut, spin, yield, auto),
-//! `HORIZON_GPU_PRIORITY=0` (sans priorite pour les flux du chemin critique),
-//! `HORIZON_GPU_REGION` (cote d'une region en chunks, 8), `HORIZON_GPU_REGIONS_MAX`
-//! (regions gardees en memoire GPU, 128), `HORIZON_GPU_CACHE` (dossier du PTX compile).
-//! Au demarrage, un auto-test compare trois chunks au CPU ; a la moindre difference ou erreur CUDA,
-//! le GPU est desactive et tout repasse par le CPU.
+//! Settings: `HORIZON_GPU_SYNC` (waiting: block by default, spin, yield, auto),
+//! `HORIZON_GPU_PRIORITY=0` (no priority for the critical path streams), `HORIZON_GPU_REGION` (side
+//! of a region in chunks, 8), `HORIZON_GPU_REGIONS_MAX` (regions kept in GPU memory, 128),
+//! `HORIZON_GPU_CACHE` (directory of the compiled PTX).
+//! At startup, a self-test compares three chunks with the CPU; at the slightest difference or CUDA
+//! error, the GPU is disabled and everything falls back to the CPU.
 mod biomes;
-mod grottes;
-mod lumiere;
-mod traduction;
+mod caves;
+mod codegen;
+mod light;
 
 pub use biomes::{BiomeGpu, BiomeTree};
-pub use lumiere::{LightGpu, LightInput, LightJob, LightSection};
+pub use light::{LightGpu, LightInput, LightJob, LightSection};
 
-pub use grottes::{CAVE_CANYON, CAVE_MASK_WORDS, CAVE_ROOM, CAVE_TUNNEL, CaveGpu, CaveItem, CaveJob, CaveTarget};
+pub use caves::{CAVE_CANYON, CAVE_MASK_WORDS, CAVE_ROOM, CAVE_TUNNEL, CaveGpu, CaveItem, CaveJob, CaveTarget};
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
@@ -37,104 +37,105 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-trait Contexte<T> {
-    fn ctx(self, quoi: &str) -> Result<T, String>;
+trait Context<T> {
+    fn ctx(self, what: &str) -> Result<T, String>;
 }
-impl<T, E: std::fmt::Debug> Contexte<T> for Result<T, E> {
-    fn ctx(self, quoi: &str) -> Result<T, String> {
-        self.map_err(|e| format!("{quoi} : {e:?}"))
+impl<T, E: std::fmt::Debug> Context<T> for Result<T, E> {
+    fn ctx(self, what: &str) -> Result<T, String> {
+        self.map_err(|e| format!("{what}: {e:?}"))
     }
 }
 
-fn env_ou(nom: &str, defaut: i32) -> i32 {
-    std::env::var(nom)
+fn env_or(name: &str, fallback: i32) -> i32 {
+    std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(defaut)
+        .unwrap_or(fallback)
 }
 
-/// Le contexte CUDA du processus, partage par toutes les dimensions.
-fn contexte() -> Result<Arc<CudaContext>, String> {
+/// The process's CUDA context, shared by all dimensions.
+fn context() -> Result<Arc<CudaContext>, String> {
     static CTX: OnceLock<Result<Arc<CudaContext>, String>> = OnceLock::new();
     CTX.get_or_init(|| {
-        let ctx = CudaContext::new(0).ctx("contexte CUDA")?;
-        // Attente de la fin d'un calcul : HORIZON_GPU_SYNC = block (par defaut : le thread dort), spin,
-        // yield ou auto (heuristique CUDA, souvent spin : le coeur tourne a vide pendant l'attente).
-        // Avec la lumiere sur GPU, le CPU n'est plus le goulot de /pregen : dormir rend 4 a 6 % du CPU
-        // par chunk sans changer le debit (GPU_ATTENTE.md).
+        let ctx = CudaContext::new(0).ctx("CUDA context")?;
+        // Waiting for a computation to finish: HORIZON_GPU_SYNC = block (default: the thread
+        // sleeps), spin, yield or auto (CUDA heuristic, often spin: the core spins idle while
+        // waiting).
+        // With light on the GPU, the CPU is no longer the bottleneck of /pregen: sleeping gives
+        // back 4 to 6 % of the CPU per chunk without changing the throughput (GPU_WAIT.md).
         use cudarc::driver::sys::CUctx_flags::*;
-        let attente = match std::env::var("HORIZON_GPU_SYNC").as_deref() {
+        let wait = match std::env::var("HORIZON_GPU_SYNC").as_deref() {
             Ok("spin") => Some(CU_CTX_SCHED_SPIN),
             Ok("yield") => Some(CU_CTX_SCHED_YIELD),
             Ok("auto") => None,
             _ => Some(CU_CTX_SCHED_BLOCKING_SYNC),
         };
-        if let Some(f) = attente {
-            ctx.set_flags(f).ctx("mode d'attente")?;
+        if let Some(f) = wait {
+            ctx.set_flags(f).ctx("wait mode")?;
         }
-        // Synchronisation geree ici : chaque calcul et chaque copie attend la fin de son flux.
+        // Synchronization handled here: each computation and each copy waits for the end of its
+        // stream.
         unsafe { ctx.disable_event_tracking() };
         Ok(ctx)
     })
     .clone()
 }
 
-/// Mots u32 d'une section dans la sortie de `SurfaceGpu::enable_sections` (sections.cu, SC_PAS) :
-/// en-tete de 5 mots, 128 etats, 128 compteurs, 1024 mots de donnees.
+/// u32 words of a section in the output of `SurfaceGpu::enable_sections` (sections.cu, SC_STRIDE):
+/// a 5-word header, 128 states, 128 counters, 1024 data words.
 pub const SECTION_WORDS: usize = 5 + 2 * 128 + 1024;
-/// Marques de post-traitement par liste au plus dans cette sortie (au-dela : etats bruts, CPU).
+/// Post-processing marks per list at most in this output (beyond that: raw states, CPU).
 pub const SECTION_MARKS: usize = 2048;
 
-/// Un flux du chemin critique (un worker attend son resultat : remplissage, surface, region) : la plus
-/// haute priorite du GPU, pour passer devant les lots asynchrones (lumiere, grottes, minerais), crees a
-/// la priorite par defaut. `HORIZON_GPU_PRIORITY=0` les met tous a la meme.
-fn flux_prioritaire(ctx: &Arc<CudaContext>) -> Result<Arc<CudaStream>, String> {
-    static PRIORITE: OnceLock<i32> = OnceLock::new();
-    let p = *PRIORITE.get_or_init(|| {
+/// A critical path stream (a worker waits for its result: filling, surface, region): the GPU's
+/// highest priority, to go ahead of the asynchronous batches (light, caves, ores), created at the
+/// default priority. `HORIZON_GPU_PRIORITY=0` puts them all at the same one.
+fn priority_stream(ctx: &Arc<CudaContext>) -> Result<Arc<CudaStream>, String> {
+    static PRIORITY: OnceLock<i32> = OnceLock::new();
+    let p = *PRIORITY.get_or_init(|| {
         if std::env::var("HORIZON_GPU_PRIORITY").as_deref() == Ok("0") || ctx.bind_to_thread().is_err() {
             return 0;
         }
-        cudarc::driver::result::stream::get_priority_range().map_or(0, |(_, haute)| haute)
+        cudarc::driver::result::stream::get_priority_range().map_or(0, |(_, high)| high)
     });
-    ctx.new_stream_with_priority(p).ctx("flux CUDA")
+    ctx.new_stream_with_priority(p).ctx("CUDA stream")
 }
 
-/// Les aquiferes d'une dimension, pour decider aussi chaque bloc sur GPU.
+/// The aquifers of a dimension, to decide each block on the GPU too.
 #[derive(Clone, Copy, Debug)]
 pub struct AquiferSetup {
-    /// Racines dans l'ordre de AquiferField::ALL (barriere, inondation, etalement, lave, exclusion,
-    /// niveau de surface).
+    /// Roots in AquiferField::ALL order (barrier, flood, spread, lava, exclusion, surface level).
     pub roots: [FunctionId; 6],
-    /// Etat (lo, hi) de la fabrique positionnelle des aquiferes (Xoroshiro).
+    /// State (lo, hi) of the aquifers' positional random factory (Xoroshiro).
     pub positional: (u64, u64),
     pub sea_level: i32,
 }
 
-/// final_density d'une dimension sur GPU.
+/// final_density of a dimension on the GPU.
 pub struct GpuFinalDensity {
-    partage: Arc<Partage>,
+    shared: Arc<Shared>,
 }
 
-struct Partage {
-    nom: String,
-    moteur: OnceLock<Option<Moteur>>,
+struct Shared {
+    name: String,
+    engine: OnceLock<Option<Engine>>,
 }
 
 impl std::fmt::Debug for GpuFinalDensity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let etat = match self.partage.moteur.get() {
+        let state = match self.shared.engine.get() {
             None => "en preparation",
-            Some(None) => "desactive",
-            Some(Some(m)) if m.hors_service.load(Relaxed) => "hors service",
-            Some(Some(_)) => "pret",
+            Some(None) => "disabled",
+            Some(Some(m)) if m.broken.load(Relaxed) => "broken",
+            Some(Some(_)) => "ready",
         };
-        write!(f, "GpuFinalDensity({}, {etat})", self.partage.nom)
+        write!(f, "GpuFinalDensity({}, {state})", self.shared.name)
     }
 }
 
 impl GpuFinalDensity {
-    /// `None` si `HORIZON_GPU_DENSITY` est absent ou vaut 0, si la source aleatoire est legacy, ou si
-    /// un noeud du graphe n'a pas de traduction CUDA. `cpu` est le sampler de reference de l'auto-test.
+    /// `None` if `HORIZON_GPU_DENSITY` is unset or 0, if the random source is legacy, or if a graph
+    /// node has no CUDA translation. `cpu` is the reference sampler of the self-test.
     pub fn new(
         compiler: &DensityCompiler,
         root: FunctionId,
@@ -143,7 +144,7 @@ impl GpuFinalDensity {
         cpu: Arc<dyn DensitySampler>,
         min_y: i32,
         height: i32,
-        nom: &str,
+        name: &str,
         aquifer: Option<AquiferSetup>,
     ) -> Option<Self> {
         let mode = std::env::var("HORIZON_GPU_DENSITY").ok()?;
@@ -151,120 +152,121 @@ impl GpuFinalDensity {
             return None;
         }
         if legacy {
-            log::info!("GPU final_density ({nom}) : source aleatoire legacy, reste sur CPU");
+            log::info!("GPU final_density ({name}): legacy random source, staying on the CPU");
             return None;
         }
-        let r = env_ou("HORIZON_GPU_REGION", 8).clamp(1, 32);
-        let capacite = env_ou("HORIZON_GPU_REGIONS_MAX", 128).max(1) as usize;
+        let r = env_or("HORIZON_GPU_REGION", 8).clamp(1, 32);
+        let capacity = env_or("HORIZON_GPU_REGIONS_MAX", 128).max(1) as usize;
         let t = Instant::now();
-        let prog = match traduction::generer(compiler, root, seed, [16 * r, height, 16 * r]) {
+        let prog = match codegen::generate(compiler, root, seed, [16 * r, height, 16 * r]) {
             Ok(p) => p,
             Err(e) => {
                 log::info!(
-                    "GPU final_density ({nom}) : pas de traduction CUDA ({e}), reste sur CPU"
+                    "GPU final_density ({name}): no CUDA translation ({e}), staying on the CPU"
                 );
                 return None;
             }
         };
         log::info!(
-            "GPU final_density ({nom}) : {} lignes de CUDA generees en {:.0} ms, regions de {r}x{r} chunks ({:.0} Mo GPU chacune)",
-            prog.lignes,
+            "GPU final_density ({name}): {} lines of CUDA generated in {:.0} ms, regions of {r}x{r} chunks ({:.0} MB of GPU memory each)",
+            prog.lines,
             t.elapsed().as_secs_f64() * 1e3,
-            prog.taille as f64 * 4e-6
+            prog.size as f64 * 4e-6
         );
         if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP") {
             let _ = std::fs::write(f, &prog.src);
         }
-        // Aquiferes : HORIZON_GPU_AQUIFERS=0 les laisse sur CPU
-        let aquifere = aquifer
+        // Aquifers: HORIZON_GPU_AQUIFERS=0 leaves them on the CPU
+        let aquifer_prog = aquifer
             .filter(|_| std::env::var("HORIZON_GPU_AQUIFERS").map_or(true, |v| v != "0"))
-            .and_then(|a| match traduction::generer_aquifere(compiler, a.roots, seed) {
+            .and_then(|a| match codegen::generate_aquifer(compiler, a.roots, seed) {
                 Ok(src) => Some((a, src)),
                 Err(e) => {
-                    log::info!("GPU final_density ({nom}) : aquiferes sans traduction CUDA ({e}), restent sur CPU");
+                    log::info!("GPU final_density ({name}): aquifers without a CUDA translation ({e}), staying on the CPU");
                     None
                 }
             });
-        let partage = Arc::new(Partage {
-            nom: nom.to_owned(),
-            moteur: OnceLock::new(),
+        let shared = Arc::new(Shared {
+            name: name.to_owned(),
+            engine: OnceLock::new(),
         });
-        let p = partage.clone();
-        let travail = move || {
+        let p = shared.clone();
+        let work = move || {
             let t = Instant::now();
-            let m = Moteur::demarrer(prog, aquifere, r, capacite, min_y, height)
+            let m = Engine::start(prog, aquifer_prog, r, capacity, min_y, height)
                 .and_then(|m| m.auto_test(&*cpu).map(|()| m));
             match m {
                 Ok(m) => {
                     let msg = format!(
-                        "GPU final_density ({}) : pret en {:.1} s, auto-test identique au CPU{}",
-                        p.nom,
+                        "GPU final_density ({}): ready in {:.1} s, self-test identical to the CPU{}",
+                        p.name,
                         t.elapsed().as_secs_f64(),
-                        if m.aq.is_some() { ", aquiferes sur GPU" } else { "" }
+                        if m.aq.is_some() { ", aquifers on the GPU" } else { "" }
                     );
                     log::info!("{msg}");
                     eprintln!("{msg}");
-                    let _ = p.moteur.set(Some(m));
+                    let _ = p.engine.set(Some(m));
                 }
                 Err(e) => {
                     log::error!(
-                        "GPU final_density ({}) : desactive, tout reste sur CPU : {e}",
-                        p.nom
+                        "GPU final_density ({}): disabled, everything stays on the CPU: {e}",
+                        p.name
                     );
                     eprintln!(
-                        "GPU final_density ({}) : desactive, tout reste sur CPU : {e}",
-                        p.nom
+                        "GPU final_density ({}): disabled, everything stays on the CPU: {e}",
+                        p.name
                     );
-                    let _ = p.moteur.set(None);
+                    let _ = p.engine.set(None);
                 }
             }
         };
         if mode == "wait" {
-            travail();
+            work();
         } else if let Err(e) = std::thread::Builder::new()
             .name("horizon-gpu".into())
-            .spawn(travail)
+            .spawn(work)
         {
-            log::error!("GPU final_density ({nom}) : thread de compilation : {e}");
+            log::error!("GPU final_density ({name}): compilation thread: {e}");
             return None;
         }
-        Some(Self { partage })
+        Some(Self { shared })
     }
 
-    /// Ecrit la densite finale du chunk dans `out` (16 x hauteur x 16, ordre de `fill_noise`).
-    /// `false` : GPU pas encore pret, desactive ou en erreur ; le CPU doit calculer ce chunk.
+    /// Writes the chunk's final density into `out` (16 x height x 16, `fill_noise` order).
+    /// `false`: GPU not ready yet, disabled or failed; the CPU must compute this chunk.
     pub fn fill_chunk(&self, chunk_x: i32, chunk_z: i32, out: &mut [f32]) -> bool {
-        match self.partage.moteur.get() {
+        match self.shared.engine.get() {
             Some(Some(m)) => m.chunk(chunk_x, chunk_z, out),
             _ => false,
         }
     }
 
-    /// Codes de chaque bloc du chunk (ordre de `fill_noise`) : 0 densite > 0, 1 air, 2 fluide par defaut,
-    /// 3 lave, 8 bloc par defaut decide par la pression de l'aquifere, +4 mise a jour de fluide planifiee.
-    /// Renvoie le skip_sampling_above_y du chunk, ou `None` (GPU absent, sans aquiferes ou en erreur).
-    /// `grottes` : le lot des carvers du chunk, dont l'aquifere GPU calcule alors aussi les cellules.
-    pub fn chunk_blocks(&self, chunk_x: i32, chunk_z: i32, out: &mut [i8], grottes: Option<&mut CaveJob>) -> Option<i32> {
-        match self.partage.moteur.get() {
-            Some(Some(m)) if m.aq.is_some() => m.chunk_codes(chunk_x, chunk_z, out, None, grottes),
+    /// Codes of each block of the chunk (`fill_noise` order): 0 density > 0, 1 air, 2 default
+    /// fluid, 3 lava, 8 default block decided by the aquifer's pressure, +4 scheduled fluid update.
+    /// Returns the chunk's skip_sampling_above_y, or `None` (no GPU, no aquifers, or failed).
+    /// `caves`: the chunk's carver batch, whose cells the GPU aquifer then computes too.
+    pub fn chunk_blocks(&self, chunk_x: i32, chunk_z: i32, out: &mut [i8], caves: Option<&mut CaveJob>) -> Option<i32> {
+        match self.shared.engine.get() {
+            Some(Some(m)) if m.aq.is_some() => m.chunk_codes(chunk_x, chunk_z, out, None, caves),
             _ => None,
         }
     }
 
-    /// Comme `chunk_blocks`, pour un chunk dont le terrain s'adapte a des structures : le beardifier est
-    /// ajoute a la densite finale sur GPU avant la decision d'aquifere. `None` pour les noyaux de terrain
-    /// des bibliotheques de structures (mods), qui restent sur CPU.
-    pub fn chunk_blocks_beard(&self, chunk_x: i32, chunk_z: i32, beard: &Beardifier, out: &mut [i8], grottes: Option<&mut CaveJob>) -> Option<i32> {
-        match self.partage.moteur.get() {
-            Some(Some(m)) if m.aq.is_some() => m.chunk_codes_beard(chunk_x, chunk_z, beard, out, None, grottes),
+    /// Like `chunk_blocks`, for a chunk whose terrain adapts to structures: the beardifier is added
+    /// to the final density on the GPU before the aquifer decision. `None` for the terrain kernels
+    /// of structure libraries (mods), which stay on the CPU.
+    pub fn chunk_blocks_beard(&self, chunk_x: i32, chunk_z: i32, beard: &Beardifier, out: &mut [i8], caves: Option<&mut CaveJob>) -> Option<i32> {
+        match self.shared.engine.get() {
+            Some(Some(m)) if m.aq.is_some() => m.chunk_codes_beard(chunk_x, chunk_z, beard, out, None, caves),
             _ => None,
         }
     }
 
-    /// `chunk_blocks` (`chunk_blocks_beard` avec `beard`), puis la surface du chunk sur le meme flux : ses
-    /// codes ne repassent pas par l'hote. Renvoie le saut du chunk et l'issue de la surface : `Some(true)`
-    /// etats finaux dans `etats` (voir `SurfaceGpu::chunk_states`), `Some(false)` une condition non
-    /// evaluable, `None` surface non calculee (le chunk passe alors par la surface CPU).
+    /// `chunk_blocks` (`chunk_blocks_beard` with `beard`), then the chunk's surface on the same
+    /// stream: its codes do not go back through the host. Returns the chunk's skip and the outcome
+    /// of the surface: `Some(true)` final states in `states` (see `SurfaceGpu::chunk_states`),
+    /// `Some(false)` a condition that cannot be evaluated, `None` surface not computed (the chunk
+    /// then goes through the CPU surface).
     #[allow(clippy::too_many_arguments)]
     pub fn chunk_blocks_surface(
         &self,
@@ -274,170 +276,170 @@ impl GpuFinalDensity {
         out: &mut [i8],
         sg: &SurfaceGpu,
         biomes: &[u16],
-        etats: &mut [u32],
-        mut grottes: Option<&mut CaveJob>,
+        states: &mut [u32],
+        mut caves: Option<&mut CaveJob>,
         mut sections: Option<&mut Vec<u32>>,
     ) -> (Option<i32>, Option<bool>) {
-        let avec_sections = sections.is_some();
-        let Some(Some(m)) = self.partage.moteur.get() else {
+        let with_sections = sections.is_some();
+        let Some(Some(m)) = self.shared.engine.get() else {
             return (None, None);
         };
         if m.aq.is_none() {
             return (None, None);
         }
-        let simple = |out: &mut [i8], grottes: Option<&mut CaveJob>| match beard {
-            Some(b) => m.chunk_codes_beard(chunk_x, chunk_z, b, out, None, grottes),
-            None => m.chunk_codes(chunk_x, chunk_z, out, None, grottes),
+        let simple = |out: &mut [i8], caves: Option<&mut CaveJob>| match beard {
+            Some(b) => m.chunk_codes_beard(chunk_x, chunk_z, b, out, None, caves),
+            None => m.chunk_codes(chunk_x, chunk_z, out, None, caves),
         };
-        if etats.len() != out.len() || out.len() != 256 * sg.height as usize || biomes.len() != sg.biome_count() {
-            return (simple(out, grottes), None);
+        if states.len() != out.len() || out.len() != 256 * sg.height as usize || biomes.len() != sg.biome_count() {
+            return (simple(out, caves), None);
         }
-        let Ok(mut res) = sg.ressource() else {
-            return (simple(out, grottes), None);
+        let Ok(mut res) = sg.resource() else {
+            return (simple(out, caves), None);
         };
         let t = Instant::now();
         let mut issue: Option<Result<Arc<RegionSurface>, String>> = None;
-        let mut suite = |st: &Arc<CudaStream>, cd: &CudaSlice<i8>| {
-            issue = Some(sg.enfiler(&mut res, st, Some(cd), chunk_x, chunk_z, biomes, avec_sections));
+        let mut follow_up = |st: &Arc<CudaStream>, cd: &CudaSlice<i8>| {
+            issue = Some(sg.enqueue(&mut res, st, Some(cd), chunk_x, chunk_z, biomes, with_sections));
         };
-        let saut = match beard {
-            Some(b) => m.chunk_codes_beard(chunk_x, chunk_z, b, out, Some(&mut suite), grottes.take()),
-            None => m.chunk_codes(chunk_x, chunk_z, out, Some(&mut suite), grottes.take()),
+        let skip = match beard {
+            Some(b) => m.chunk_codes_beard(chunk_x, chunk_z, b, out, Some(&mut follow_up), caves.take()),
+            None => m.chunk_codes(chunk_x, chunk_z, out, Some(&mut follow_up), caves.take()),
         };
-        // Le flux des codes a ete attendu par chunk_codes : les etats sont arrives
-        let surface = match (saut, issue) {
+        // The codes' stream was waited for by chunk_codes: the states have arrived
+        let surface = match (skip, issue) {
             (Some(_), Some(Ok(_region))) => {
-                let lu = sg.lire(&mut res, etats, sections.take());
-                sg.rendre(res, lu.is_ok(), t);
-                lu.ok()
+                let readback = sg.read_back(&mut res, states, sections.take());
+                sg.put_back(res, readback.is_ok(), t);
+                readback.ok()
             }
             (_, Some(Err(e))) => {
-                static SIGNALEE: OnceLock<()> = OnceLock::new();
-                if SIGNALEE.set(()).is_ok() {
-                    log::error!("GPU surface : chunk {chunk_x} {chunk_z} : {e}");
+                static REPORTED: OnceLock<()> = OnceLock::new();
+                if REPORTED.set(()).is_ok() {
+                    log::error!("GPU surface: chunk {chunk_x} {chunk_z}: {e}");
                 }
                 None
             }
             _ => None,
         };
-        (saut, surface)
+        (skip, surface)
     }
 
-    /// Un chunk dont le CPU a recalcule les blocs : la limite d'air de son aquifere differait du GPU.
+    /// A chunk whose blocks the CPU recomputed: the air limit of its aquifer differed from the GPU.
     pub fn note_aquifer_mismatch(&self) {
-        if let Some(Some(m)) = self.partage.moteur.get() {
-            m.stats.ecarts.fetch_add(1, Relaxed);
+        if let Some(Some(m)) = self.shared.engine.get() {
+            m.stats.mismatches.fetch_add(1, Relaxed);
         }
     }
 
-    /// Un chunk calcule sur CPU parce que son terrain depend de structures ou de vieux chunks.
+    /// A chunk computed on the CPU because its terrain depends on structures or old chunks.
     pub fn note_cpu_fallback(&self) {
-        if let Some(Some(m)) = self.partage.moteur.get() {
-            m.stats.replis.fetch_add(1, Relaxed);
+        if let Some(Some(m)) = self.shared.engine.get() {
+            m.stats.fallbacks.fetch_add(1, Relaxed);
         }
     }
 }
 
-impl Drop for Partage {
+impl Drop for Shared {
     fn drop(&mut self) {
-        if let Some(Some(m)) = self.moteur.get()
+        if let Some(Some(m)) = self.engine.get()
             && m.stats.chunks.load(Relaxed) > 0
         {
-            eprintln!("{}", m.bilan());
+            eprintln!("{}", m.summary());
         }
     }
 }
 
-/// Ce que le GPU garde d'une region : densite finale, et codes des blocs si les aquiferes y sont.
-struct DonneesRegion {
+/// What the GPU keeps of a region: final density, and block codes if the aquifers are there.
+struct RegionData {
     mem: CudaSlice<f32>,
     codes: Option<CudaSlice<i8>>,
-    /// Positions et statuts des cellules d'aquifere, pour refaire les chunks a structures
-    cellules: Option<Cellules>,
-    /// skip_sampling_above_y de chaque chunk de la region (cz * r + cx)
-    sauts: Vec<i32>,
+    /// Positions and statuses of the aquifer cells, to redo the chunks with structures
+    cells: Option<Cells>,
+    /// skip_sampling_above_y of each chunk of the region (cz * r + cx)
+    skips: Vec<i32>,
 }
 
-struct Cellules {
+struct Cells {
     p: CudaSlice<i32>,
     st: CudaSlice<i32>,
     /// cx0, cy0, cz0, ncx, ncy, ncz
-    grille: [i32; 6],
+    grid: [i32; 6],
 }
 
 #[derive(Default)]
 struct Region {
-    donnees: OnceLock<Option<DonneesRegion>>,
-    servis: AtomicU32,
+    data: OnceLock<Option<RegionData>>,
+    served: AtomicU32,
 }
 
 struct Cache {
-    carte: HashMap<(i32, i32), (Arc<Region>, u64)>,
-    horloge: u64,
-    capacite: usize,
+    lookup: HashMap<(i32, i32), (Arc<Region>, u64)>,
+    clock: u64,
+    capacity: usize,
 }
 
-/// Flux et tampons d'un worker pour la copie d'un chunk, rendus au pool apres usage.
-struct Ressources {
+/// Stream and buffers of a worker for copying a chunk, returned to the pool after use.
+struct Resources {
     stream: Arc<CudaStream>,
     buf: CudaSlice<f32>,
-    hote: PinnedHostSlice<f32>,
+    host: PinnedHostSlice<f32>,
     buf_codes: CudaSlice<i8>,
-    hote_codes: PinnedHostSlice<i8>,
+    host_codes: PinnedHostSlice<i8>,
 }
 
 #[derive(Default)]
 struct Stats {
     chunks: AtomicU64,
-    ns_copie: AtomicU64,
+    ns_copy: AtomicU64,
     regions: AtomicU64,
     ns_regions: AtomicU64,
     evictions: AtomicU64,
-    replis: AtomicU64,
-    /// Chunks remplis a partir des codes d'aquiferes du GPU
+    fallbacks: AtomicU64,
+    /// Chunks filled from the GPU's aquifer codes
     chunks_aq: AtomicU64,
-    /// Chunks dont la limite d'air de l'aquifere CPU differait du GPU
-    ecarts: AtomicU64,
-    /// Chunks a structures (beardifier) faits sur GPU
+    /// Chunks where the CPU aquifer's air limit differed from the GPU
+    mismatches: AtomicU64,
+    /// Chunks with structures (beardifier) done on the GPU
     chunks_beard: AtomicU64,
 }
 
-/// Les noyaux des aquiferes et leurs constantes.
-struct Aquiferes {
+/// The aquifer kernels and their constants.
+struct Aquifers {
     _module: Arc<cudarc::driver::CudaModule>,
     surface: CudaFunction,
-    cellules: CudaFunction,
-    saut: CudaFunction,
-    blocs: CudaFunction,
+    cells: CudaFunction,
+    skip: CudaFunction,
+    blocks: CudaFunction,
     chunk: CudaFunction,
     beard: CudaFunction,
-    /// Substance des cellules creusees (grottes)
-    grottes: CudaFunction,
-    /// Noyau du beard de vanilla (24 x 24 x 24)
-    noyau: CudaSlice<f32>,
-    positionnel: (u64, u64),
-    mer: i32,
+    /// Substance of the carved cells (caves)
+    caves: CudaFunction,
+    /// Vanilla's beard kernel (24 x 24 x 24)
+    kernel: CudaSlice<f32>,
+    positional: (u64, u64),
+    sea: i32,
 }
 
-type Lancement = (CudaFunction, usize, usize);
+type Launch = (CudaFunction, usize, usize);
 
-struct Moteur {
+struct Engine {
     ctx: Arc<CudaContext>,
-    /// Tables d'axes : (noyau, grille, threads)
-    f_ax: Vec<Lancement>,
-    /// Grilles dans l'ordre de lancement : (grille, passe 2D, noyau 3D, points)
-    f_gr: Vec<(usize, Option<(CudaFunction, usize)>, CudaFunction, usize)>,
+    /// Axis tables: (kernel, grid, threads)
+    f_ax: Vec<Launch>,
+    /// Grids in launch order: (grid, 2D pass, 3D kernel, points)
+    f_cv: Vec<(usize, Option<(CudaFunction, usize)>, CudaFunction, usize)>,
     f_chunk: CudaFunction,
-    aq: Option<Aquiferes>,
-    pas_grilles: Vec<[i32; 3]>,
-    taille: usize,
+    aq: Option<Aquifers>,
+    grid_step: Vec<[i32; 3]>,
+    size: usize,
     r: i32,
     min_y: i32,
     n_chunk: usize,
     cache: Mutex<Cache>,
-    pool: Mutex<Vec<Ressources>>,
+    pool: Mutex<Vec<Resources>>,
     stats: Stats,
-    hors_service: AtomicBool,
+    broken: AtomicBool,
 }
 
 fn config(n: usize) -> LaunchConfig {
@@ -448,16 +450,16 @@ fn config(n: usize) -> LaunchConfig {
     }
 }
 
-/// FNV-1a 64 bits : nom stable du PTX en cache.
-fn empreinte(octets: &[u8]) -> u64 {
+/// 64-bit FNV-1a: stable name of the cached PTX.
+fn footprint(octets: &[u8]) -> u64 {
     octets.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
 }
 
-/// PTX du programme, depuis le cache disque si possible (NVRTC prend environ 12 s).
+/// The program's PTX, from the disk cache if possible (NVRTC takes about 12 s).
 fn ptx(src: &str, arch: &'static str) -> Result<Ptx, String> {
-    let dossier = std::env::var_os("HORIZON_GPU_CACHE")
+    let dir = std::env::var_os("HORIZON_GPU_CACHE")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("XDG_CACHE_HOME").map(|d| PathBuf::from(d).join("horizon-gpu"))
@@ -465,14 +467,14 @@ fn ptx(src: &str, arch: &'static str) -> Result<Ptx, String> {
         .or_else(|| {
             std::env::var_os("HOME").map(|d| PathBuf::from(d).join(".cache").join("horizon-gpu"))
         });
-    let cle = empreinte(format!("{arch}\n{src}").as_bytes());
-    let fichier = dossier
+    let key = footprint(format!("{arch}\n{src}").as_bytes());
+    let file = dir
         .as_ref()
-        .map(|d| d.join(format!("final_density-{cle:016x}.ptx")));
-    if let Some(f) = &fichier
-        && let Ok(texte) = std::fs::read_to_string(f)
+        .map(|d| d.join(format!("final_density-{key:016x}.ptx")));
+    if let Some(f) = &file
+        && let Ok(text) = std::fs::read_to_string(f)
     {
-        return Ok(Ptx::from_src(texte));
+        return Ok(Ptx::from_src(text));
     }
     let options = CompileOptions {
         arch: Some(arch),
@@ -485,63 +487,63 @@ fn ptx(src: &str, arch: &'static str) -> Result<Ptx, String> {
         ..Default::default()
     };
     let p = compile_ptx_with_opts(src, options).ctx("compilation NVRTC")?;
-    if let (Some(d), Some(f)) = (&dossier, &fichier) {
+    if let (Some(d), Some(f)) = (&dir, &file) {
         let _ = std::fs::create_dir_all(d).and_then(|()| std::fs::write(f, p.to_src()));
     }
     Ok(p)
 }
 
-impl Moteur {
-    fn demarrer(
-        prog: traduction::Programme,
-        aquifere: Option<(AquiferSetup, String)>,
+impl Engine {
+    fn start(
+        prog: codegen::Program,
+        aquifer: Option<(AquiferSetup, String)>,
         r: i32,
-        capacite: usize,
+        capacity: usize,
         min_y: i32,
-        hauteur: i32,
+        height: i32,
     ) -> Result<Self, String> {
-        let ctx = contexte()?;
-        let (maj, min) = ctx.compute_capability().ctx("capacite du GPU")?;
-        let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
+        let ctx = context()?;
+        let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
+        let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
         let module = ctx
             .load_module(ptx(&prog.src, arch)?)
-            .ctx("chargement du module")?;
-        let f = |nom: &str| module.load_function(nom).ctx(nom);
+            .ctx("module load")?;
+        let f = |name: &str| module.load_function(name).ctx(name);
         let mut f_ax = Vec::new();
         for &(k, gr, nb) in &prog.axes {
             f_ax.push((f(&format!("kax_{k}"))?, gr, nb));
         }
-        let mut f_gr = Vec::new();
-        for k in (1..prog.grilles.len()).chain(std::iter::once(0)) {
-            let gr = prog.grilles[k];
-            let k2d = if prog.bords[k] > 0 {
-                Some((f(&format!("k2d_{k}"))?, gr.colonnes() * prog.bords[k]))
+        let mut f_cv = Vec::new();
+        for k in (1..prog.grids.len()).chain(std::iter::once(0)) {
+            let gr = prog.grids[k];
+            let k2d = if prog.edges[k] > 0 {
+                Some((f(&format!("k2d_{k}"))?, gr.columns() * prog.edges[k]))
             } else {
                 None
             };
-            f_gr.push((k, k2d, f(&format!("k3d_{k}"))?, gr.n()));
+            f_cv.push((k, k2d, f(&format!("k3d_{k}"))?, gr.n()));
         }
-        let aq = match aquifere {
+        let aq = match aquifer {
             Some((a, src)) => {
-                let m = ctx.load_module(ptx(&src, arch)?).ctx("module des aquiferes")?;
-                let g = |nom: &str| m.load_function(nom).ctx(nom);
-                let st = ctx.new_stream().ctx("flux CUDA")?;
-                let noyau = st
+                let m = ctx.load_module(ptx(&src, arch)?).ctx("aquifer module")?;
+                let g = |name: &str| m.load_function(name).ctx(name);
+                let st = ctx.new_stream().ctx("CUDA stream")?;
+                let kernel = st
                     .clone_htod(&horizon_core::density::beard_kernel()[..])
-                    .ctx("noyau du beard")?;
-                st.synchronize().ctx("noyau du beard")?;
-                Some(Aquiferes {
+                    .ctx("beard kernel")?;
+                st.synchronize().ctx("beard kernel")?;
+                Some(Aquifers {
                     beard: g("kbeard_chunk")?,
-                    grottes: g("kgr_substance")?,
-                    noyau,
+                    caves: g("kcv_substance")?,
+                    kernel,
                     surface: g("kaq_surface")?,
-                    cellules: g("kaq_cellules")?,
-                    saut: g("kaq_saut")?,
-                    blocs: g("kaq_blocs_region")?,
+                    cells: g("kaq_cells")?,
+                    skip: g("kaq_skip")?,
+                    blocks: g("kaq_blocks_region")?,
                     chunk: g("kaq_chunk")?,
                     _module: m,
-                    positionnel: a.positional,
-                    mer: a.sea_level,
+                    positional: a.positional,
+                    sea: a.sea_level,
                 })
             }
             None => None,
@@ -551,30 +553,30 @@ impl Moteur {
             aq,
             ctx,
             f_ax,
-            f_gr,
-            pas_grilles: prog.grilles.iter().map(|g| g.pas).collect(),
-            taille: prog.taille,
+            f_cv,
+            grid_step: prog.grids.iter().map(|g| g.step).collect(),
+            size: prog.size,
             r,
             min_y,
-            n_chunk: 256 * hauteur as usize,
+            n_chunk: 256 * height as usize,
             cache: Mutex::new(Cache {
-                carte: HashMap::new(),
-                horloge: 0,
-                capacite,
+                lookup: HashMap::new(),
+                clock: 0,
+                capacity,
             }),
             pool: Mutex::new(Vec::new()),
             stats: Stats::default(),
-            hors_service: AtomicBool::new(false),
+            broken: AtomicBool::new(false),
         })
     }
 
-    /// Trois chunks (dont des coordonnees negatives) compares bit a bit au sampler CPU.
+    /// Three chunks (some with negative coordinates) compared bit for bit with the CPU sampler.
     fn auto_test(&self, cpu: &dyn DensitySampler) -> Result<(), String> {
         let h = (self.n_chunk / 256) as i32;
         for (cx, cz) in [(0, 0), (self.r - 1, 1), (-1, -1)] {
             let mut gpu = vec![0.0f32; self.n_chunk];
             let mut reference = vec![0.0f32; self.n_chunk];
-            self.chunk_interne(cx, cz, &mut gpu)?;
+            self.inner_chunk(cx, cz, &mut gpu)?;
             let volume = DensityVolume::new([16, h, 16], [cx * 16, self.min_y, cz * 16], [1; 3])
                 .ctx("volume")?;
             cpu.sample_volume(&mut SamplerContext::cached(), &mut reference, volume)
@@ -590,7 +592,7 @@ impl Moteur {
                     .map(|&i| format!("[{i}] gpu {} cpu {}", gpu[i], reference[i]))
                     .collect();
                 return Err(format!(
-                    "auto-test : {diff} densites differentes du CPU dans le chunk {cx} {cz} ({})",
+                    "self-test: {diff} densities differ from the CPU in chunk {cx} {cz} ({})",
                     ex.join(", ")
                 ));
             }
@@ -599,15 +601,15 @@ impl Moteur {
     }
 
     fn chunk(&self, cx: i32, cz: i32, out: &mut [f32]) -> bool {
-        // Hors de la bordure du monde (30 M de blocs), le CPU garde la main
-        if self.hors_service.load(Relaxed)
+        // Outside the world border (30 M blocks), the CPU keeps control
+        if self.broken.load(Relaxed)
             || out.len() != self.n_chunk
             || cx.unsigned_abs() > 1_875_000
             || cz.unsigned_abs() > 1_875_000
         {
             return false;
         }
-        match self.chunk_interne(cx, cz, out) {
+        match self.inner_chunk(cx, cz, out) {
             Ok(()) => {
                 let n = self.stats.chunks.load(Relaxed);
                 if n.is_power_of_two() && n >= 1024 || n % 65536 == 0 {
@@ -616,8 +618,8 @@ impl Moteur {
                 true
             }
             Err(e) => {
-                if !self.hors_service.swap(true, Relaxed) {
-                    log::error!("GPU final_density desactive, retour au CPU : {e}");
+                if !self.broken.swap(true, Relaxed) {
+                    log::error!("GPU final_density disabled, back to the CPU: {e}");
                 }
                 false
             }
@@ -625,93 +627,93 @@ impl Moteur {
     }
 
     fn journal(&self) {
-        log::info!("{}", self.bilan());
+        log::info!("{}", self.summary());
     }
 
-    fn bilan(&self) -> String {
+    fn summary(&self) -> String {
         let s = &self.stats;
         let (n, reg) = (s.chunks.load(Relaxed), s.regions.load(Relaxed));
         format!(
-            "GPU final_density : {n} chunks dont {} avec aquiferes (copie {:.0} us en moyenne), {reg} regions calculees ({:.2} ms en moyenne), {} evictions, {} chunks sur CPU (structures, melange), {} ecarts d'aquifere, {} chunks a structures sur GPU",
+            "GPU final_density: {n} chunks, {} of them with aquifers (copy {:.0} us on average), {reg} regions computed ({:.2} ms on average), {} evictions, {} chunks on the CPU (structures, blending), {} aquifer mismatches, {} chunks with structures on the GPU",
             s.chunks_aq.load(Relaxed),
-            s.ns_copie.load(Relaxed) as f64 / 1e3 / n.max(1) as f64,
+            s.ns_copy.load(Relaxed) as f64 / 1e3 / n.max(1) as f64,
             s.ns_regions.load(Relaxed) as f64 / 1e6 / reg.max(1) as f64,
             s.evictions.load(Relaxed),
-            s.replis.load(Relaxed),
-            s.ecarts.load(Relaxed),
+            s.fallbacks.load(Relaxed),
+            s.mismatches.load(Relaxed),
             s.chunks_beard.load(Relaxed)
         )
     }
 
-    fn chunk_interne(&self, cx: i32, cz: i32, out: &mut [f32]) -> Result<(), String> {
+    fn inner_chunk(&self, cx: i32, cz: i32, out: &mut [f32]) -> Result<(), String> {
         let r = self.r;
         let (rx, rz) = (cx.div_euclid(r), cz.div_euclid(r));
         let (lx, lz) = (cx - rx * r, cz - rz * r);
         let region = self.region((rx, rz));
-        let mut res = self.ressource()?;
-        let resultat = self.copier(&region, rx, rz, lx, lz, &mut res, out);
+        let mut res = self.resource()?;
+        let result = self.copy_out(&region, rx, rz, lx, lz, &mut res, out);
         self.pool.lock().unwrap().push(res);
-        if resultat.is_ok() && region.servis.fetch_add(1, Relaxed) + 1 == (r * r) as u32 {
-            // Tous les chunks de la region sont servis : sa memoire GPU est rendue
+        if result.is_ok() && region.served.fetch_add(1, Relaxed) + 1 == (r * r) as u32 {
+            // Every chunk of the region has been served: its GPU memory is released
             let mut c = self.cache.lock().unwrap();
-            if c.carte
+            if c.lookup
                 .get(&(rx, rz))
                 .is_some_and(|(e, _)| Arc::ptr_eq(e, &region))
             {
-                c.carte.remove(&(rx, rz));
+                c.lookup.remove(&(rx, rz));
             }
         }
-        resultat
+        result
     }
 
-    fn copier(
+    fn copy_out(
         &self,
         region: &Region,
         rx: i32,
         rz: i32,
         lx: i32,
         lz: i32,
-        res: &mut Ressources,
+        res: &mut Resources,
         out: &mut [f32],
     ) -> Result<(), String> {
-        // Le premier worker qui demande la region la calcule ; les autres attendent ici
-        let donnees = self.donnees(region, rx, rz, res)?;
+        // The first worker that asks for the region computes it; the others wait here
+        let data = self.data(region, rx, rz, res)?;
         let t = Instant::now();
         let mut b = res.stream.launch_builder(&self.f_chunk);
-        b.arg(&donnees.mem).arg(&mut res.buf).arg(&lx).arg(&lz);
-        unsafe { b.launch(config(self.n_chunk)) }.ctx("copie du chunk")?;
+        b.arg(&data.mem).arg(&mut res.buf).arg(&lx).arg(&lz);
+        unsafe { b.launch(config(self.n_chunk)) }.ctx("chunk copy")?;
         res.stream
-            .memcpy_dtoh(&res.buf, &mut res.hote)
-            .ctx("retour du chunk")?;
-        // Sans suivi d'evenements, cudarc n'enregistre pas l'evenement du tampon verrouille et
-        // `as_slice` n'attendrait pas la fin de la copie : on attend le flux lui-meme.
-        res.stream.synchronize().ctx("attente du retour")?;
-        out.copy_from_slice(res.hote.as_slice().ctx("lecture du retour")?);
+            .memcpy_dtoh(&res.buf, &mut res.host)
+            .ctx("chunk readback")?;
+        // Without event tracking, cudarc does not record the event of the pinned buffer and
+        // `as_slice` would not wait for the end of the copy: wait for the stream itself.
+        res.stream.synchronize().ctx("readback wait")?;
+        out.copy_from_slice(res.host.as_slice().ctx("readback read")?);
         self.stats.chunks.fetch_add(1, Relaxed);
         self.stats
-            .ns_copie
+            .ns_copy
             .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         Ok(())
     }
 
-    /// Les donnees de la region ; le premier worker qui la demande la calcule, les autres attendent.
-    fn donnees<'r>(&self, region: &'r Region, rx: i32, rz: i32, res: &Ressources) -> Result<&'r DonneesRegion, String> {
-        let d = region.donnees.get_or_init(|| {
+    /// The region's data; the first worker that asks for it computes it, the others wait.
+    fn data<'r>(&self, region: &'r Region, rx: i32, rz: i32, res: &Resources) -> Result<&'r RegionData, String> {
+        let d = region.data.get_or_init(|| {
             let t = Instant::now();
-            let m = self.calculer(rx, rz, &res.stream);
+            let m = self.compute(rx, rz, &res.stream);
             self.stats.regions.fetch_add(1, Relaxed);
             self.stats
                 .ns_regions
                 .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-            m.map_err(|e| log::error!("GPU final_density : region {rx} {rz} : {e}"))
+            m.map_err(|e| log::error!("GPU final_density: region {rx} {rz}: {e}"))
                 .ok()
         });
-        d.as_ref().ok_or_else(|| "calcul de region en echec".to_string())
+        d.as_ref().ok_or_else(|| "region computation failed".to_string())
     }
 
-    /// Codes des blocs d'un chunk et son skip_sampling_above_y.
-    fn chunk_codes(&self, cx: i32, cz: i32, out: &mut [i8], mut suite: Option<&mut dyn FnMut(&Arc<CudaStream>, &CudaSlice<i8>)>, grottes: Option<&mut CaveJob>) -> Option<i32> {
-        if self.hors_service.load(Relaxed)
+    /// Block codes of a chunk and its skip_sampling_above_y.
+    fn chunk_codes(&self, cx: i32, cz: i32, out: &mut [i8], mut follow_up: Option<&mut dyn FnMut(&Arc<CudaStream>, &CudaSlice<i8>)>, caves: Option<&mut CaveJob>) -> Option<i32> {
+        if self.broken.load(Relaxed)
             || out.len() != self.n_chunk
             || cx.unsigned_abs() > 1_875_000
             || cz.unsigned_abs() > 1_875_000
@@ -722,44 +724,44 @@ impl Moteur {
         let (rx, rz) = (cx.div_euclid(r), cz.div_euclid(r));
         let (lx, lz) = (cx - rx * r, cz - rz * r);
         let region = self.region((rx, rz));
-        let resultat = self.ressource().and_then(|mut res| {
-            let rr = self.copier_codes(&region, rx, rz, lx, lz, &mut res, out, suite.take());
+        let result = self.resource().and_then(|mut res| {
+            let rr = self.copy_codes(&region, rx, rz, lx, lz, &mut res, out, follow_up.take());
             self.pool.lock().unwrap().push(res);
             rr
         });
-        match resultat {
-            Ok(saut) => {
-                if let Some(j) = grottes {
-                    self.grottes_substance(&region, lx, lz, j);
+        match result {
+            Ok(skip) => {
+                if let Some(j) = caves {
+                    self.caves_substance(&region, lx, lz, j);
                 }
-                if region.servis.fetch_add(1, Relaxed) + 1 == (r * r) as u32 {
+                if region.served.fetch_add(1, Relaxed) + 1 == (r * r) as u32 {
                     let mut c = self.cache.lock().unwrap();
-                    if c.carte.get(&(rx, rz)).is_some_and(|(e, _)| Arc::ptr_eq(e, &region)) {
-                        c.carte.remove(&(rx, rz));
+                    if c.lookup.get(&(rx, rz)).is_some_and(|(e, _)| Arc::ptr_eq(e, &region)) {
+                        c.lookup.remove(&(rx, rz));
                     }
                 }
                 let n = self.stats.chunks.load(Relaxed);
                 if n.is_power_of_two() && n >= 1024 || n % 65536 == 0 {
                     self.journal();
                 }
-                Some(saut)
+                Some(skip)
             }
             Err(e) => {
-                if !self.hors_service.swap(true, Relaxed) {
-                    log::error!("GPU final_density desactive, retour au CPU : {e}");
+                if !self.broken.swap(true, Relaxed) {
+                    log::error!("GPU final_density disabled, back to the CPU: {e}");
                 }
                 None
             }
         }
     }
 
-    fn chunk_codes_beard(&self, cx: i32, cz: i32, beard: &Beardifier, out: &mut [i8], mut suite: Option<&mut dyn FnMut(&Arc<CudaStream>, &CudaSlice<i8>)>, grottes: Option<&mut CaveJob>) -> Option<i32> {
-        static SANS_BEARD: OnceLock<bool> = OnceLock::new();
-        if *SANS_BEARD.get_or_init(|| std::env::var("HORIZON_GPU_BEARD").as_deref() == Ok("0")) {
+    fn chunk_codes_beard(&self, cx: i32, cz: i32, beard: &Beardifier, out: &mut [i8], mut follow_up: Option<&mut dyn FnMut(&Arc<CudaStream>, &CudaSlice<i8>)>, caves: Option<&mut CaveJob>) -> Option<i32> {
+        static NO_BEARD: OnceLock<bool> = OnceLock::new();
+        if *NO_BEARD.get_or_init(|| std::env::var("HORIZON_GPU_BEARD").as_deref() == Ok("0")) {
             return None;
         }
-        let (pieces, jonctions, kp, kj, zone) = beard.parts();
-        if !kp.is_empty() || !kj.is_empty() || self.hors_service.load(Relaxed) || out.len() != self.n_chunk || cx.unsigned_abs() > 1_875_000 || cz.unsigned_abs() > 1_875_000 {
+        let (pieces, junctions, kp, kj, zone) = beard.parts();
+        if !kp.is_empty() || !kj.is_empty() || self.broken.load(Relaxed) || out.len() != self.n_chunk || cx.unsigned_abs() > 1_875_000 || cz.unsigned_abs() > 1_875_000 {
             return None;
         }
         let pc: Vec<i32> = pieces
@@ -776,7 +778,7 @@ impl Moteur {
                 [a[0], a[1], a[2], b[0], b[1], b[2], adj, p.ground_level_delta]
             })
             .collect();
-        let jc: Vec<i32> = jonctions.iter().flat_map(|j| [j.source_x, j.source_ground_y, j.source_z]).collect();
+        let jc: Vec<i32> = junctions.iter().flat_map(|j| [j.source_x, j.source_ground_y, j.source_z]).collect();
         let z: Vec<i32> = zone.map_or(vec![0; 6], |b| {
             let (a, c) = (b.minimum(), b.maximum());
             vec![a[0], a[1], a[2], c[0], c[1], c[2]]
@@ -785,67 +787,67 @@ impl Moteur {
         let (rx, rz) = (cx.div_euclid(r), cz.div_euclid(r));
         let (lx, lz) = (cx - rx * r, cz - rz * r);
         let region = self.region((rx, rz));
-        let resultat = self.ressource().and_then(|mut res| {
+        let result = self.resource().and_then(|mut res| {
             let rr = (|| -> Result<i32, String> {
-                let donnees = self.donnees(&region, rx, rz, &res)?;
-                let (aq, cel) = match (&self.aq, &donnees.cellules) {
+                let data = self.data(&region, rx, rz, &res)?;
+                let (aq, cell_grid) = match (&self.aq, &data.cells) {
                     (Some(a), Some(c)) => (a, c),
-                    _ => return Err("region sans cellules d'aquiferes".into()),
+                    _ => return Err("region without aquifer cells".into()),
                 };
                 let t = Instant::now();
                 let st = res.stream.clone();
-                // Des tableaux vides ne s'allouent pas : au moins un element
+                // Empty arrays are not allocated: at least one element
                 let pd = st.clone_htod(if pc.is_empty() { &[0i32][..] } else { &pc[..] }).ctx("pieces")?;
-                let jd = st.clone_htod(if jc.is_empty() { &[0i32][..] } else { &jc[..] }).ctx("jonctions")?;
+                let jd = st.clone_htod(if jc.is_empty() { &[0i32][..] } else { &jc[..] }).ctx("junctions")?;
                 let zd = st.clone_htod(&z[..]).ctx("zone")?;
-                let saut = donnees.sauts[(lz * self.r + lx) as usize];
-                let (np, nj, avec) = ((pc.len() / 8) as i32, (jc.len() / 3) as i32, i32::from(zone.is_some()));
+                let skip = data.skips[(lz * self.r + lx) as usize];
+                let (np, nj, has_zone) = ((pc.len() / 8) as i32, (jc.len() / 3) as i32, i32::from(zone.is_some()));
                 let (gx, h) = (16 * self.r, (self.n_chunk / 256) as i32);
                 let (x0, z0) = (rx * self.r * 16, rz * self.r * 16);
-                let gr = cel.grille;
+                let gr = cell_grid.grid;
                 let mut b = st.launch_builder(&aq.beard);
-                b.arg(&donnees.mem).arg(&mut res.buf_codes).arg(&pd).arg(&np).arg(&jd).arg(&nj).arg(&aq.noyau).arg(&zd).arg(&avec);
-                b.arg(&cel.p).arg(&cel.st).arg(&saut).arg(&lx).arg(&lz).arg(&x0).arg(&z0).arg(&gx).arg(&self.min_y).arg(&h);
-                b.arg(&gr[0]).arg(&gr[1]).arg(&gr[2]).arg(&gr[3]).arg(&gr[4]).arg(&gr[5]).arg(&aq.mer);
+                b.arg(&data.mem).arg(&mut res.buf_codes).arg(&pd).arg(&np).arg(&jd).arg(&nj).arg(&aq.kernel).arg(&zd).arg(&has_zone);
+                b.arg(&cell_grid.p).arg(&cell_grid.st).arg(&skip).arg(&lx).arg(&lz).arg(&x0).arg(&z0).arg(&gx).arg(&self.min_y).arg(&h);
+                b.arg(&gr[0]).arg(&gr[1]).arg(&gr[2]).arg(&gr[3]).arg(&gr[4]).arg(&gr[5]).arg(&aq.sea);
                 unsafe { b.launch(config(self.n_chunk)) }.ctx("chunk a structures")?;
-                // La surface du chunk a la suite, sur le meme flux
-                if let Some(s) = suite.take() {
+                // The chunk's surface right after, on the same stream
+                if let Some(s) = follow_up.take() {
                     s(&st, &res.buf_codes);
                 }
-                st.memcpy_dtoh(&res.buf_codes, &mut res.hote_codes).ctx("retour des codes")?;
-                st.synchronize().ctx("attente des codes")?;
+                st.memcpy_dtoh(&res.buf_codes, &mut res.host_codes).ctx("code readback")?;
+                st.synchronize().ctx("code wait")?;
                 drop((pd, jd, zd));
-                // Copie puis controle : les codes que le GPU vient d'ecrire sont lus une fois en memoire,
-                // le controle les relit dans le cache. En erreur, `out` revient a zero.
-                out.copy_from_slice(res.hote_codes.as_slice().ctx("lecture des codes")?);
+                // Copy then check: the codes the GPU just wrote are read once from memory, the
+                // check rereads them in the cache. On error, `out` is zeroed.
+                out.copy_from_slice(res.host_codes.as_slice().ctx("code read")?);
                 if out.contains(&-1) {
                     out.fill(0);
-                    return Err("cellule d'aquifere hors grille".into());
+                    return Err("aquifer cell outside the grid".into());
                 }
                 self.stats.chunks.fetch_add(1, Relaxed);
                 self.stats.chunks_beard.fetch_add(1, Relaxed);
-                self.stats.ns_copie.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-                Ok(saut)
+                self.stats.ns_copy.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                Ok(skip)
             })();
             self.pool.lock().unwrap().push(res);
             rr
         });
-        match resultat {
-            Ok(saut) => {
-                if let Some(j) = grottes {
-                    self.grottes_substance(&region, lx, lz, j);
+        match result {
+            Ok(skip) => {
+                if let Some(j) = caves {
+                    self.caves_substance(&region, lx, lz, j);
                 }
-                if region.servis.fetch_add(1, Relaxed) + 1 == (r * r) as u32 {
+                if region.served.fetch_add(1, Relaxed) + 1 == (r * r) as u32 {
                     let mut c = self.cache.lock().unwrap();
-                    if c.carte.get(&(rx, rz)).is_some_and(|(e, _)| Arc::ptr_eq(e, &region)) {
-                        c.carte.remove(&(rx, rz));
+                    if c.lookup.get(&(rx, rz)).is_some_and(|(e, _)| Arc::ptr_eq(e, &region)) {
+                        c.lookup.remove(&(rx, rz));
                     }
                 }
-                Some(saut)
+                Some(skip)
             }
             Err(e) => {
-                if !self.hors_service.swap(true, Relaxed) {
-                    log::error!("GPU final_density desactive, retour au CPU : {e}");
+                if !self.broken.swap(true, Relaxed) {
+                    log::error!("GPU final_density disabled, back to the CPU: {e}");
                 }
                 None
             }
@@ -853,143 +855,143 @@ impl Moteur {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn copier_codes(
+    fn copy_codes(
         &self,
         region: &Region,
         rx: i32,
         rz: i32,
         lx: i32,
         lz: i32,
-        res: &mut Ressources,
+        res: &mut Resources,
         out: &mut [i8],
-        suite: Option<&mut dyn FnMut(&Arc<CudaStream>, &CudaSlice<i8>)>,
+        follow_up: Option<&mut dyn FnMut(&Arc<CudaStream>, &CudaSlice<i8>)>,
     ) -> Result<i32, String> {
-        let donnees = self.donnees(region, rx, rz, res)?;
-        let (aq, codes) = match (&self.aq, &donnees.codes) {
+        let data = self.data(region, rx, rz, res)?;
+        let (aq, codes) = match (&self.aq, &data.codes) {
             (Some(a), Some(c)) => (a, c),
-            _ => return Err("region sans codes d'aquiferes".into()),
+            _ => return Err("region without aquifer codes".into()),
         };
         let t = Instant::now();
         let (gx, h) = (16 * self.r, (self.n_chunk / 256) as i32);
         let mut b = res.stream.launch_builder(&aq.chunk);
         b.arg(codes).arg(&mut res.buf_codes).arg(&lx).arg(&lz).arg(&gx).arg(&h);
-        unsafe { b.launch(config(self.n_chunk)) }.ctx("copie des codes")?;
-        // La surface du chunk a la suite, sur le meme flux
-        if let Some(s) = suite {
+        unsafe { b.launch(config(self.n_chunk)) }.ctx("code copy")?;
+        // The chunk's surface right after, on the same stream
+        if let Some(s) = follow_up {
             s(&res.stream, &res.buf_codes);
         }
         res.stream
-            .memcpy_dtoh(&res.buf_codes, &mut res.hote_codes)
-            .ctx("retour des codes")?;
-        res.stream.synchronize().ctx("attente des codes")?;
-        // Copie puis controle (chunk_codes_beard) : une lecture en memoire, le controle dans le cache.
-        out.copy_from_slice(res.hote_codes.as_slice().ctx("lecture des codes")?);
+            .memcpy_dtoh(&res.buf_codes, &mut res.host_codes)
+            .ctx("code readback")?;
+        res.stream.synchronize().ctx("code wait")?;
+        // Copy then check (chunk_codes_beard): one read from memory, the check in the cache.
+        out.copy_from_slice(res.host_codes.as_slice().ctx("code read")?);
         if out.contains(&-1) {
             out.fill(0);
-            return Err("cellule d'aquifere hors grille".into());
+            return Err("aquifer cell outside the grid".into());
         }
         self.stats.chunks.fetch_add(1, Relaxed);
         self.stats.chunks_aq.fetch_add(1, Relaxed);
         self.stats
-            .ns_copie
+            .ns_copy
             .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-        Ok(donnees.sauts[(lz * self.r + lx) as usize])
+        Ok(data.skips[(lz * self.r + lx) as usize])
     }
 
-    /// Enfile sur le flux d'un lot de grottes la substance de ses cellules, avec l'aquifere de la region.
-    fn grottes_substance(&self, region: &Arc<Region>, lx: i32, lz: i32, job: &mut CaveJob) {
-        let (Some(aq), Some(Some(d))) = (&self.aq, region.donnees.get()) else {
+    /// Enqueues on a cave batch's stream the substance of its cells, with the region's aquifer.
+    fn caves_substance(&self, region: &Arc<Region>, lx: i32, lz: i32, job: &mut CaveJob) {
+        let (Some(aq), Some(Some(d))) = (&self.aq, region.data.get()) else {
             return;
         };
-        let Some(cel) = &d.cellules else {
+        let Some(cell_grid) = &d.cells else {
             return;
         };
-        let saut = d.sauts[(lz * self.r + lx) as usize];
-        let garde: Arc<dyn std::any::Any + Send + Sync> = region.clone();
-        let aqr = grottes::AquifereRegion {
-            f: &aq.grottes,
-            p: &cel.p,
-            st: &cel.st,
-            grille: cel.grille,
-            saut,
-            mer: aq.mer,
+        let skip = d.skips[(lz * self.r + lx) as usize];
+        let guard: Arc<dyn std::any::Any + Send + Sync> = region.clone();
+        let aqr = caves::AquiferRegion {
+            f: &aq.caves,
+            p: &cell_grid.p,
+            st: &cell_grid.st,
+            grid: cell_grid.grid,
+            skip,
+            sea: aq.sea,
         };
-        if let Err(e) = job.enfiler_substance(aqr, garde) {
-            static SIGNALEE: OnceLock<()> = OnceLock::new();
-            if SIGNALEE.set(()).is_ok() {
-                log::error!("GPU grottes : substance : {e}");
+        if let Err(e) = job.enqueue_substance(aqr, guard) {
+            static REPORTED: OnceLock<()> = OnceLock::new();
+            if REPORTED.set(()).is_ok() {
+                log::error!("GPU caves: substance: {e}");
             }
         }
     }
 
-    fn region(&self, cle: (i32, i32)) -> Arc<Region> {
+    fn region(&self, key: (i32, i32)) -> Arc<Region> {
         let mut c = self.cache.lock().unwrap();
-        c.horloge += 1;
-        let h = c.horloge;
-        if let Some((r, t)) = c.carte.get_mut(&cle) {
+        c.clock += 1;
+        let h = c.clock;
+        if let Some((r, t)) = c.lookup.get_mut(&key) {
             *t = h;
             return r.clone();
         }
-        if c.carte.len() >= c.capacite
-            && let Some(vieille) = c.carte.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k)
+        if c.lookup.len() >= c.capacity
+            && let Some(oldest) = c.lookup.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k)
         {
-            // Liberee quand le dernier worker qui la lit a fini
-            c.carte.remove(&vieille);
+            // Released when the last worker that reads it is done
+            c.lookup.remove(&oldest);
             self.stats.evictions.fetch_add(1, Relaxed);
         }
         let r = Arc::new(Region::default());
-        c.carte.insert(cle, (r.clone(), h));
+        c.lookup.insert(key, (r.clone(), h));
         r
     }
 
-    fn ressource(&self) -> Result<Ressources, String> {
+    fn resource(&self) -> Result<Resources, String> {
         if let Some(r) = self.pool.lock().unwrap().pop() {
             return Ok(r);
         }
-        let stream = flux_prioritaire(&self.ctx)?;
-        let buf = stream.alloc_zeros::<f32>(self.n_chunk).ctx("tampon GPU")?;
-        // Memoire verrouillee ordinaire : le defaut de cudarc (write-combined) est lent a relire
-        let hote = unsafe { self.ctx.alloc_pinned_with_flags::<f32>(self.n_chunk, 0) }
-            .ctx("tampon hote")?;
-        let buf_codes = stream.alloc_zeros::<i8>(self.n_chunk).ctx("tampon GPU des codes")?;
-        let hote_codes = unsafe { self.ctx.alloc_pinned_with_flags::<i8>(self.n_chunk, 0) }
-            .ctx("tampon hote des codes")?;
-        Ok(Ressources {
+        let stream = priority_stream(&self.ctx)?;
+        let buf = stream.alloc_zeros::<f32>(self.n_chunk).ctx("GPU buffer")?;
+        // Ordinary pinned memory: cudarc's default (write-combined) is slow to read back
+        let host = unsafe { self.ctx.alloc_pinned_with_flags::<f32>(self.n_chunk, 0) }
+            .ctx("host buffer")?;
+        let buf_codes = stream.alloc_zeros::<i8>(self.n_chunk).ctx("GPU code buffer")?;
+        let host_codes = unsafe { self.ctx.alloc_pinned_with_flags::<i8>(self.n_chunk, 0) }
+            .ctx("host code buffer")?;
+        Ok(Resources {
             stream,
             buf,
-            hote,
+            host,
             buf_codes,
-            hote_codes,
+            host_codes,
         })
     }
 
-    /// Toute la region sur le flux `st` : tables d'axes, grilles de coins, grille de blocs.
-    fn calculer(&self, rx: i32, rz: i32, st: &Arc<CudaStream>) -> Result<DonneesRegion, String> {
+    /// The whole region on stream `st`: axis tables, corner grids, block grid.
+    fn compute(&self, rx: i32, rz: i32, st: &Arc<CudaStream>) -> Result<RegionData, String> {
         let min = [rx * self.r * 16, self.min_y, rz * self.r * 16];
         let mins: Vec<[i32; 3]> = self
-            .pas_grilles
+            .grid_step
             .iter()
             .enumerate()
-            .map(|(k, pas)| {
+            .map(|(k, step)| {
                 if k == 0 {
                     min
                 } else {
-                    std::array::from_fn(|i| min[i].div_euclid(pas[i]) * pas[i])
+                    std::array::from_fn(|i| min[i].div_euclid(step[i]) * step[i])
                 }
             })
             .collect();
         let mut mem = st
-            .alloc_zeros::<f32>(self.taille)
-            .ctx("memoire de region")?;
+            .alloc_zeros::<f32>(self.size)
+            .ctx("region memory")?;
         for (f, gr, nb) in &self.f_ax {
             let mut b = st.launch_builder(f);
             b.arg(&mut mem)
                 .arg(&mins[*gr][0])
                 .arg(&mins[*gr][1])
                 .arg(&mins[*gr][2]);
-            unsafe { b.launch(config(*nb)) }.ctx("noyau d'axes")?;
+            unsafe { b.launch(config(*nb)) }.ctx("axis kernel")?;
         }
-        for (k, k2d, k3d, n3d) in &self.f_gr {
+        for (k, k2d, k3d, n3d) in &self.f_cv {
             if let Some((f, nb)) = k2d {
                 let mut b = st.launch_builder(f);
                 b.arg(&mut mem)
@@ -1003,28 +1005,28 @@ impl Moteur {
                 .arg(&mins[*k][0])
                 .arg(&mins[*k][1])
                 .arg(&mins[*k][2]);
-            unsafe { b.launch(config(*n3d)) }.ctx("grille 3D")?;
+            unsafe { b.launch(config(*n3d)) }.ctx("3D grid")?;
         }
-        let (codes, sauts, cellules) = match &self.aq {
+        let (codes, skips, cells) = match &self.aq {
             Some(aq) => {
-                let (c, s, cel) = self.aquiferes(aq, &mem, min, st)?;
-                (Some(c), s, Some(cel))
+                let (c, s, cell_grid) = self.aquifers(aq, &mem, min, st)?;
+                (Some(c), s, Some(cell_grid))
             }
             None => {
-                st.synchronize().ctx("calcul de region")?;
+                st.synchronize().ctx("region computation")?;
                 (None, Vec::new(), None)
             }
         };
-        Ok(DonneesRegion {
+        Ok(RegionData {
             mem,
             codes,
-            cellules,
-            sauts,
+            cells,
+            skips,
         })
     }
 
-    /// Codes des blocs de la region (memes grilles que aquifer_blocks, sur toute la region).
-    fn aquiferes(&self, aq: &Aquiferes, mem: &CudaSlice<f32>, min: [i32; 3], st: &Arc<CudaStream>) -> Result<(CudaSlice<i8>, Vec<i32>, Cellules), String> {
+    /// Block codes of the region (same grids as aquifer_blocks, over the whole region).
+    fn aquifers(&self, aq: &Aquifers, mem: &CudaSlice<f32>, min: [i32; 3], st: &Arc<CudaStream>) -> Result<(CudaSlice<i8>, Vec<i32>, Cells), String> {
         let h = (self.n_chunk / 256) as i32;
         let gx = 16 * self.r;
         let (x0, z0) = (min[0], min[2]);
@@ -1040,130 +1042,131 @@ impl Moteur {
         let (chx0, chz0) = (x0 >> 4, z0 >> 4);
         let mut s = st.alloc_zeros::<i32>((nqx * nqz) as usize).ctx("surface")?;
         let mut p = st.alloc_zeros::<i32>((3 * ncx * ncy * ncz) as usize).ctx("positions")?;
-        let mut stt = st.alloc_zeros::<i32>((2 * ncx * ncy * ncz) as usize).ctx("statuts")?;
-        let mut saut = st.alloc_zeros::<i32>(nch as usize).ctx("sauts")?;
+        let mut stt = st.alloc_zeros::<i32>((2 * ncx * ncy * ncz) as usize).ctx("statuses")?;
+        let mut skip = st.alloc_zeros::<i32>(nch as usize).ctx("skips")?;
         let mut codes = st.alloc_zeros::<i8>(self.n_chunk * nch as usize).ctx("codes")?;
-        let (lo, hi) = aq.positionnel;
+        let (lo, hi) = aq.positional;
         {
             let mut l = st.launch_builder(&aq.surface);
             l.arg(&mut s).arg(&qx0).arg(&qz0).arg(&nqx).arg(&nqz);
             unsafe { l.launch(config((nqx * nqz) as usize)) }.ctx("surface")?;
         }
         {
-            let mut l = st.launch_builder(&aq.cellules);
+            let mut l = st.launch_builder(&aq.cells);
             l.arg(&mut p).arg(&mut stt).arg(&s).arg(&qx0).arg(&qz0).arg(&nqx).arg(&cx0).arg(&cy0).arg(&cz0);
-            l.arg(&ncx).arg(&ncy).arg(&ncz).arg(&lo).arg(&hi).arg(&aq.mer);
-            unsafe { l.launch(config((ncx * ncy * ncz) as usize)) }.ctx("cellules")?;
+            l.arg(&ncx).arg(&ncy).arg(&ncz).arg(&lo).arg(&hi).arg(&aq.sea);
+            unsafe { l.launch(config((ncx * ncy * ncz) as usize)) }.ctx("cells")?;
         }
         {
-            let mut l = st.launch_builder(&aq.saut);
-            l.arg(&mut saut).arg(&s).arg(&qx0).arg(&qz0).arg(&nqx).arg(&chx0).arg(&chz0).arg(&self.r).arg(&nch);
+            let mut l = st.launch_builder(&aq.skip);
+            l.arg(&mut skip).arg(&s).arg(&qx0).arg(&qz0).arg(&nqx).arg(&chx0).arg(&chz0).arg(&self.r).arg(&nch);
             l.arg(&self.min_y).arg(&h);
-            unsafe { l.launch(config(nch as usize)) }.ctx("sauts")?;
+            unsafe { l.launch(config(nch as usize)) }.ctx("skips")?;
         }
         {
-            let mut l = st.launch_builder(&aq.blocs);
-            l.arg(mem).arg(&mut codes).arg(&p).arg(&stt).arg(&saut).arg(&x0).arg(&z0).arg(&gx).arg(&gx).arg(&self.r);
-            l.arg(&self.min_y).arg(&h).arg(&cx0).arg(&cy0).arg(&cz0).arg(&ncx).arg(&ncy).arg(&ncz).arg(&aq.mer);
-            unsafe { l.launch(config(self.n_chunk * nch as usize)) }.ctx("blocs")?;
+            let mut l = st.launch_builder(&aq.blocks);
+            l.arg(mem).arg(&mut codes).arg(&p).arg(&stt).arg(&skip).arg(&x0).arg(&z0).arg(&gx).arg(&gx).arg(&self.r);
+            l.arg(&self.min_y).arg(&h).arg(&cx0).arg(&cy0).arg(&cz0).arg(&ncx).arg(&ncy).arg(&ncz).arg(&aq.sea);
+            unsafe { l.launch(config(self.n_chunk * nch as usize)) }.ctx("blocks")?;
         }
-        st.synchronize().ctx("aquiferes de la region")?;
-        let sauts = st.clone_dtoh(&saut).ctx("retour des sauts")?;
+        st.synchronize().ctx("region aquifers")?;
+        let skips = st.clone_dtoh(&skip).ctx("skip readback")?;
         Ok((
             codes,
-            sauts,
-            Cellules {
+            skips,
+            Cells {
                 p,
                 st: stt,
-                grille: [cx0, cy0, cz0, ncx, ncy, ncz],
+                grid: [cx0, cy0, cz0, ncx, ncy, ncz],
             },
         ))
     }
 }
 
-/// Evalue des racines du graphe en une liste de points sur le GPU, exactement comme
-/// `DensitySampler::sample_value` de Horizon (verification et banc d'essai).
-/// Resultat : une liste de valeurs par racine, dans l'ordre des points.
+/// Evaluates graph roots at a list of points on the GPU, exactly like Horizon's
+/// `DensitySampler::sample_value` (checks and benchmark).
+/// Result: one list of values per root, in point order.
 pub fn evaluate_points(
     compiler: &DensityCompiler,
     seed: i64,
     roots: &[FunctionId],
     points: &[[i32; 3]],
 ) -> Result<Vec<Vec<f32>>, String> {
-    let src = traduction::generer_points(compiler, roots, seed).map_err(|e| e.to_string())?;
+    let src = codegen::generate_points(compiler, roots, seed).map_err(|e| e.to_string())?;
     if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP") {
         let _ = std::fs::write(f, &src);
     }
-    let ctx = contexte()?;
-    let (maj, min) = ctx.compute_capability().ctx("capacite du GPU")?;
-    let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-    let module = ctx.load_module(ptx(&src, arch)?).ctx("chargement du module")?;
-    let st = ctx.new_stream().ctx("flux CUDA")?;
-    let plat: Vec<i32> = points.iter().flatten().copied().collect();
-    let p = st.clone_htod(&plat).ctx("envoi des points")?;
+    let ctx = context()?;
+    let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
+    let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
+    let module = ctx.load_module(ptx(&src, arch)?).ctx("module load")?;
+    let st = ctx.new_stream().ctx("CUDA stream")?;
+    let flat: Vec<i32> = points.iter().flatten().copied().collect();
+    let p = st.clone_htod(&flat).ctx("point upload")?;
     let n = points.len();
-    let mut sorties = Vec::new();
+    let mut outputs = Vec::new();
     for k in 0..roots.len() {
-        let f = module.load_function(&format!("kpt_{k}")).ctx("noyau de points")?;
-        let mut out = st.alloc_zeros::<f32>(n.max(1)).ctx("sortie")?;
+        let f = module.load_function(&format!("kpt_{k}")).ctx("point kernel")?;
+        let mut out = st.alloc_zeros::<f32>(n.max(1)).ctx("output")?;
         let ni = n as i32;
         let mut b = st.launch_builder(&f);
         b.arg(&p).arg(&mut out).arg(&ni);
         unsafe { b.launch(config(n.max(1))) }.ctx("evaluation")?;
         st.synchronize().ctx("evaluation")?;
-        let mut v = st.clone_dtoh(&out).ctx("retour")?;
+        let mut v = st.clone_dtoh(&out).ctx("readback")?;
         v.truncate(n);
-        sorties.push(v);
+        outputs.push(v);
     }
-    Ok(sorties)
+    Ok(outputs)
 }
 
-/// Parametres d'un calcul d'aquiferes sur GPU (jalon de verification) : un rectangle de chunks.
+/// Parameters of an aquifer computation on the GPU (check milestone): a rectangle of chunks.
 pub struct AquiferBatch<'a> {
-    /// Racines dans l'ordre de AquiferField::ALL.
+    /// Roots in AquiferField::ALL order.
     pub roots: [FunctionId; 6],
-    /// Etat (lo, hi) de la fabrique positionnelle des aquiferes.
+    /// State (lo, hi) of the aquifers' positional random factory.
     pub positional: (u64, u64),
     pub sea_level: i32,
     pub min_y: i32,
     pub height: i32,
-    /// Premier chunk (x, z) et nombre de chunks (x, z).
+    /// First chunk (x, z) and number of chunks (x, z).
     pub chunk0: (i32, i32),
     pub chunks: (i32, i32),
-    /// Densite finale de chaque chunk a la suite (chunk = z * nx + x), dans l'ordre de `fill_noise`.
+    /// Final density of each chunk one after the other (chunk = z * nx + x), in `fill_noise` order.
     pub density: &'a [f32],
 }
 
-/// Codes de chaque bloc (0 bloc par defaut, 1 air, 2 fluide par defaut, 3 lave, +4 mise a jour planifiee,
-/// -1 hors grille) et skip_sampling_above_y de chaque chunk.
+/// Codes of each block (0 default block, 1 air, 2 default fluid, 3 lava, +4 scheduled update, -1
+/// outside the grid) and skip_sampling_above_y of each chunk.
 pub fn aquifer_blocks(compiler: &DensityCompiler, seed: i64, b: &AquiferBatch) -> Result<(Vec<i8>, Vec<i32>), String> {
-    let src = traduction::generer_aquifere(compiler, b.roots, seed).map_err(|e| e.to_string())?;
+    let src = codegen::generate_aquifer(compiler, b.roots, seed).map_err(|e| e.to_string())?;
     if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP") {
         let _ = std::fs::write(f, &src);
     }
-    let ctx = contexte()?;
-    let (maj, min) = ctx.compute_capability().ctx("capacite du GPU")?;
-    let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-    let module = ctx.load_module(ptx(&src, arch)?).ctx("chargement du module")?;
-    let st = ctx.new_stream().ctx("flux CUDA")?;
+    let ctx = context()?;
+    let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
+    let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
+    let module = ctx.load_module(ptx(&src, arch)?).ctx("module load")?;
+    let st = ctx.new_stream().ctx("CUDA stream")?;
     let (nchx, nchz) = b.chunks;
     let nch = nchx * nchz;
     let (x0, z0) = (b.chunk0.0 * 16, b.chunk0.1 * 16);
     let (x1, z1) = ((b.chunk0.0 + nchx) * 16 - 1, (b.chunk0.1 + nchz) * 16 - 1);
     let (y0, y1) = (b.min_y, b.min_y + b.height - 1);
-    // Grille des cellules (NoiseBasedAquifer::new sur tout le rectangle)
+    // Cell grid (NoiseBasedAquifer::new over the whole rectangle)
     let (cx0, cy0, cz0) = ((x0 - 5) >> 4, (y0 + 1).div_euclid(12) - 1, (z0 - 5) >> 4);
     let (cx1, cy1, cz1) = (((x1 - 5) >> 4) + 1, (y1 + 1).div_euclid(12) + 1, ((z1 - 5) >> 4) + 1);
     let (ncx, ncy, ncz) = (cx1 - cx0 + 1, cy1 - cy0 + 1, cz1 - cz0 + 1);
-    // Colonnes de surface : decalages de compute_fluid (x de -48 a +16, z de -16 a +16) autour des cellules
+    // Surface columns: compute_fluid offsets (x from -48 to +16, z from -16 to +16) around the
+    // cells
     let (qx0, qz0) = ((cx0 * 16 - 48) >> 2, (cz0 * 16 - 16) >> 2);
     let (qx1, qz1) = ((cx1 * 16 + 9 + 16) >> 2, (cz1 * 16 + 9 + 16) >> 2);
     let (nqx, nqz) = (qx1 - qx0 + 1, qz1 - qz0 + 1);
     let mut s = st.alloc_zeros::<i32>((nqx * nqz) as usize).ctx("surface")?;
     let mut p = st.alloc_zeros::<i32>((3 * ncx * ncy * ncz) as usize).ctx("positions")?;
-    let mut stt = st.alloc_zeros::<i32>((2 * ncx * ncy * ncz) as usize).ctx("statuts")?;
-    let mut saut = st.alloc_zeros::<i32>(nch as usize).ctx("sauts")?;
-    let dens = st.clone_htod(b.density).ctx("densites")?;
+    let mut stt = st.alloc_zeros::<i32>((2 * ncx * ncy * ncz) as usize).ctx("statuses")?;
+    let mut skip = st.alloc_zeros::<i32>(nch as usize).ctx("skips")?;
+    let dens = st.clone_htod(b.density).ctx("densities")?;
     let mut codes = st.alloc_zeros::<i8>(b.density.len()).ctx("codes")?;
     let f = |n: &str| module.load_function(n).ctx(n);
     let (lo, hi) = b.positional;
@@ -1174,97 +1177,97 @@ pub fn aquifer_blocks(compiler: &DensityCompiler, seed: i64, b: &AquiferBatch) -
         unsafe { l.launch(config((nqx * nqz) as usize)) }.ctx("surface")?;
     }
     {
-        let k = f("kaq_cellules")?;
+        let k = f("kaq_cells")?;
         let mut l = st.launch_builder(&k);
         l.arg(&mut p).arg(&mut stt).arg(&s).arg(&qx0).arg(&qz0).arg(&nqx).arg(&cx0).arg(&cy0).arg(&cz0);
         l.arg(&ncx).arg(&ncy).arg(&ncz).arg(&lo).arg(&hi).arg(&b.sea_level);
-        unsafe { l.launch(config((ncx * ncy * ncz) as usize)) }.ctx("cellules")?;
+        unsafe { l.launch(config((ncx * ncy * ncz) as usize)) }.ctx("cells")?;
     }
     {
-        let k = f("kaq_saut")?;
+        let k = f("kaq_skip")?;
         let mut l = st.launch_builder(&k);
-        l.arg(&mut saut).arg(&s).arg(&qx0).arg(&qz0).arg(&nqx).arg(&b.chunk0.0).arg(&b.chunk0.1).arg(&nchx).arg(&nch);
+        l.arg(&mut skip).arg(&s).arg(&qx0).arg(&qz0).arg(&nqx).arg(&b.chunk0.0).arg(&b.chunk0.1).arg(&nchx).arg(&nch);
         l.arg(&b.min_y).arg(&b.height);
-        unsafe { l.launch(config(nch as usize)) }.ctx("sauts")?;
+        unsafe { l.launch(config(nch as usize)) }.ctx("skips")?;
     }
     {
-        let k = f("kaq_blocs")?;
+        let k = f("kaq_blocks")?;
         let mut l = st.launch_builder(&k);
-        l.arg(&dens).arg(&mut codes).arg(&p).arg(&stt).arg(&saut).arg(&b.chunk0.0).arg(&b.chunk0.1).arg(&nchx).arg(&nch);
+        l.arg(&dens).arg(&mut codes).arg(&p).arg(&stt).arg(&skip).arg(&b.chunk0.0).arg(&b.chunk0.1).arg(&nchx).arg(&nch);
         l.arg(&b.min_y).arg(&b.height).arg(&cx0).arg(&cy0).arg(&cz0).arg(&ncx).arg(&ncy).arg(&ncz).arg(&b.sea_level);
-        unsafe { l.launch(config(b.density.len())) }.ctx("blocs")?;
+        unsafe { l.launch(config(b.density.len())) }.ctx("blocks")?;
     }
-    st.synchronize().ctx("aquiferes")?;
-    Ok((st.clone_dtoh(&codes).ctx("retour des codes")?, st.clone_dtoh(&saut).ctx("retour des sauts")?))
+    st.synchronize().ctx("aquifers")?;
+    Ok((st.clone_dtoh(&codes).ctx("code readback")?, st.clone_dtoh(&skip).ctx("skip readback")?))
 }
 
 
-/// Evalue des bruits (`Noise::get3`) en une liste de points sur le GPU (verification de la surface).
+/// Evaluates noises (`Noise::get3`) at a list of points on the GPU (surface checks).
 pub fn evaluate_noises(
     compiler: &DensityCompiler,
     noises: &[&dyn horizon_core::noise::Noise],
     points: &[[f64; 3]],
 ) -> Result<Vec<Vec<f32>>, String> {
-    let src = traduction::generer_bruits(compiler, noises).map_err(|e| e.to_string())?;
-    let ctx = contexte()?;
-    let (maj, min) = ctx.compute_capability().ctx("capacite du GPU")?;
-    let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-    let module = ctx.load_module(ptx(&src, arch)?).ctx("chargement du module")?;
-    let st = ctx.new_stream().ctx("flux CUDA")?;
-    let plat: Vec<f64> = points.iter().flatten().copied().collect();
-    let p = st.clone_htod(&plat).ctx("envoi des points")?;
+    let src = codegen::generate_noises(compiler, noises).map_err(|e| e.to_string())?;
+    let ctx = context()?;
+    let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
+    let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
+    let module = ctx.load_module(ptx(&src, arch)?).ctx("module load")?;
+    let st = ctx.new_stream().ctx("CUDA stream")?;
+    let flat: Vec<f64> = points.iter().flatten().copied().collect();
+    let p = st.clone_htod(&flat).ctx("point upload")?;
     let n = points.len();
-    let mut sorties = Vec::new();
+    let mut outputs = Vec::new();
     for k in 0..noises.len() {
-        let f = module.load_function(&format!("knz_{k}")).ctx("noyau de bruit")?;
-        let mut out = st.alloc_zeros::<f32>(n.max(1)).ctx("sortie")?;
+        let f = module.load_function(&format!("knz_{k}")).ctx("noise kernel")?;
+        let mut out = st.alloc_zeros::<f32>(n.max(1)).ctx("output")?;
         let ni = n as i32;
         let mut b = st.launch_builder(&f);
         b.arg(&p).arg(&mut out).arg(&ni);
         unsafe { b.launch(config(n.max(1))) }.ctx("evaluation")?;
         st.synchronize().ctx("evaluation")?;
-        let mut v = st.clone_dtoh(&out).ctx("retour")?;
+        let mut v = st.clone_dtoh(&out).ctx("readback")?;
         v.truncate(n);
-        sorties.push(v);
+        outputs.push(v);
     }
-    Ok(sorties)
+    Ok(outputs)
 }
 
-/// Tirages d'une fabrique positionnelle Xoroshiro (lo, hi) en chaque position : premier next_float,
-/// premier next_double, trois next_float successifs.
+/// Draws of a Xoroshiro positional random factory (lo, hi) at each position: first next_float,
+/// first next_double, three successive next_float.
 pub fn positional_draws(
     compiler: &DensityCompiler,
     positional: (u64, u64),
     points: &[[i32; 3]],
 ) -> Result<(Vec<f32>, Vec<f64>, Vec<f32>), String> {
-    let src = traduction::generer_bruits(compiler, &[]).map_err(|e| e.to_string())?;
-    let ctx = contexte()?;
-    let (maj, min) = ctx.compute_capability().ctx("capacite du GPU")?;
-    let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-    let module = ctx.load_module(ptx(&src, arch)?).ctx("chargement du module")?;
-    let st = ctx.new_stream().ctx("flux CUDA")?;
-    let plat: Vec<i32> = points.iter().flatten().copied().collect();
-    let p = st.clone_htod(&plat).ctx("envoi des points")?;
+    let src = codegen::generate_noises(compiler, &[]).map_err(|e| e.to_string())?;
+    let ctx = context()?;
+    let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
+    let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
+    let module = ctx.load_module(ptx(&src, arch)?).ctx("module load")?;
+    let st = ctx.new_stream().ctx("CUDA stream")?;
+    let flat: Vec<i32> = points.iter().flatten().copied().collect();
+    let p = st.clone_htod(&flat).ctx("point upload")?;
     let n = points.len().max(1);
-    let mut f = st.alloc_zeros::<f32>(n).ctx("sortie")?;
-    let mut d = st.alloc_zeros::<f64>(n).ctx("sortie")?;
-    let mut f3 = st.alloc_zeros::<f32>(3 * n).ctx("sortie")?;
-    let k = module.load_function("ktirages").ctx("ktirages")?;
+    let mut f = st.alloc_zeros::<f32>(n).ctx("output")?;
+    let mut d = st.alloc_zeros::<f64>(n).ctx("output")?;
+    let mut f3 = st.alloc_zeros::<f32>(3 * n).ctx("output")?;
+    let k = module.load_function("kdraws").ctx("kdraws")?;
     let (ni, lo, hi) = (points.len() as i32, positional.0, positional.1);
     let mut b = st.launch_builder(&k);
     b.arg(&p).arg(&mut f).arg(&mut d).arg(&mut f3).arg(&ni).arg(&lo).arg(&hi);
-    unsafe { b.launch(config(n)) }.ctx("tirages")?;
-    st.synchronize().ctx("tirages")?;
+    unsafe { b.launch(config(n)) }.ctx("draws")?;
+    st.synchronize().ctx("draws")?;
     Ok((
-        st.clone_dtoh(&f).ctx("retour")?,
-        st.clone_dtoh(&d).ctx("retour")?,
-        st.clone_dtoh(&f3).ctx("retour")?,
+        st.clone_dtoh(&f).ctx("readback")?,
+        st.clone_dtoh(&d).ctx("readback")?,
+        st.clone_dtoh(&f3).ctx("readback")?,
     ))
 }
 
 
-/// Jalon S2 de la surface : quarts choisis par le zoom des biomes (graine deja obfusquee) et
-/// temperatures ajustees a la hauteur pour chaque (temperature de base, modificateur gele).
+/// S2 milestone of the surface: quarts picked by the biome zoom (seed already obfuscated) and
+/// height-adjusted temperatures for each (base temperature, frozen modifier).
 #[allow(clippy::type_complexity)]
 pub fn surface_s2_check(
     compiler: &DensityCompiler,
@@ -1272,31 +1275,31 @@ pub fn surface_s2_check(
     points: &[[i32; 3]],
     biomes: &[(f32, bool)],
     sea_level: i32,
-    hauteur: &horizon_core::noise::SimplexNoise,
-    gel: &horizon_core::noise::NoiseStack,
+    height: &horizon_core::noise::SimplexNoise,
+    freeze: &horizon_core::noise::NoiseStack,
     info: &horizon_core::noise::SimplexNoise,
 ) -> Result<(Vec<[i32; 3]>, Vec<Vec<f32>>), String> {
-    let src = traduction::generer_surface_s2(compiler, hauteur, gel, info).map_err(|e| e.to_string())?;
-    let ctx = contexte()?;
-    let (maj, min) = ctx.compute_capability().ctx("capacite du GPU")?;
-    let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-    let module = ctx.load_module(ptx(&src, arch)?).ctx("chargement du module")?;
-    let st = ctx.new_stream().ctx("flux CUDA")?;
-    let plat: Vec<i32> = points.iter().flatten().copied().collect();
-    let p = st.clone_htod(&plat).ctx("envoi des points")?;
+    let src = codegen::generate_surface_s2(compiler, height, freeze, info).map_err(|e| e.to_string())?;
+    let ctx = context()?;
+    let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
+    let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
+    let module = ctx.load_module(ptx(&src, arch)?).ctx("module load")?;
+    let st = ctx.new_stream().ctx("CUDA stream")?;
+    let flat: Vec<i32> = points.iter().flatten().copied().collect();
+    let p = st.clone_htod(&flat).ctx("point upload")?;
     let n = points.len();
-    let mut q = st.alloc_zeros::<i32>(3 * n.max(1)).ctx("quarts")?;
+    let mut q = st.alloc_zeros::<i32>(3 * n.max(1)).ctx("quarters")?;
     {
-        let k = module.load_function("ksf_quarts").ctx("ksf_quarts")?;
+        let k = module.load_function("ksf_quarters").ctx("ksf_quarters")?;
         let ni = n as i32;
         let mut b = st.launch_builder(&k);
         b.arg(&p).arg(&mut q).arg(&ni).arg(&zoom_seed);
         unsafe { b.launch(config(n.max(1))) }.ctx("zoom")?;
     }
     let bases: Vec<f32> = biomes.iter().map(|b| b.0).collect();
-    let geles: Vec<i32> = biomes.iter().map(|b| i32::from(b.1)).collect();
+    let frozen_flags: Vec<i32> = biomes.iter().map(|b| i32::from(b.1)).collect();
     let bd = st.clone_htod(&bases).ctx("bases")?;
-    let gd = st.clone_htod(&geles).ctx("geles")?;
+    let gd = st.clone_htod(&frozen_flags).ctx("frozen_flags")?;
     let mut t = st.alloc_zeros::<f32>((n * biomes.len()).max(1)).ctx("temperatures")?;
     {
         let k = module.load_function("ksf_temperatures").ctx("ksf_temperatures")?;
@@ -1305,16 +1308,16 @@ pub fn surface_s2_check(
         b.arg(&p).arg(&bd).arg(&gd).arg(&nb).arg(&mut t).arg(&ni).arg(&sea_level);
         unsafe { b.launch(config((n * biomes.len()).max(1))) }.ctx("temperatures")?;
     }
-    st.synchronize().ctx("jalon S2")?;
-    let qv = st.clone_dtoh(&q).ctx("retour")?;
-    let tv = st.clone_dtoh(&t).ctx("retour")?;
-    let quarts = (0..n).map(|i| [qv[3 * i], qv[3 * i + 1], qv[3 * i + 2]]).collect();
-    let temps = (0..biomes.len()).map(|k| tv[k * n..(k + 1) * n].to_vec()).collect();
-    Ok((quarts, temps))
+    st.synchronize().ctx("S2 milestone")?;
+    let qv = st.clone_dtoh(&q).ctx("readback")?;
+    let tv = st.clone_dtoh(&t).ctx("readback")?;
+    let quarters = (0..n).map(|i| [qv[3 * i], qv[3 * i + 1], qv[3 * i + 2]]).collect();
+    let temperatures = (0..biomes.len()).map(|k| tv[k * n..(k + 1) * n].to_vec()).collect();
+    Ok((quarters, temperatures))
 }
 
 
-/// Regle de surface sous forme neutre (traduite depuis `MaterialRule` de horizon-world).
+/// Surface rule in neutral form (translated from horizon-world's `MaterialRule`).
 #[derive(Clone, Debug)]
 pub enum SurfaceRule {
     Empty,
@@ -1322,10 +1325,12 @@ pub enum SurfaceRule {
     Sequence(Vec<usize>),
     Condition { condition: usize, rule: usize },
     Bandlands,
-    /// `positive_y` : les y hors desquels la densite n'est jamais positive (rien n'y est place).
+    /// `positive_y`: the y outside of which the density is never positive (nothing is placed
+    /// there).
     OreVein { blocks: [u32; 3], raw_chance: f32, density: FunctionId, richness: FunctionId, gap: FunctionId, positive_y: [i32; 2] },
 }
-/// Condition de surface sous forme neutre (ancres deja resolues, noms deja traduits en index).
+/// Surface condition in neutral form (anchors already resolved, names already translated to
+/// indices).
 #[derive(Clone, Debug)]
 pub enum SurfaceCondition {
     Hole,
@@ -1340,7 +1345,7 @@ pub enum SurfaceCondition {
     Gradient { low: i32, high: i32, positional: (u64, u64) },
     Not(usize),
 }
-/// Tout ce que la surface d'un monde utilise (jalon S3).
+/// Everything a world's surface uses (S3 milestone).
 pub struct SurfaceSetup<'a> {
     pub rules: Vec<SurfaceRule>,
     pub conditions: Vec<SurfaceCondition>,
@@ -1353,24 +1358,24 @@ pub struct SurfaceSetup<'a> {
     pub root_positional: (u64, u64),
     pub ore_positional: (u64, u64),
     pub surface_level: FunctionId,
-    /// Par biome : temperature de base et modificateur gele.
+    /// Per biome: base temperature and frozen modifier.
     pub temperatures: Vec<(f32, bool)>,
     pub temperature_noises: (&'a horizon_core::noise::SimplexNoise, &'a horizon_core::noise::NoiseStack, &'a horizon_core::noise::SimplexNoise),
     pub zoom_seed: i64,
     pub sea_level: i32,
     pub min_y: i32,
     pub height: i32,
-    /// Piliers des badlands erodes et icebergs (jalon S4) ; `None` : colonnes sans extensions.
+    /// Eroded badlands pillars and icebergs (S4 milestone); `None`: columns without extensions.
     pub extensions: Option<SurfaceExtensions<'a>>,
-    /// Les etats du remplissage par code (& 3) : bloc par defaut, air, fluide par defaut, lave.
+    /// The fill states per code (& 3): default block, air, default fluid, lava.
     pub fill_states: [u32; 4],
-    /// Les etats a fluide que la regle peut ecrire (l'eau des marais) : marques de post-traitement.
+    /// The fluid states the rule can write (swamp water): post-processing marks.
     pub fluid_states: Vec<u32>,
 }
-/// Les extensions de la surface (`material_extensions.rs` de Horizon).
+/// The surface extensions (Horizon's `material_extensions.rs`).
 pub struct SurfaceExtensions<'a> {
     pub eroded_badlands: Option<u32>,
-    /// Au plus deux biomes (frozen_ocean, deep_frozen_ocean).
+    /// At most two biomes (frozen_ocean, deep_frozen_ocean).
     pub frozen_oceans: Vec<u32>,
     /// badlands_surface, badlands_pillar, badlands_pillar_roof, iceberg_surface, iceberg_pillar,
     /// iceberg_pillar_roof.
@@ -1380,40 +1385,40 @@ pub struct SurfaceExtensions<'a> {
     pub snow: u32,
 }
 
-/// Un programme de grilles (filons, surface preliminaire) charge sur le GPU.
+/// A program of grids (veins, preliminary surface) loaded on the GPU.
 struct Volume {
-    f_ax: Vec<Lancement>,
-    f_gr: Vec<(usize, Option<(CudaFunction, usize)>, CudaFunction, usize)>,
-    pas: Vec<[i32; 3]>,
-    taille: usize,
+    f_ax: Vec<Launch>,
+    f_cv: Vec<(usize, Option<(CudaFunction, usize)>, CudaFunction, usize)>,
+    step: Vec<[i32; 3]>,
+    size: usize,
 }
 impl Volume {
-    fn charger(ctx: &Arc<CudaContext>, arch: &'static str, prog: traduction::Programme) -> Result<Self, String> {
-        let module = ctx.load_module(ptx(&prog.src, arch)?).ctx("module d'un filon")?;
-        let f = |nom: &str| module.load_function(nom).ctx(nom);
+    fn load(ctx: &Arc<CudaContext>, arch: &'static str, prog: codegen::Program) -> Result<Self, String> {
+        let module = ctx.load_module(ptx(&prog.src, arch)?).ctx("vein module")?;
+        let f = |name: &str| module.load_function(name).ctx(name);
         let mut f_ax = Vec::new();
         for &(k, gr, nb) in &prog.axes {
             f_ax.push((f(&format!("kax_{k}"))?, gr, nb));
         }
-        let mut f_gr = Vec::new();
-        for k in (1..prog.grilles.len()).chain(std::iter::once(0)) {
-            let gr = prog.grilles[k];
-            let k2d = if prog.bords[k] > 0 { Some((f(&format!("k2d_{k}"))?, gr.colonnes() * prog.bords[k])) } else { None };
-            f_gr.push((k, k2d, f(&format!("k3d_{k}"))?, gr.n()));
+        let mut f_cv = Vec::new();
+        for k in (1..prog.grids.len()).chain(std::iter::once(0)) {
+            let gr = prog.grids[k];
+            let k2d = if prog.edges[k] > 0 { Some((f(&format!("k2d_{k}"))?, gr.columns() * prog.edges[k])) } else { None };
+            f_cv.push((k, k2d, f(&format!("k3d_{k}"))?, gr.n()));
         }
-        Ok(Self { f_ax, f_gr, pas: prog.grilles.iter().map(|g| g.pas).collect(), taille: prog.taille })
+        Ok(Self { f_ax, f_cv, step: prog.grids.iter().map(|g| g.step).collect(), size: prog.size })
     }
-    /// Toutes les grilles du programme sur l'origine `min` ; la grille des blocs est au debut de `mem`, en
-    /// ((z * CGX) + x) * CGY + y.
-    fn grille(&self, st: &Arc<CudaStream>, mem: &mut CudaSlice<f32>, min: [i32; 3]) -> Result<(), String> {
-        let mins: Vec<[i32; 3]> = self.pas.iter().enumerate().map(|(k, pas)| if k == 0 { min } else { std::array::from_fn(|i| min[i].div_euclid(pas[i]) * pas[i]) }).collect();
-        st.memset_zeros(mem).ctx("memoire d'un programme")?;
+    /// All the program's grids at origin `min`; the block grid is at the start of `mem`, at ((z *
+    /// CGX) + x) * CGY + y.
+    fn grid(&self, st: &Arc<CudaStream>, mem: &mut CudaSlice<f32>, min: [i32; 3]) -> Result<(), String> {
+        let mins: Vec<[i32; 3]> = self.step.iter().enumerate().map(|(k, step)| if k == 0 { min } else { std::array::from_fn(|i| min[i].div_euclid(step[i]) * step[i]) }).collect();
+        st.memset_zeros(mem).ctx("program memory")?;
         for (f, gr, nb) in &self.f_ax {
             let mut b = st.launch_builder(f);
             b.arg(&mut *mem).arg(&mins[*gr][0]).arg(&mins[*gr][1]).arg(&mins[*gr][2]);
-            unsafe { b.launch(config(*nb)) }.ctx("noyau d'axes")?;
+            unsafe { b.launch(config(*nb)) }.ctx("axis kernel")?;
         }
-        for (k, k2d, k3d, n3d) in &self.f_gr {
+        for (k, k2d, k3d, n3d) in &self.f_cv {
             if let Some((f, nb)) = k2d {
                 let mut b = st.launch_builder(f);
                 b.arg(&mut *mem).arg(&mins[*k][0]).arg(&mins[*k][1]).arg(&mins[*k][2]);
@@ -1421,40 +1426,40 @@ impl Volume {
             }
             let mut b = st.launch_builder(k3d);
             b.arg(&mut *mem).arg(&mins[*k][0]).arg(&mins[*k][1]).arg(&mins[*k][2]);
-            unsafe { b.launch(config(*n3d)) }.ctx("grille 3D")?;
+            unsafe { b.launch(config(*n3d)) }.ctx("3D grid")?;
         }
         Ok(())
     }
 }
 
-/// Les tampons d'un appel de la surface, gardes d'un chunk a l'autre (un jeu par worker a la fois).
-struct RessourcesSurface {
+/// The buffers of a surface call, kept from one chunk to the next (one set per worker at a time).
+struct SurfaceResources {
     st: Arc<CudaStream>,
     pl: CudaSlice<f32>,
     cd: CudaSlice<i8>,
     bd: CudaSlice<u16>,
-    /// Les blocs d'iceberg (etat + 1).
-    glace: CudaSlice<u32>,
-    /// Par bloc : above, below, water ; par colonne : 10 entiers (ksf_tetes) et le bruit secondaire.
+    /// Iceberg blocks (state + 1).
+    ice: CudaSlice<u32>,
+    /// Per block: above, below, water; per column: 10 integers (ksf_heads) and the secondary noise.
     meta: CudaSlice<i32>,
     coli: CudaSlice<i32>,
     cold: CudaSlice<f64>,
-    fin: CudaSlice<u32>,
+    end: CudaSlice<u32>,
     err: CudaSlice<i32>,
-    hote: cudarc::driver::PinnedHostSlice<u32>,
-    hote_err: cudarc::driver::PinnedHostSlice<i32>,
-    /// Sections compactes, cartes de hauteur, marques et erreur (`enable_sections`)
+    host: cudarc::driver::PinnedHostSlice<u32>,
+    host_err: cudarc::driver::PinnedHostSlice<i32>,
+    /// Compact sections, heightmaps, marks and error (`enable_sections`)
     sec: CudaSlice<u32>,
-    hote_sec: cudarc::driver::PinnedHostSlice<u32>,
-    /// Marques de chaque colonne (ksec_hauteurs pour ksec_marques)
+    host_sec: cudarc::driver::PinnedHostSlice<u32>,
+    /// Marks of each column (ksec_heights for ksec_marks)
     nm: CudaSlice<u32>,
 }
-/// La construction des sections compactes du remplissage (`SurfaceGpu::enable_sections`).
+/// Building the compact sections of the fill (`SurfaceGpu::enable_sections`).
 struct SectionsGpu {
     _module: Arc<cudarc::driver::CudaModule>,
     k_sections: CudaFunction,
-    k_hauteurs: CudaFunction,
-    k_marques: CudaFunction,
+    k_heights: CudaFunction,
+    k_marks: CudaFunction,
     flags: CudaSlice<u8>,
     nflags: u32,
     air: u32,
@@ -1462,138 +1467,140 @@ struct SectionsGpu {
 }
 
 #[derive(Default)]
-struct StatsSurface {
+struct SurfaceStats {
     chunks: AtomicU64,
     ns: AtomicU64,
-    replis: AtomicU64,
-    /// Sections compactes : chunks poses, repasses par les etats bruts, ecarts au CPU (mode test)
+    fallbacks: AtomicU64,
+    /// Compact sections: chunks placed, fallen back to raw states, mismatches with the CPU (test
+    /// mode)
     sections: AtomicU64,
-    sections_replis: AtomicU64,
-    sections_ecarts: AtomicU64,
-    /// HORIZON_GPU_SURFACE_PROFIL : filons, surface preliminaire, colonnes, blocs, envois et retour (ns)
+    sections_fallbacks: AtomicU64,
+    sections_mismatches: AtomicU64,
+    /// HORIZON_GPU_SURFACE_PROFILE: veins, preliminary surface, columns, blocks, uploads and
+    /// readback (ns)
     phases: [AtomicU64; 5],
 }
 
-/// La surface d'un monde sur GPU : etats finaux d'un chunk apres remplissage et surface.
+/// A world's surface on the GPU: final states of a chunk after filling and surface.
 pub struct SurfaceGpu {
     ctx: Arc<CudaContext>,
     _module: Arc<cudarc::driver::CudaModule>,
-    k_tetes: CudaFunction,
-    k_descente: CudaFunction,
-    k_blocs: CudaFunction,
+    k_heads: CudaFunction,
+    k_descent: CudaFunction,
+    k_blocks: CudaFunction,
     volumes: Vec<Volume>,
-    niveau: Volume,
+    level: Volume,
     height: i32,
-    pool: Mutex<Vec<RessourcesSurface>>,
-    stats: StatsSurface,
-    /// Par region de NIVEAU_R x NIVEAU_R chunks, calculee une fois pour ses chunks ; les plus anciennes
-    /// sont oubliees au-dela de `capacite`.
+    pool: Mutex<Vec<SurfaceResources>>,
+    stats: SurfaceStats,
+    /// Per region of LEVEL_R x LEVEL_R chunks, computed once for its chunks; the oldest are dropped
+    /// beyond `capacity`.
     regions: Mutex<Regions>,
-    capacite: usize,
-    /// Les grilles des filons d'une region : y de depart et hauteur.
+    capacity: usize,
+    /// The vein grids of a region: starting y and height.
     vlo: i32,
     vh: i32,
     sections: OnceLock<Option<SectionsGpu>>,
 }
-/// La surface preliminaire d'une region (plan y = 0, en z puis x, sur l'hote) et les densites de ses
-/// filons (sur le GPU : une grille par racine, en ((z * SF_VR) + x) * SF_VH + y - SF_VLO).
+/// The preliminary surface of a region (y = 0 plane, by z then x, on the host) and the densities of
+/// its veins (on the GPU: one grid per root, at ((z * SF_VR) + x) * SF_VH + y - SF_VLO).
 struct RegionSurface {
     plan: Vec<f32>,
-    filons: CudaSlice<f32>,
+    veins: CudaSlice<f32>,
 }
-type CelluleRegion = Arc<std::sync::OnceLock<Result<Arc<RegionSurface>, String>>>;
+type RegionCell = Arc<std::sync::OnceLock<Result<Arc<RegionSurface>, String>>>;
 #[derive(Default)]
 struct Regions {
-    carte: std::collections::HashMap<(i32, i32), CelluleRegion>,
-    ordre: std::collections::VecDeque<(i32, i32)>,
+    lookup: std::collections::HashMap<(i32, i32), RegionCell>,
+    order: std::collections::VecDeque<(i32, i32)>,
 }
 impl Drop for SurfaceGpu {
     fn drop(&mut self) {
         let n = self.stats.chunks.load(Relaxed);
         if n > 0 {
             eprintln!(
-                "GPU surface : {n} chunks ({} us en moyenne par appel), {} replis CPU ; sections compactes : {} chunks, {} par les etats bruts, {} ecarts au CPU (mode test)",
+                "GPU surface: {n} chunks ({} us per call on average), {} CPU fallbacks; compact sections: {} chunks, {} through raw states, {} mismatches with the CPU (test mode)",
                 self.stats.ns.load(Relaxed) / n / 1000,
-                self.stats.replis.load(Relaxed),
+                self.stats.fallbacks.load(Relaxed),
                 self.stats.sections.load(Relaxed),
-                self.stats.sections_replis.load(Relaxed),
-                self.stats.sections_ecarts.load(Relaxed),
+                self.stats.sections_fallbacks.load(Relaxed),
+                self.stats.sections_mismatches.load(Relaxed),
             );
-            if std::env::var_os("HORIZON_GPU_SURFACE_PROFIL").is_some() {
+            if std::env::var_os("HORIZON_GPU_SURFACE_PROFILE").is_some() {
                 let p = self.stats.phases.each_ref().map(|a| a.load(Relaxed) / n / 1000);
-                eprintln!("GPU surface : par chunk, filons {} us, surface preliminaire {} us, colonnes {} us, blocs {} us, envois et retour {} us", p[0], p[1], p[2], p[3], p[4]);
+                eprintln!("GPU surface: per chunk, veins {} us, preliminary surface {} us, columns {} us, blocks {} us, uploads and readback {} us", p[0], p[1], p[2], p[3], p[4]);
             }
         }
     }
 }
 impl std::fmt::Debug for SurfaceGpu {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SurfaceGpu({} filons)", self.volumes.len())
+        write!(f, "SurfaceGpu({} veins)", self.volumes.len())
     }
 }
 impl SurfaceGpu {
     pub fn new(compiler: &DensityCompiler, setup: &SurfaceSetup, seed: i64) -> Result<Self, String> {
-        let prog = traduction::generer_surface(compiler, setup, seed).map_err(|e| e.to_string())?;
+        let prog = codegen::generate_surface(compiler, setup, seed).map_err(|e| e.to_string())?;
         if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP_SURFACE") {
             let f = std::path::PathBuf::from(f);
             let _ = std::fs::write(&f, &prog.src);
             for (k, v) in prog.volumes.iter().enumerate() {
-                let _ = std::fs::write(f.with_extension(format!("filon{k}.cu")), &v.src);
+                let _ = std::fs::write(f.with_extension(format!("vein{k}.cu")), &v.src);
             }
-            let _ = std::fs::write(f.with_extension("niveau.cu"), &prog.niveau.src);
+            let _ = std::fs::write(f.with_extension("level.cu"), &prog.level.src);
         }
-        let ctx = contexte()?;
-        let (maj, min) = ctx.compute_capability().ctx("capacite du GPU")?;
-        let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-        let module = ctx.load_module(ptx(&prog.src, arch)?).ctx("module de surface")?;
-        let k_tetes = module.load_function("ksf_tetes").ctx("ksf_tetes")?;
-        let k_descente = module.load_function("ksf_descente").ctx("ksf_descente")?;
-        let k_blocs = module.load_function("ksf_blocs").ctx("ksf_blocs")?;
+        let ctx = context()?;
+        let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
+        let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
+        let module = ctx.load_module(ptx(&prog.src, arch)?).ctx("surface module")?;
+        let k_heads = module.load_function("ksf_heads").ctx("ksf_heads")?;
+        let k_descent = module.load_function("ksf_descent").ctx("ksf_descent")?;
+        let k_blocks = module.load_function("ksf_blocks").ctx("ksf_blocks")?;
         let mut volumes = Vec::new();
         for v in prog.volumes {
-            volumes.push(Volume::charger(&ctx, arch, v)?);
+            volumes.push(Volume::load(&ctx, arch, v)?);
         }
-        let niveau = Volume::charger(&ctx, arch, prog.niveau)?;
-        let capacite = std::env::var("HORIZON_GPU_SURFACE_REGIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
+        let level = Volume::load(&ctx, arch, prog.level)?;
+        let capacity = std::env::var("HORIZON_GPU_SURFACE_REGIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(48);
         Ok(Self {
             ctx,
             _module: module,
-            k_tetes,
-            k_descente,
-            k_blocs,
+            k_heads,
+            k_descent,
+            k_blocks,
             volumes,
-            niveau,
+            level,
             height: setup.height,
             pool: Mutex::new(Vec::new()),
-            stats: StatsSurface::default(),
+            stats: SurfaceStats::default(),
             regions: Mutex::new(Regions::default()),
-            capacite,
-            vlo: prog.filons_y.0,
-            vh: prog.filons_y.1,
+            capacity,
+            vlo: prog.veins_y.0,
+            vh: prog.veins_y.1,
             sections: OnceLock::new(),
         })
     }
-    /// HORIZON_GPU_SECTIONS : le GPU construit aussi les sections compactes du remplissage, ses cartes de
-    /// hauteur et ses marques (sections.cu), que `fill_noise_sections` pose telles quelles. `flags` : par
-    /// etat, 1 air, 2 fluide, 4 bloque le mouvement (`TerrainChunk::section_flags`) ; `test` : les etats
-    /// reviennent aussi, pour comparer. Une fois par dimension ; faux si le module ne se charge pas.
+    /// HORIZON_GPU_SECTIONS: the GPU also builds the compact sections of the fill, its heightmaps
+    /// and its marks (sections.cu), which `fill_noise_sections` places as they are. `flags`: per
+    /// state, 1 air, 2 fluid, 4 blocks motion (`TerrainChunk::section_flags`); `test`: the states
+    /// come back too, for comparison. Once per dimension; false if the module does not load.
     pub fn enable_sections(&self, flags: &[u8], air: u32, test: bool) -> bool {
         self.sections
             .get_or_init(|| {
                 let r = (|| -> Result<SectionsGpu, String> {
-                    let (maj, min) = self.ctx.compute_capability().ctx("capacite du GPU")?;
-                    let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
+                    let (major, min) = self.ctx.compute_capability().ctx("GPU compute capability")?;
+                    let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
                     let module = self
                         .ctx
                         .load_module(ptx(include_str!("sections.cu"), arch)?)
-                        .ctx("module des sections")?;
-                    let st = self.ctx.new_stream().ctx("flux CUDA")?;
-                    let flags_d = st.clone_htod(flags).ctx("drapeaux des etats")?;
-                    st.synchronize().ctx("drapeaux des etats")?;
+                        .ctx("section module")?;
+                    let st = self.ctx.new_stream().ctx("CUDA stream")?;
+                    let flags_d = st.clone_htod(flags).ctx("state flags")?;
+                    st.synchronize().ctx("state flags")?;
                     Ok(SectionsGpu {
                         k_sections: module.load_function("ksec_sections").ctx("ksec_sections")?,
-                        k_hauteurs: module.load_function("ksec_hauteurs").ctx("ksec_hauteurs")?,
-                        k_marques: module.load_function("ksec_marques").ctx("ksec_marques")?,
+                        k_heights: module.load_function("ksec_heights").ctx("ksec_heights")?,
+                        k_marks: module.load_function("ksec_marks").ctx("ksec_marks")?,
                         _module: module,
                         flags: flags_d,
                         nflags: flags.len() as u32,
@@ -1601,129 +1608,131 @@ impl SurfaceGpu {
                         test,
                     })
                 })();
-                r.map_err(|e| log::error!("GPU sections : pas de sections sur GPU : {e}")).ok()
+                r.map_err(|e| log::error!("GPU sections: no sections on the GPU: {e}")).ok()
             })
             .is_some()
     }
-    /// Un chunk dont les sections compactes du GPU sont posees (`ok`) ou passent par les etats bruts.
+    /// A chunk whose GPU compact sections are placed (`ok`) or go through the raw states.
     pub fn note_sections(&self, ok: bool) {
         if ok {
             self.stats.sections.fetch_add(1, Relaxed);
         } else {
-            self.stats.sections_replis.fetch_add(1, Relaxed);
+            self.stats.sections_fallbacks.fetch_add(1, Relaxed);
         }
     }
-    /// Mode test : des sections compactes qui different de celles du CPU.
+    /// Test mode: compact sections that differ from the CPU's.
     pub fn note_sections_mismatch(&self) {
-        self.stats.sections_ecarts.fetch_add(1, Relaxed);
+        self.stats.sections_mismatches.fetch_add(1, Relaxed);
     }
-    /// Mots u32 de la sortie des sections d'un chunk : `SECTION_WORDS` par section, 512 hauteurs (ocean
-    /// puis surface), 2 compteurs et 2 x `SECTION_MARKS` marques, puis le mot d'erreur.
+    /// u32 words of a chunk's section output: `SECTION_WORDS` per section, 512 heights (ocean then
+    /// surface), 2 counters and 2 x `SECTION_MARKS` marks, then the error word.
     pub fn sections_len(&self) -> usize {
         (self.height as usize / 16) * SECTION_WORDS + 512 + 2 + 2 * SECTION_MARKS + 1
     }
-    /// La region (rx, rz) : surface preliminaire et filons, calcules au premier chunk qui la demande.
+    /// Region (rx, rz): preliminary surface and veins, computed at the first chunk that asks for
+    /// it.
     fn region(&self, st: &Arc<CudaStream>, rx: i32, rz: i32) -> Result<Arc<RegionSurface>, String> {
-        let cellule = {
+        let cell = {
             let mut p = self.regions.lock().unwrap();
-            match p.carte.get(&(rx, rz)) {
+            match p.lookup.get(&(rx, rz)) {
                 Some(c) => c.clone(),
                 None => {
-                    let c: CelluleRegion = Arc::new(std::sync::OnceLock::new());
-                    p.carte.insert((rx, rz), c.clone());
-                    p.ordre.push_back((rx, rz));
-                    // Liberee quand le dernier chunk qui la lit a fini
-                    while p.ordre.len() > self.capacite {
-                        if let Some(v) = p.ordre.pop_front() {
-                            p.carte.remove(&v);
+                    let c: RegionCell = Arc::new(std::sync::OnceLock::new());
+                    p.lookup.insert((rx, rz), c.clone());
+                    p.order.push_back((rx, rz));
+                    // Released when the last chunk that reads it is done
+                    while p.order.len() > self.capacity {
+                        if let Some(v) = p.order.pop_front() {
+                            p.lookup.remove(&v);
                         }
                     }
                     c
                 }
             }
         };
-        cellule
+        cell
             .get_or_init(|| {
-                let vr = 16 * traduction::NIVEAU_R;
+                let vr = 16 * codegen::LEVEL_R;
                 let n = (vr * vr) as usize;
-                let mut mem = st.alloc_zeros::<f32>(self.niveau.taille).ctx("memoire de la surface preliminaire")?;
-                self.niveau.grille(st, &mut mem, [rx * vr, 0, rz * vr])?;
-                let plan = st.clone_dtoh(&mem.slice(0..n)).ctx("retour de la surface preliminaire")?;
+                let mut mem = st.alloc_zeros::<f32>(self.level.size).ctx("preliminary surface memory")?;
+                self.level.grid(st, &mut mem, [rx * vr, 0, rz * vr])?;
+                let plan = st.clone_dtoh(&mem.slice(0..n)).ctx("preliminary surface readback")?;
                 let vn = n * self.vh as usize;
-                let mut filons = st.alloc_zeros::<f32>(vn * self.volumes.len().max(1)).ctx("filons de la region")?;
+                let mut veins = st.alloc_zeros::<f32>(vn * self.volumes.len().max(1)).ctx("region veins")?;
                 for (k, v) in self.volumes.iter().enumerate() {
-                    let mut m = st.alloc_zeros::<f32>(v.taille).ctx("memoire d'un filon")?;
-                    v.grille(st, &mut m, [rx * vr, self.vlo, rz * vr])?;
-                    st.memcpy_dtod(&m.slice(0..vn), &mut filons.slice_mut(k * vn..(k + 1) * vn)).ctx("copie d'un filon")?;
+                    let mut m = st.alloc_zeros::<f32>(v.size).ctx("vein memory")?;
+                    v.grid(st, &mut m, [rx * vr, self.vlo, rz * vr])?;
+                    st.memcpy_dtod(&m.slice(0..vn), &mut veins.slice_mut(k * vn..(k + 1) * vn)).ctx("vein copy")?;
                 }
-                // Lue ensuite depuis les flux des autres workers
-                st.synchronize().ctx("region de la surface")?;
-                Ok(Arc::new(RegionSurface { plan, filons }))
+                // Read afterwards from the other workers' streams
+                st.synchronize().ctx("surface region")?;
+                Ok(Arc::new(RegionSurface { plan, veins }))
             })
             .clone()
     }
-    /// Nombre de biomes attendus par `chunk_states` : les quarts des 3 x 3 chunks autour du chunk.
+    /// Number of biomes `chunk_states` expects: the quarts of the 3 x 3 chunks around the chunk.
     pub fn biome_count(&self) -> usize {
         9 * 16 * (self.height as usize / 4)
     }
-    /// Le chunk est passe par le CPU.
+    /// The chunk went through the CPU.
     pub fn note_cpu_fallback(&self) {
-        self.stats.replis.fetch_add(1, Relaxed);
+        self.stats.fallbacks.fetch_add(1, Relaxed);
     }
-    fn ressource(&self) -> Result<RessourcesSurface, String> {
+    fn resource(&self) -> Result<SurfaceResources, String> {
         if let Some(r) = self.pool.lock().unwrap().pop() {
             return Ok(r);
         }
         let n = 256 * self.height as usize;
-        let st = flux_prioritaire(&self.ctx)?;
-        Ok(RessourcesSurface {
-            pl: st.alloc_zeros::<f32>(256).ctx("surface preliminaire")?,
+        let st = priority_stream(&self.ctx)?;
+        Ok(SurfaceResources {
+            pl: st.alloc_zeros::<f32>(256).ctx("preliminary surface")?,
             cd: st.alloc_zeros::<i8>(n).ctx("codes")?,
             bd: st.alloc_zeros::<u16>(self.biome_count()).ctx("biomes")?,
-            glace: st.alloc_zeros::<u32>(n).ctx("icebergs")?,
-            meta: st.alloc_zeros::<i32>(3 * n).ctx("descente")?,
-            coli: st.alloc_zeros::<i32>(10 * 256).ctx("colonnes")?,
-            cold: st.alloc_zeros::<f64>(256).ctx("colonnes")?,
-            fin: st.alloc_zeros::<u32>(n).ctx("etats finaux")?,
-            err: st.alloc_zeros::<i32>(1).ctx("erreur")?,
-            // Memoire verrouillee ordinaire (le defaut de cudarc, write-combined, est lent a relire)
-            hote: unsafe { self.ctx.alloc_pinned_with_flags::<u32>(n, 0) }.ctx("tampon hote")?,
-            hote_err: unsafe { self.ctx.alloc_pinned_with_flags::<i32>(1, 0) }.ctx("tampon hote")?,
+            ice: st.alloc_zeros::<u32>(n).ctx("icebergs")?,
+            meta: st.alloc_zeros::<i32>(3 * n).ctx("descent")?,
+            coli: st.alloc_zeros::<i32>(10 * 256).ctx("columns")?,
+            cold: st.alloc_zeros::<f64>(256).ctx("columns")?,
+            end: st.alloc_zeros::<u32>(n).ctx("final states")?,
+            err: st.alloc_zeros::<i32>(1).ctx("error")?,
+            // Ordinary pinned memory (cudarc's default, write-combined, is slow to read back)
+            host: unsafe { self.ctx.alloc_pinned_with_flags::<u32>(n, 0) }.ctx("host buffer")?,
+            host_err: unsafe { self.ctx.alloc_pinned_with_flags::<i32>(1, 0) }.ctx("host buffer")?,
             sec: st.alloc_zeros::<u32>(self.sections_len()).ctx("sections")?,
-            nm: st.alloc_zeros::<u32>(512).ctx("marques des colonnes")?,
-            hote_sec: unsafe { self.ctx.alloc_pinned_with_flags::<u32>(self.sections_len(), 0) }.ctx("tampon hote")?,
+            nm: st.alloc_zeros::<u32>(512).ctx("column marks")?,
+            host_sec: unsafe { self.ctx.alloc_pinned_with_flags::<u32>(self.sections_len(), 0) }.ctx("host buffer")?,
             st,
         })
     }
-    /// Les etats finaux du chunk (remplissage puis surface, extensions comprises) dans l'ordre de
-    /// fill_noise : l'etat sur 30 bits, le bit 31 quand le remplissage planifie une mise a jour de fluide
-    /// (code + 4 sur de l'eau ou de la lave), le bit 30 quand la surface y ecrit un etat a fluide. `codes` :
-    /// les codes du remplissage GPU ; `biomes` : les quarts des 3 x 3 chunks (dz puis dx de -1 a +1, chaque
-    /// chunk en sections). `Ok(false)` : une condition n'a pas pu etre evaluee, le chunk doit passer par le
-    /// CPU. `GpuFinalDensity::chunk_blocks_surface` fait de meme sans renvoyer les codes au GPU.
+    /// The chunk's final states (fill then surface, extensions included) in fill_noise order: the
+    /// state on 30 bits, bit 31 when the fill schedules a fluid update (code + 4 on water or lava),
+    /// bit 30 when the surface writes a fluid state there. `codes`: the codes of the GPU fill;
+    /// `biomes`: the quarts of the 3 x 3 chunks (dz then dx from -1 to +1, each chunk by sections).
+    /// `Ok(false)`: a condition could not be evaluated, the chunk must go through the CPU.
+    /// `GpuFinalDensity::chunk_blocks_surface` does the same without sending the codes back to the
+    /// GPU.
     pub fn chunk_states(&self, chunk_x: i32, chunk_z: i32, codes: &[i8], biomes: &[u16], out: &mut [u32]) -> Result<bool, String> {
         let n = 256 * self.height as usize;
         if codes.len() != n || out.len() != n || biomes.len() != self.biome_count() {
-            return Err("tailles inattendues".into());
+            return Err("unexpected sizes".into());
         }
         let t = Instant::now();
-        let mut res = self.ressource()?;
+        let mut res = self.resource()?;
         let st = res.st.clone();
         let r = (|| {
             st.memcpy_htod(codes, &mut res.cd).ctx("codes")?;
-            let _region = self.enfiler(&mut res, &st, None, chunk_x, chunk_z, biomes, false)?;
-            st.synchronize().ctx("attente de la surface")?;
-            self.lire(&mut res, out, None)
+            let _region = self.enqueue(&mut res, &st, None, chunk_x, chunk_z, biomes, false)?;
+            st.synchronize().ctx("surface wait")?;
+            self.read_back(&mut res, out, None)
         })();
-        self.rendre(res, r.is_ok(), t);
+        self.put_back(res, r.is_ok(), t);
         r
     }
-    /// La surface du chunk mise en file sur `st`, apres le noyau qui y ecrit ses codes (`cd`, sinon les
-    /// codes deja envoyes dans `res`). Les etats se lisent par `lire` une fois `st` attendu ; la region
-    /// renvoyee doit rester en vie jusque-la.
-    fn enfiler(
+    /// The chunk's surface queued on `st`, after the kernel that writes its codes there (`cd`,
+    /// otherwise the codes already uploaded into `res`). The states are read by `read_back` once
+    /// `st` is waited for; the returned region must stay alive until then.
+    fn enqueue(
         &self,
-        res: &mut RessourcesSurface,
+        res: &mut SurfaceResources,
         st: &Arc<CudaStream>,
         cd: Option<&CudaSlice<i8>>,
         chunk_x: i32,
@@ -1732,17 +1741,17 @@ impl SurfaceGpu {
         sections: bool,
     ) -> Result<Arc<RegionSurface>, String> {
         let n = 256 * self.height as usize;
-        let profil = cd.is_none() && std::env::var_os("HORIZON_GPU_SURFACE_PROFIL").is_some();
+        let profile = cd.is_none() && std::env::var_os("HORIZON_GPU_SURFACE_PROFILE").is_some();
         let mut t = Instant::now();
         let mut phase = |k: usize| -> Result<(), String> {
-            if profil {
-                st.synchronize().ctx("profil")?;
+            if profile {
+                st.synchronize().ctx("profile")?;
                 self.stats.phases[k].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
                 t = Instant::now();
             }
             Ok(())
         };
-        let r = traduction::NIVEAU_R;
+        let r = codegen::LEVEL_R;
         let (rx, rz) = (chunk_x.div_euclid(r), chunk_z.div_euclid(r));
         let region = self.region(st, rx, rz)?;
         phase(0)?;
@@ -1753,125 +1762,125 @@ impl SurfaceGpu {
                 pl[(lz * 16 + lx) as usize] = region.plan[((oz + lz) * 16 * r + ox + lx) as usize];
             }
         }
-        st.memcpy_htod(&pl[..], &mut res.pl).ctx("surface preliminaire")?;
+        st.memcpy_htod(&pl[..], &mut res.pl).ctx("preliminary surface")?;
         phase(1)?;
         st.memcpy_htod(biomes, &mut res.bd).ctx("biomes")?;
-        st.memset_zeros(&mut res.err).ctx("erreur")?;
+        st.memset_zeros(&mut res.err).ctx("error")?;
         phase(4)?;
-        st.memset_zeros(&mut res.glace).ctx("icebergs")?;
-        st.memset_zeros(&mut res.meta).ctx("descente")?;
+        st.memset_zeros(&mut res.ice).ctx("icebergs")?;
+        st.memset_zeros(&mut res.meta).ctx("descent")?;
         let cd: &CudaSlice<i8> = match cd {
             Some(c) => c,
             None => &res.cd,
         };
-        let mut b = st.launch_builder(&self.k_tetes);
+        let mut b = st.launch_builder(&self.k_heads);
         b.arg(cd)
             .arg(&res.bd)
             .arg(&res.pl)
-            .arg(&mut res.glace)
+            .arg(&mut res.ice)
             .arg(&mut res.coli)
             .arg(&mut res.cold)
             .arg(&mut res.err)
             .arg(&chunk_x)
             .arg(&chunk_z);
-        // Une warp par colonne
-        unsafe { b.launch(config(256 * 32)) }.ctx("colonnes de la surface")?;
-        let mut b = st.launch_builder(&self.k_descente);
+        // One warp per column
+        unsafe { b.launch(config(256 * 32)) }.ctx("surface columns")?;
+        let mut b = st.launch_builder(&self.k_descent);
         b.arg(cd).arg(&mut res.coli).arg(&mut res.meta);
-        unsafe { b.launch(config(256 * 32)) }.ctx("descente de la surface")?;
+        unsafe { b.launch(config(256 * 32)) }.ctx("surface descent")?;
         phase(2)?;
-        let mut b = st.launch_builder(&self.k_blocs);
+        let mut b = st.launch_builder(&self.k_blocks);
         b.arg(cd)
             .arg(&res.bd)
-            .arg(&region.filons)
-            .arg(&res.glace)
+            .arg(&region.veins)
+            .arg(&res.ice)
             .arg(&res.meta)
             .arg(&res.coli)
             .arg(&res.cold)
-            .arg(&mut res.fin)
+            .arg(&mut res.end)
             .arg(&mut res.err)
             .arg(&chunk_x)
             .arg(&chunk_z)
             .arg(&ox)
             .arg(&oz);
-        unsafe { b.launch(config(n)) }.ctx("blocs de la surface")?;
+        unsafe { b.launch(config(n)) }.ctx("surface blocks")?;
         phase(3)?;
         let sec = if sections { self.sections.get().and_then(Option::as_ref) } else { None };
         if let Some(sg) = sec {
             let ns = self.height as usize / 16;
             let (a, b) = (ns * SECTION_WORDS, ns * SECTION_WORDS + 512);
-            let fin_mq = b + 2 + 2 * SECTION_MARKS;
-            st.memset_zeros(&mut res.sec.slice_mut(fin_mq..fin_mq + 1)).ctx("erreur des sections")?;
+            let end_mq = b + 2 + 2 * SECTION_MARKS;
+            st.memset_zeros(&mut res.sec.slice_mut(end_mq..end_mq + 1)).ctx("section error")?;
             let h = self.height;
             let cap = SECTION_MARKS as i32;
             {
                 let hm = res.sec.slice(a..b);
-                let mut l = st.launch_builder(&sg.k_hauteurs);
-                l.arg(&res.fin).arg(&sg.flags).arg(&sg.nflags).arg(&sg.air).arg(&h).arg(&hm).arg(&mut res.nm);
+                let mut l = st.launch_builder(&sg.k_heights);
+                l.arg(&res.end).arg(&sg.flags).arg(&sg.nflags).arg(&sg.air).arg(&h).arg(&hm).arg(&mut res.nm);
                 unsafe { l.launch(LaunchConfig { grid_dim: (256, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 }) }
-                    .ctx("hauteurs des sections")?;
+                    .ctx("section heights")?;
             }
             {
-                let mq = res.sec.slice(b..fin_mq);
-                let er = res.sec.slice(fin_mq..fin_mq + 1);
-                let mut l = st.launch_builder(&sg.k_marques);
-                l.arg(&res.fin).arg(&sg.air).arg(&h).arg(&res.nm).arg(&mq).arg(&cap).arg(&er);
+                let mq = res.sec.slice(b..end_mq);
+                let er = res.sec.slice(end_mq..end_mq + 1);
+                let mut l = st.launch_builder(&sg.k_marks);
+                l.arg(&res.end).arg(&sg.air).arg(&h).arg(&res.nm).arg(&mq).arg(&cap).arg(&er);
                 unsafe { l.launch(LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }
-                    .ctx("marques des sections")?;
+                    .ctx("section marks")?;
             }
             {
                 let out = res.sec.slice(0..a);
-                let er = res.sec.slice(fin_mq..fin_mq + 1);
+                let er = res.sec.slice(end_mq..end_mq + 1);
                 let mut l = st.launch_builder(&sg.k_sections);
-                l.arg(&res.fin).arg(&sg.flags).arg(&sg.nflags).arg(&sg.air).arg(&h).arg(&out).arg(&er);
+                l.arg(&res.end).arg(&sg.flags).arg(&sg.nflags).arg(&sg.air).arg(&h).arg(&out).arg(&er);
                 unsafe { l.launch(LaunchConfig { grid_dim: (ns as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }
                     .ctx("sections")?;
             }
-            st.memcpy_dtoh(&res.sec, &mut res.hote_sec).ctx("retour des sections")?;
+            st.memcpy_dtoh(&res.sec, &mut res.host_sec).ctx("section readback")?;
             if sg.test {
-                st.memcpy_dtoh(&res.fin, &mut res.hote).ctx("retour des etats")?;
+                st.memcpy_dtoh(&res.end, &mut res.host).ctx("state readback")?;
             }
         } else {
-            st.memcpy_dtoh(&res.fin, &mut res.hote).ctx("retour des etats")?;
+            st.memcpy_dtoh(&res.end, &mut res.host).ctx("state readback")?;
         }
-        st.memcpy_dtoh(&res.err, &mut res.hote_err).ctx("retour de l'erreur")?;
-        if profil {
-            st.synchronize().ctx("profil")?;
+        st.memcpy_dtoh(&res.err, &mut res.host_err).ctx("error readback")?;
+        if profile {
+            st.synchronize().ctx("profile")?;
             self.stats.phases[4].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         }
         Ok(region)
     }
-    /// Les etats d'une surface mise en file, son flux attendu (suivi d'evenements coupe : la memoire
-    /// verrouillee ne s'attend pas seule).
-    fn lire(&self, res: &mut RessourcesSurface, out: &mut [u32], sections: Option<&mut Vec<u32>>) -> Result<bool, String> {
+    /// The states of a queued surface, its stream waited for (event tracking off: pinned memory
+    /// does not wait by itself).
+    fn read_back(&self, res: &mut SurfaceResources, out: &mut [u32], sections: Option<&mut Vec<u32>>) -> Result<bool, String> {
         let sec = self.sections.get().and_then(Option::as_ref);
         match (sections, sec) {
             (Some(v), Some(sg)) => {
-                let lu = res.hote_sec.as_slice().ctx("lecture des sections")?;
-                if lu[lu.len() - 1] == 0 {
+                let readback = res.host_sec.as_slice().ctx("section read")?;
+                if readback[readback.len() - 1] == 0 {
                     v.clear();
-                    v.extend_from_slice(lu);
+                    v.extend_from_slice(readback);
                     if sg.test {
-                        out.copy_from_slice(res.hote.as_slice().ctx("lecture des etats")?);
+                        out.copy_from_slice(res.host.as_slice().ctx("state read")?);
                     }
                 } else {
-                    // Trop de marques ou de palettes : les etats bruts, pour le CPU
+                    // Too many marks or palettes: the raw states, for the CPU
                     v.clear();
-                    res.st.memcpy_dtoh(&res.fin, &mut res.hote).ctx("retour des etats")?;
-                    res.st.synchronize().ctx("retour des etats")?;
-                    out.copy_from_slice(res.hote.as_slice().ctx("lecture des etats")?);
+                    res.st.memcpy_dtoh(&res.end, &mut res.host).ctx("state readback")?;
+                    res.st.synchronize().ctx("state readback")?;
+                    out.copy_from_slice(res.host.as_slice().ctx("state read")?);
                 }
             }
             (Some(v), None) => {
                 v.clear();
-                out.copy_from_slice(res.hote.as_slice().ctx("lecture des etats")?);
+                out.copy_from_slice(res.host.as_slice().ctx("state read")?);
             }
-            (None, _) => out.copy_from_slice(res.hote.as_slice().ctx("lecture des etats")?),
+            (None, _) => out.copy_from_slice(res.host.as_slice().ctx("state read")?),
         }
-        Ok(res.hote_err.as_slice().ctx("lecture de l'erreur")?[0] == 0)
+        Ok(res.host_err.as_slice().ctx("error read")?[0] == 0)
     }
-    /// Rend les tampons (pas ceux d'un appel en erreur, dont le flux peut etre casse).
-    fn rendre(&self, res: RessourcesSurface, ok: bool, t: Instant) {
+    /// Returns the buffers (not those of a failed call, whose stream may be broken).
+    fn put_back(&self, res: SurfaceResources, ok: bool, t: Instant) {
         if ok {
             self.pool.lock().unwrap().push(res);
             self.stats.chunks.fetch_add(1, Relaxed);
@@ -1880,8 +1889,8 @@ impl SurfaceGpu {
     }
 }
 
-/// Un blob de minerai (OreFeature.doPlace) a calculer : ses `count` spheres `[x, y, z, r]` (avant
-/// elagage) a partir de `first` dans les spheres du lot, et sa boite (coin bas, cote en X et Z, hauteur).
+/// An ore blob (OreFeature.doPlace) to compute: its `count` spheres `[x, y, z, r]` (before pruning)
+/// from `first` in the batch's spheres, and its box (low corner, side in X and Z, height).
 #[derive(Clone, Copy, Debug)]
 pub struct OreBlob {
     pub first: u32,
@@ -1892,52 +1901,53 @@ pub struct OreBlob {
 }
 
 #[derive(Default)]
-struct StatsMinerais {
-    lots: AtomicU64,
+struct OreStats {
+    batches: AtomicU64,
     blobs: AtomicU64,
-    ns_envoi: AtomicU64,
-    ns_attente: AtomicU64,
-    replis: AtomicU64,
-    erreurs: AtomicU64,
-    ecarts: AtomicU64,
+    ns_send: AtomicU64,
+    ns_wait: AtomicU64,
+    fallbacks: AtomicU64,
+    errors: AtomicU64,
+    mismatches: AtomicU64,
 }
 
-/// Les cellules des blobs de minerai sur GPU (`HORIZON_GPU_ORES`) : l'elagage des spheres de
-/// OreFeature.doPlace, puis le masque des cellules de chaque rangee (x, y) de la boite du blob.
-/// Le lot d'un chunk est envoye au debut de sa decoration et lu a l'etape des minerais.
+/// The cells of the ore blobs on the GPU (`HORIZON_GPU_ORES`): the sphere pruning of
+/// OreFeature.doPlace, then the mask of the cells of each row (x, y) of the blob's box.
+/// A chunk's batch is sent at the start of its decoration and read at the ore step.
 pub struct OreGpu {
     ctx: Arc<CudaContext>,
     _module: Arc<cudarc::driver::CudaModule>,
     k_blobs: CudaFunction,
-    pool: Mutex<Vec<RessourcesMinerais>>,
-    stats: StatsMinerais,
+    pool: Mutex<Vec<OreResources>>,
+    stats: OreStats,
 }
-/// Les tampons d'un lot, en mots de 32 bits : en entree les blobs (8 mots chacun) puis les spheres
-/// (8 mots chacune), en sortie les erreurs (1 mot par blob) puis les rangees.
-struct RessourcesMinerais {
+/// The buffers of a batch, in 32-bit words: as input the blobs (8 words each) then the spheres (8
+/// words each), as output the errors (1 word per blob) then the rows.
+struct OreResources {
     st: Arc<CudaStream>,
-    /// Capacites : blobs, spheres, rangees
+    /// Capacities: blobs, spheres, rows
     cap: [usize; 3],
-    entree: CudaSlice<u32>,
-    sortie: CudaSlice<u32>,
-    h_entree: PinnedHostSlice<u32>,
-    h_sortie: PinnedHostSlice<u32>,
+    input: CudaSlice<u32>,
+    output: CudaSlice<u32>,
+    h_input: PinnedHostSlice<u32>,
+    h_output: PinnedHostSlice<u32>,
 }
-/// Un lot de blobs envoye au GPU, a lire apres `OreGpu::wait` et a rendre par `OreGpu::finish`.
+/// A batch of blobs sent to the GPU, to read after `OreGpu::wait` and to return through
+/// `OreGpu::finish`.
 pub struct OreJob {
-    res: Option<RessourcesMinerais>,
-    /// Premiere rangee de chaque blob, et le total a la fin
-    rangees: Vec<usize>,
-    attendu: bool,
+    res: Option<OreResources>,
+    /// First row of each blob, and the total at the end
+    rows: Vec<usize>,
+    expected: bool,
     ok: bool,
-    /// Le retour lu, une fois attendu (adresse et longueur) : `as_slice` est un appel au pilote
-    vue: (usize, usize),
+    /// The readback, once waited for (address and length): `as_slice` is a driver call
+    view: (usize, usize),
 }
 impl Drop for OreJob {
     fn drop(&mut self) {
-        // Les copies du flux ecrivent dans ces tampons : ils ne sont liberes qu'apres elles
+        // The stream's copies write into these buffers: they are only released after them
         if let Some(r) = &self.res
-            && !self.attendu
+            && !self.expected
         {
             let _ = r.st.synchronize();
         }
@@ -1950,81 +1960,81 @@ impl std::fmt::Debug for OreGpu {
 }
 impl Drop for OreGpu {
     fn drop(&mut self) {
-        let n = self.stats.lots.load(Relaxed);
+        let n = self.stats.batches.load(Relaxed);
         if n > 0 {
             eprintln!(
-                "GPU minerais : {n} lots, {} blobs par lot, envoi {} us, attente {} us par lot ; {} features repassees par le CPU, {} blobs en erreur, {} ecarts au CPU (mode test)",
+                "GPU ores: {n} batches, {} blobs per batch, upload {} us, wait {} us per batch; {} features fell back to the CPU, {} blobs failed, {} mismatches with the CPU (test mode)",
                 self.stats.blobs.load(Relaxed) / n,
-                self.stats.ns_envoi.load(Relaxed) / n / 1000,
-                self.stats.ns_attente.load(Relaxed) / n / 1000,
-                self.stats.replis.load(Relaxed),
-                self.stats.erreurs.load(Relaxed),
-                self.stats.ecarts.load(Relaxed),
+                self.stats.ns_send.load(Relaxed) / n / 1000,
+                self.stats.ns_wait.load(Relaxed) / n / 1000,
+                self.stats.fallbacks.load(Relaxed),
+                self.stats.errors.load(Relaxed),
+                self.stats.mismatches.load(Relaxed),
             );
         }
     }
 }
 impl OreGpu {
     pub fn new() -> Result<Self, String> {
-        let ctx = contexte()?;
-        let (maj, min) = ctx.compute_capability().ctx("capacite du GPU")?;
-        let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
+        let ctx = context()?;
+        let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
+        let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
         let module = ctx
-            .load_module(ptx(include_str!("minerais.cu"), arch)?)
-            .ctx("module des minerais")?;
-        let k_blobs = module.load_function("kmin_blobs").ctx("kmin_blobs")?;
+            .load_module(ptx(include_str!("ores.cu"), arch)?)
+            .ctx("ore module")?;
+        let k_blobs = module.load_function("kore_blobs").ctx("kore_blobs")?;
         Ok(Self {
             ctx,
             _module: module,
             k_blobs,
             pool: Mutex::new(Vec::new()),
-            stats: StatsMinerais::default(),
+            stats: OreStats::default(),
         })
     }
-    /// Une feature planifiee est repassee par le CPU.
+    /// A planned feature fell back to the CPU.
     pub fn note_cpu_fallback(&self) {
-        self.stats.replis.fetch_add(1, Relaxed);
+        self.stats.fallbacks.fetch_add(1, Relaxed);
     }
-    /// Mode test : un blob dont les cellules different de celles du CPU.
+    /// Test mode: a blob whose cells differ from the CPU's.
     pub fn note_mismatch(&self) {
-        self.stats.ecarts.fetch_add(1, Relaxed);
+        self.stats.mismatches.fetch_add(1, Relaxed);
     }
-    fn ressource(&self, besoin: [usize; 3]) -> Result<RessourcesMinerais, String> {
+    fn resource(&self, needed: [usize; 3]) -> Result<OreResources, String> {
         let mut pool = self.pool.lock().unwrap();
-        if let Some(k) = pool.iter().position(|r| (0..3).all(|i| r.cap[i] >= besoin[i])) {
+        if let Some(k) = pool.iter().position(|r| (0..3).all(|i| r.cap[i] >= needed[i])) {
             return Ok(pool.swap_remove(k));
         }
-        // Trop petites (ou aucune) : une plus grande remplace l'une d'elles
-        let ancienne = pool.pop();
+        // Too small (or none): a bigger one replaces one of them
+        let previous = pool.pop();
         drop(pool);
         let cap: [usize; 3] = std::array::from_fn(|i| {
-            let defaut = [256, 8192, 65536][i];
-            besoin[i]
-                .max(defaut)
-                .max(ancienne.as_ref().map_or(0, |r| r.cap[i]))
+            let fallback = [256, 8192, 65536][i];
+            needed[i]
+                .max(fallback)
+                .max(previous.as_ref().map_or(0, |r| r.cap[i]))
                 .next_power_of_two()
         });
-        let st = match ancienne {
+        let st = match previous {
             Some(r) => r.st.clone(),
-            None => self.ctx.new_stream().ctx("flux CUDA")?,
+            None => self.ctx.new_stream().ctx("CUDA stream")?,
         };
         let [b, s, m] = cap;
-        Ok(RessourcesMinerais {
-            entree: st.alloc_zeros::<u32>(8 * b + 8 * s).ctx("blobs")?,
-            sortie: st.alloc_zeros::<u32>(b + m).ctx("rangees")?,
-            h_entree: unsafe { self.ctx.alloc_pinned_with_flags::<u32>(8 * b + 8 * s, 0) }
-                .ctx("tampon hote")?,
-            h_sortie: unsafe { self.ctx.alloc_pinned_with_flags::<u32>(b + m, 0) }
-                .ctx("tampon hote")?,
+        Ok(OreResources {
+            input: st.alloc_zeros::<u32>(8 * b + 8 * s).ctx("blobs")?,
+            output: st.alloc_zeros::<u32>(b + m).ctx("rows")?,
+            h_input: unsafe { self.ctx.alloc_pinned_with_flags::<u32>(8 * b + 8 * s, 0) }
+                .ctx("host buffer")?,
+            h_output: unsafe { self.ctx.alloc_pinned_with_flags::<u32>(b + m, 0) }
+                .ctx("host buffer")?,
             st,
             cap,
         })
     }
-    /// Envoie les blobs d'un chunk ; le calcul et le retour se font sur un flux a part.
+    /// Sends the blobs of a chunk; the computation and the readback happen on a separate stream.
     pub fn submit(&self, blobs: &[OreBlob], spheres: &[[f64; 4]]) -> Result<OreJob, String> {
         let t = Instant::now();
         let nb = blobs.len();
-        let mut rangees = Vec::with_capacity(nb + 1);
+        let mut rows = Vec::with_capacity(nb + 1);
         let mut total = 0usize;
         for b in blobs {
             if b.size_xz <= 0
@@ -2035,111 +2045,112 @@ impl OreGpu {
             {
                 return Err("blob hors limites".into());
             }
-            rangees.push(total);
+            rows.push(total);
             total += (b.size_xz * b.size_y) as usize;
         }
-        rangees.push(total);
+        rows.push(total);
         if nb == 0 {
             return Ok(OreJob {
                 res: None,
-                rangees,
-                attendu: true,
+                rows,
+                expected: true,
                 ok: true,
-                vue: (0, 0),
+                view: (0, 0),
             });
         }
-        let mut res = self.ressource([nb, spheres.len(), total])?;
-        let (n_entree, n_sortie) = (8 * nb + 8 * spheres.len(), nb + total);
+        let mut res = self.resource([nb, spheres.len(), total])?;
+        let (n_input, n_output) = (8 * nb + 8 * spheres.len(), nb + total);
         {
-            let h = res.h_entree.as_mut_slice().ctx("tampon hote")?;
-            let (tetes, reste) = h.split_at_mut(4 * nb);
-            let (debuts, sp) = reste.split_at_mut(4 * nb);
+            let h = res.h_input.as_mut_slice().ctx("host buffer")?;
+            let (heads, rest) = h.split_at_mut(4 * nb);
+            let (starts, sp) = rest.split_at_mut(4 * nb);
             for (i, b) in blobs.iter().enumerate() {
-                tetes[4 * i..4 * i + 4].copy_from_slice(&[
+                heads[4 * i..4 * i + 4].copy_from_slice(&[
                     b.first,
                     b.count,
-                    rangees[i] as u32,
+                    rows[i] as u32,
                     (b.size_xz | (b.size_y << 8)) as u32,
                 ]);
-                debuts[4 * i..4 * i + 4].copy_from_slice(&[
+                starts[4 * i..4 * i + 4].copy_from_slice(&[
                     b.start[0] as u32,
                     b.start[1] as u32,
                     b.start[2] as u32,
                     0,
                 ]);
             }
-            // Les doubles en petit-boutiste, comme sur le GPU
-            for (mots, v) in sp.chunks_exact_mut(2).zip(spheres.iter().flatten()) {
+            // The doubles in little-endian, as on the GPU
+            for (words, v) in sp.chunks_exact_mut(2).zip(spheres.iter().flatten()) {
                 let b = v.to_bits();
-                mots[0] = b as u32;
-                mots[1] = (b >> 32) as u32;
+                words[0] = b as u32;
+                words[1] = (b >> 32) as u32;
             }
         }
         let st = res.st.clone();
         st.memcpy_htod(
-            &res.h_entree.as_slice().ctx("tampon hote")?[..n_entree],
-            &mut res.entree.slice_mut(0..n_entree),
+            &res.h_input.as_slice().ctx("host buffer")?[..n_input],
+            &mut res.input.slice_mut(0..n_input),
         )
-        .ctx("envoi des blobs")?;
+        .ctx("blob upload")?;
         let nbi = nb as i32;
         let mut l = st.launch_builder(&self.k_blobs);
-        l.arg(&res.entree).arg(&mut res.sortie).arg(&nbi);
+        l.arg(&res.input).arg(&mut res.output).arg(&nbi);
         let cfg = LaunchConfig {
             grid_dim: (nb as u32, 1, 1),
             block_dim: (128, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { l.launch(cfg) }.ctx("blobs de minerai")?;
+        unsafe { l.launch(cfg) }.ctx("ore blobs")?;
         st.memcpy_dtoh(
-            &res.sortie.slice(0..n_sortie),
-            &mut res.h_sortie.as_mut_slice().ctx("tampon hote")?[..n_sortie],
+            &res.output.slice(0..n_output),
+            &mut res.h_output.as_mut_slice().ctx("host buffer")?[..n_output],
         )
-        .ctx("retour des rangees")?;
-        self.stats.lots.fetch_add(1, Relaxed);
+        .ctx("row readback")?;
+        self.stats.batches.fetch_add(1, Relaxed);
         self.stats.blobs.fetch_add(nb as u64, Relaxed);
-        self.stats.ns_envoi.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        self.stats.ns_send.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         Ok(OreJob {
             res: Some(res),
-            rangees,
-            attendu: false,
+            rows,
+            expected: false,
             ok: true,
-            vue: (0, 0),
+            view: (0, 0),
         })
     }
-    /// Attend le lot (une fois) ; `false` si le GPU a echoue (le lot repasse alors par le CPU).
+    /// Waits for the batch (once); `false` if the GPU failed (the batch then falls back to the
+    /// CPU).
     pub fn wait(&self, job: &mut OreJob) -> bool {
-        if !job.attendu {
+        if !job.expected {
             let t = Instant::now();
             job.ok = job.res.as_ref().is_some_and(|r| r.st.synchronize().is_ok());
             if job.ok
-                && let Some(s) = job.res.as_ref().and_then(|r| r.h_sortie.as_slice().ok())
+                && let Some(s) = job.res.as_ref().and_then(|r| r.h_output.as_slice().ok())
             {
-                job.vue = (s.as_ptr() as usize, s.len());
+                job.view = (s.as_ptr() as usize, s.len());
             } else {
                 job.ok = false;
             }
-            job.attendu = true;
-            self.stats.ns_attente.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+            job.expected = true;
+            self.stats.ns_wait.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         }
         job.ok
     }
-    /// Les rangees du blob `i` d'un lot attendu (rangee `x * size_y + y`, bit z), ou None si le blob
-    /// est en erreur (une cellule hors de sa boite) ou le lot pas attendu.
+    /// The rows of blob `i` of a waited batch (row `x * size_y + y`, bit z), or None if the blob
+    /// failed (a cell outside its box) or the batch was not waited for.
     pub fn rows<'a>(&self, job: &'a OreJob, i: usize) -> Option<&'a [u32]> {
-        if !job.attendu || !job.ok {
+        if !job.expected || !job.ok {
             return None;
         }
         job.res.as_ref()?;
-        // Le tampon du lot, lu par `wait` : il vit tant que le lot
-        let sortie = unsafe { std::slice::from_raw_parts(job.vue.0 as *const u32, job.vue.1) };
-        let nb = job.rangees.len() - 1;
-        if *sortie.get(i)? != 0 {
-            self.stats.erreurs.fetch_add(1, Relaxed);
+        // The batch's buffer, read by `wait`: it lives as long as the batch
+        let output = unsafe { std::slice::from_raw_parts(job.view.0 as *const u32, job.view.1) };
+        let nb = job.rows.len() - 1;
+        if *output.get(i)? != 0 {
+            self.stats.errors.fetch_add(1, Relaxed);
             return None;
         }
-        sortie.get(nb + job.rangees[i]..nb + *job.rangees.get(i + 1)?)
+        output.get(nb + job.rows[i]..nb + *job.rows.get(i + 1)?)
     }
-    /// Rend les tampons d'un lot, apres l'avoir attendu s'il ne l'a pas ete.
+    /// Returns the buffers of a batch, after waiting for it if not done yet.
     pub fn finish(&self, mut job: OreJob) {
         self.wait(&mut job);
         if job.ok

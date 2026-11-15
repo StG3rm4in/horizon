@@ -897,7 +897,7 @@ impl GpuLighting {
             match horizon_gpu::LightGpu::new(info, masks, types, sections) {
                 Ok(g) => Some(Arc::new(g)),
                 Err(e) => {
-                    log::error!("GPU lumiere : pas de lumiere sur GPU : {e}");
+                    log::error!("GPU light: no light on the GPU: {e}");
                     None
                 }
             }

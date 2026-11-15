@@ -28,11 +28,11 @@ fn planned_carvers_carve_the_same_cells() {
                         .unwrap();
                     let mut b = CarvingMask::new(-63, 312).unwrap();
                     carver.execute(context, &planned, target, &mut b).unwrap();
-                    assert_eq!(a.words(), b.words(), "graine {seed}, cible {target:?}");
+                    assert_eq!(a.words(), b.words(), "seed {seed}, target {target:?}");
                     cells += a.words().iter().map(|w| u64::from(w.count_ones())).sum::<u64>();
                 }
             }
         }
     }
-    assert!(cells > 100_000, "{cells} cellules");
+    assert!(cells > 100_000, "{cells} cells");
 }

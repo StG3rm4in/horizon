@@ -1,77 +1,77 @@
-# Avancée de `/pregen`
+# `/pregen` progress
 
-## Le constat
+## The finding
 
-Avec tout sur GPU (densité, aquifères, beardifier, surface, minerais, grottes, lumière), `/pregen`
-n'occupe plus que 8 à 9 cœurs sur 12. La trace `HORIZON_PREGEN_TRACE=1` (moyenne de chaque étape sur
-une seconde dans latest.log, `game/commands/pregen.rs`) montre, sur une zone de 201 × 201 chunks :
+With everything on the GPU (density, aquifers, beardifier, surface, ores, caves, light), `/pregen`
+only keeps 8 to 9 cores busy out of 12. The `HORIZON_PREGEN_TRACE=1` trace (average of each step over
+one second in latest.log, `game/commands/pregen.rs`) shows, on a zone of 201 × 201 chunks:
 
-| Mesure | Valeur |
+| Measure | Value |
 |---|---|
-| File des workers vide | 28 à 57 % des mises à jour |
-| Décorations en cours | 5,5 en moyenne (limite : 2 par worker, 24) |
-| Générations en cours | 15 à 20 (limite : 3 par worker, 36) |
-| Lumières en cours | 4 à 8 |
+| Worker queue empty | 28 to 57% of the updates |
+| Decorations in flight | 5.5 on average (limit: 2 per worker, 24) |
+| Generations in flight | 15 to 20 (limit: 3 per worker, 36) |
+| Lights in flight | 4 to 8 |
 
-## Pourquoi
+## Why
 
-`/pregen` balaie la zone par bandes de colonnes (jusqu'à 256 de large) sur quelques rangées (au moins
-1 024 chunks : 6 rangées ici). `Streaming::set_band` donne aux chunks de la bande leur rang de
-décoration rangée par rangée, colonne après colonne, pour que l'ordre ne dépende pas du minutage.
+`/pregen` sweeps the zone in bands of columns (up to 256 wide) over a few rows (at least 1,024
+chunks: 6 rows here). `Streaming::set_band` gives the chunks of the band their decoration rank row by
+row, column after column, so that the order does not depend on timing.
 
-Or un chunk n'est décoré qu'une fois décorés tous les chunks de rang inférieur à moins de deux de lui
-(`DecorationOrder::blocked` : leurs régions d'écriture se recouvrent). Colonne après colonne, chaque
-chunk attend celui de sa gauche : une rangée se décore en série, et seules les 5 ou 6 rangées de la
-bande avancent ensemble.
+But a chunk is only decorated once all the chunks of lower rank less than two away from it are
+decorated (`DecorationOrder::blocked`: their write regions overlap). Column after column, each chunk
+waits for the one on its left: a row is decorated serially, and only the 5 or 6 rows of the band move
+forward together.
 
-## Le changement
+## The change
 
-Par défaut depuis le 15/11 (`HORIZON_PREGEN_ORDER=rows` pour l ancien ordre) : chaque rangée en trois passes, une colonne sur trois à chaque passe.
-Deux chunks à trois colonnes l'un de l'autre n'ont pas de région d'écriture commune, ni de chunk de
-leurs 3 × 3 en commun : une passe décore jusqu'à 67 chunks à la fois sur 201 colonnes. L'ordre reste
-fixé par la géométrie de la bande, indépendant du minutage.
+The default since 15/11 (`HORIZON_PREGEN_ORDER=rows` for the old order): each row in three passes,
+one column out of three in each pass. Two chunks three columns apart have no common write region, nor
+any common chunk in their 3 × 3: a pass decorates up to 67 chunks at once over 201 columns. The order
+stays fixed by the geometry of the band, independent of timing.
 
-Le monde ne change pas de qualité, mais pas non plus à l'identique : là où les décorations de chunks
-voisins se recouvrent (arbres, filons, sculk aux bords), l'ordre décide de ce qui passe en premier.
-Aucun des deux ordres n'est celui de vanilla, qui n'a pas de prégénération (l'ordre de vanilla autour
-d'un joueur, `DecorationOrder::reassign`, n'est pas touché).
+The world does not change in quality, but not identically either: where the decorations of
+neighbouring chunks overlap (trees, veins, sculk at the edges), the order decides what goes first.
+Neither order is vanilla's, which has no pregeneration (vanilla's order around a player,
+`DecorationOrder::reassign`, is untouched).
 
-## Mesures
+## Measurements
 
-Trace (serveur compilé dans parity-target, même zone neuve 1550000/−1570000) :
+Trace (server built in parity-target, same fresh zone 1550000/−1570000):
 
-| Ordre | Débit | File vide | Décorations | Générations |
+| Order | Throughput | Empty queue | Decorations | Generations |
 |---|---|---|---|---|
-| colonne après colonne | 1 260 chunks/s | 28 à 39 % | 5,5 | 18 |
-| trois passes | 1 380 chunks/s (+9,5 %) | 4 à 8 % | 6 à 12 | 29 à 30 |
+| column after column | 1,260 chunks/s | 28 to 39% | 5.5 | 18 |
+| three passes | 1,380 chunks/s (+9.5%) | 4 to 8% | 6 to 12 | 29 to 30 |
 
-Bancs release (`/tmp/ab14.sh`, rayon 1 600 blocs, zones neuves, tout sur GPU) :
+Release benches (`/tmp/ab14.sh`, radius 1,600 blocks, fresh zones, everything on the GPU):
 
-| Zone | Colonne après colonne | Trois passes | Cœurs occupés |
+| Zone | Column after column | Three passes | Busy cores |
 |---|---|---|---|
-| 1600000/−1620000 | 1 305 chunks/s | 1 386 (+6,2 %) | 8,6 → 9,4 |
-| −1630000/1640000 | 1 386 chunks/s | 1 635 (+18,0 %) | 7,6 → 9,4 |
-| 1650000/−1670000 | 1 303 chunks/s | 1 344 (+3,2 %) | 8,7 → 9,3 |
+| 1600000/−1620000 | 1,305 chunks/s | 1,386 (+6.2%) | 8.6 → 9.4 |
+| −1630000/1640000 | 1,386 chunks/s | 1,635 (+18.0%) | 7.6 → 9.4 |
+| 1650000/−1670000 | 1,303 chunks/s | 1,344 (+3.2%) | 8.7 → 9.3 |
 
-Le temps CPU par chunk monte de 4 à 6 % : plus de cœurs travaillent en même temps sur une machine à une
-seule barrette de mémoire. Plus de workers (`HORIZON_WORKER_THREADS=14` ou `16`, `/tmp/ab15.sh`)
-n'apporte rien de net (−2,6 à +2,7 %).
+The CPU time per chunk rises by 4 to 6%: more cores work at the same time on a machine with a single
+memory stick. More workers (`HORIZON_WORKER_THREADS=14` or `16`, `/tmp/ab15.sh`) bring nothing clear
+(−2.6 to +2.7%).
 
-## Reproductibilité
+## Reproducibility
 
-`/tmp/cmp_regions.py` et `/tmp/cmp_blocs.py` comparent les chunks que deux mondes ont sauvegardés.
-Même zone de 51 × 51 chunks, générée deux fois (12 puis 5 workers) :
+`/tmp/cmp_regions.py` and `/tmp/cmp_blocs.py` compare the chunks two worlds saved. Same zone of
+51 × 51 chunks, generated twice (12 then 5 workers):
 
-| Ordre | Chunks aux blocs différents | Aux biomes différents |
+| Order | Chunks with different blocks | With different biomes |
 |---|---|---|
-| colonne après colonne | 3 sur 2 601 | 0 |
-| trois passes | 1 sur 2 601 | 0 |
+| column after column | 3 out of 2,601 | 0 |
+| three passes | 1 out of 2,601 | 0 |
 
-Les quelques écarts, et ceux des entités de bloc (graines de butin, compteurs) et des ticks planifiés,
-existaient déjà : `/pregen` fait tourner les ticks du serveur pendant la génération, et les fluides
-planifiés s'écoulent plus ou moins selon le temps que les chunks restent chargés.
+The few mismatches, and those of the block entities (loot seeds, counters) and of the scheduled
+ticks, already existed: `/pregen` runs the server ticks during generation, and the scheduled fluids
+flow more or less depending on how long the chunks stay loaded.
 
-## Correction du 15/11
+## Correction of 15/11
 
-Le débit était déjà limité par le CPU : « 8 à 9 cœurs sur 12 » compte des threads logiques, et le
-10600K n'a que 6 cœurs physiques. Voir DEBIT.md.
+The throughput was already limited by the CPU: "8 to 9 cores out of 12" counts logical threads, and
+the 10600K only has 6 physical cores. See THROUGHPUT.md.

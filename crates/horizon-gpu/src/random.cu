@@ -1,5 +1,5 @@
-// Generateur Xoroshiro128++ de Horizon, operation par operation.
-// Xoroshiro128++ et XoroshiroPositionalRandom::at
+// Horizon's Xoroshiro128++ generator, operation by operation.
+// Xoroshiro128++ and XoroshiroPositionalRandom::at
 __device__ __forceinline__ unsigned long long aq_rotl(unsigned long long x, int k) { return (x << k) | (x >> (64 - k)); }
 __device__ __forceinline__ unsigned long long aq_next_long(unsigned long long &lo, unsigned long long &hi) {
   unsigned long long l = lo, h = hi ^ l;
@@ -10,20 +10,20 @@ __device__ __forceinline__ unsigned long long aq_next_long(unsigned long long &l
 }
 __device__ __forceinline__ int aq_next_int_bound(unsigned long long &lo, unsigned long long &hi, int bound) {
   unsigned int b = (unsigned int)bound;
-  unsigned int seuil = (0u - b) % b;
+  unsigned int threshold = (0u - b) % b;
   while (true) {
     unsigned long long p = (unsigned long long)(unsigned int)aq_next_long(lo, hi) * (unsigned long long)b;
-    if ((unsigned int)p >= seuil) return (int)(p >> 32);
+    if ((unsigned int)p >= threshold) return (int)(p >> 32);
   }
 }
-// Mth.getSeed (position_seed de Horizon), arithmetique Java signee
+// Mth.getSeed (Horizon's position_seed), signed Java arithmetic
 __device__ __forceinline__ long long aq_position_seed(int x, int y, int z) {
   long long m = (long long)(int)((unsigned)x * 3129871u) ^ (long long)((unsigned long long)(long long)z * 116129781ull) ^ (long long)y;
   unsigned long long u = (unsigned long long)m;
   unsigned long long r = u * u * 42317861ull + u * 11ull;
   return ((long long)r) >> 16;
 }
-// Tirages de Xoroshiro (RandomSource de Horizon) et fabrique positionnelle : etat de at(x, y, z)
+// Xoroshiro draws (Horizon's RandomSource) and positional random factory: state of at(x, y, z)
 __device__ __forceinline__ float aq_next_float(unsigned long long &lo, unsigned long long &hi) {
   return (float)(aq_next_long(lo, hi) >> 40) * 5.9604644775390625e-8f;
 }
