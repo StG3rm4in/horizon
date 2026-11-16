@@ -159,8 +159,7 @@ impl std::fmt::Debug for CaveGpu {
 impl Drop for CaveGpu {
     fn drop(&mut self) {
         let s = &self.stats;
-        let n = s.batches.load(Relaxed);
-        if n > 0 {
+        if let Some(n) = std::num::NonZero::new(s.batches.load(Relaxed)) {
             eprintln!(
                 "GPU caves: {n} batches, {} elements and {} cells carved per batch (max {}), upload {} us, wait {} us per batch; {} with the GPU aquifer; {} chunks fell back to the CPU, {} batches failed; mismatches with the CPU (test mode): {} masks, {} substances",
                 s.elements.load(Relaxed) / n,
@@ -272,7 +271,7 @@ impl CaveGpu {
         let st = res.st.clone();
         {
             let h = res.h_input.as_mut_slice().ctx("host buffer")?;
-            for (m, it) in h[..ni].chunks_exact_mut(16).zip(items) {
+            for (m, it) in h[..ni].as_chunks_mut::<16>().0.iter_mut().zip(items) {
                 m.copy_from_slice(&it.words());
             }
             for (m, w) in h[ni..e].iter_mut().zip(widths.chunks(2)) {

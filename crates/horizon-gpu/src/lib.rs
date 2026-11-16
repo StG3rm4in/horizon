@@ -652,7 +652,7 @@ impl Engine {
         match self.inner_chunk(cx, cz, out) {
             Ok(()) => {
                 let n = self.stats.chunks.load(Relaxed);
-                if n.is_power_of_two() && n >= 1024 || n % 65536 == 0 {
+                if n.is_power_of_two() && n >= 1024 || n.is_multiple_of(65536) {
                     self.journal();
                 }
                 true
@@ -798,7 +798,7 @@ impl Engine {
                     }
                 }
                 let n = self.stats.chunks.load(Relaxed);
-                if n.is_power_of_two() && n >= 1024 || n % 65536 == 0 {
+                if n.is_power_of_two() && n >= 1024 || n.is_multiple_of(65536) {
                     self.journal();
                 }
                 Some(skip)
@@ -1904,8 +1904,7 @@ struct Regions {
 }
 impl Drop for SurfaceGpu {
     fn drop(&mut self) {
-        let n = self.stats.chunks.load(Relaxed);
-        if n > 0 {
+        if let Some(n) = std::num::NonZero::new(self.stats.chunks.load(Relaxed)) {
             eprintln!(
                 "GPU surface: {n} chunks ({} us per call on average), {} CPU fallbacks; compact sections: {} chunks, {} through raw states, {} mismatches with the CPU (test mode)",
                 self.stats.ns.load(Relaxed) / n / 1000,
@@ -2442,8 +2441,7 @@ impl std::fmt::Debug for OreGpu {
 }
 impl Drop for OreGpu {
     fn drop(&mut self) {
-        let n = self.stats.batches.load(Relaxed);
-        if n > 0 {
+        if let Some(n) = std::num::NonZero::new(self.stats.batches.load(Relaxed)) {
             eprintln!(
                 "GPU ores: {n} batches, {} blobs per batch, upload {} us, wait {} us per batch; {} features fell back to the CPU, {} blobs failed, {} mismatches with the CPU (test mode)",
                 self.stats.blobs.load(Relaxed) / n,
@@ -2564,7 +2562,12 @@ impl OreGpu {
                 ]);
             }
             // The doubles in little-endian, as on the GPU
-            for (words, v) in sp.chunks_exact_mut(2).zip(spheres.iter().flatten()) {
+            for (words, v) in sp
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(spheres.iter().flatten())
+            {
                 let b = v.to_bits();
                 words[0] = b as u32;
                 words[1] = (b >> 32) as u32;

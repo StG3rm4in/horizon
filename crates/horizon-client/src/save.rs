@@ -5750,8 +5750,8 @@ mod tests {
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
                 let y = -64 + i / 256;
-                if y < ground || (y < ground + 30 && seed % 11 == 0) {
-                    let state = if seed % 5 == 0 {
+                if y < ground || (y < ground + 30 && seed.is_multiple_of(11)) {
+                    let state = if seed.is_multiple_of(5) {
                         (seed % states) as u32
                     } else {
                         (seed % 60) as u32

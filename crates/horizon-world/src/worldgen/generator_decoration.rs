@@ -133,7 +133,7 @@ impl FeatureTimes {
     ) {
         use std::sync::atomic::Ordering::Relaxed;
         let n = self.chunks.fetch_add(1, Relaxed) + 1;
-        if n % 10_000 != 0 {
+        if !n.is_multiple_of(10_000) {
             return;
         }
         let total = self.stages[0].load(Relaxed).max(1) as f64;
@@ -170,7 +170,7 @@ impl FeatureTimes {
         {
             rows.push((self.stages[k + 1].load(Relaxed), n, n, name.to_string()));
         }
-        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.0));
         let mut out = format!(
             "feature times: {n} chunks, decorate {:.0} us per chunk",
             total / n as f64 / 1000.0

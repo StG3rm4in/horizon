@@ -294,9 +294,9 @@ struct Plan {
 }
 
 impl LightGpu {
-    /// `info`: the light info of each state (`emission << 16 | type << 4 | attenuation`); `masks[a
-    /// * types + b]`: the directions where the faces of types a and b block the light; `sections`:
-    /// sections of a column.
+    /// `info`: the light info of each state (`emission << 16 | type << 4 | attenuation`);
+    /// `masks[a * types + b]`: the directions where the faces of types a and b block the light;
+    /// `sections`: sections of a column.
     pub fn new(info: &[u32], masks: &[u8], types: usize, sections: usize) -> Result<Self, String> {
         if masks.len() != types * types || info.is_empty() || !(1..=254).contains(&sections) {
             return Err("light tables".into());
@@ -440,7 +440,7 @@ impl LightGpu {
         present: u16,
         fill: impl FnOnce(&mut [u64]) -> Option<usize>,
     ) -> Result<LightJob, String> {
-        if h == 0 || h % 16 != 0 || h > 16 * self.nsec {
+        if h == 0 || !h.is_multiple_of(16) || h > 16 * self.nsec {
             return Err("light height".into());
         }
         self.launch(
@@ -463,7 +463,7 @@ impl LightGpu {
         info: &[u32],
         inputs: &[LightInput<'_, S>],
     ) -> Result<LightJob, String> {
-        if h == 0 || h % 16 != 0 || h > 16 * self.nsec {
+        if h == 0 || !h.is_multiple_of(16) || h > 16 * self.nsec {
             return Err("light height".into());
         }
         let nsh = h / 16;
@@ -832,7 +832,7 @@ impl LightGpu {
         self.stats
             .ns_send
             .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-        if n.is_power_of_two() && n >= 1024 || n % 65536 == 0 {
+        if n.is_power_of_two() && n >= 1024 || n.is_multiple_of(65536) {
             log::info!("{}", self.summary());
         }
         Ok(LightJob {

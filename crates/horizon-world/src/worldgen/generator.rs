@@ -3635,7 +3635,7 @@ where
             );
         }
         if n.is_power_of_two()
-            || n % 256 == 0
+            || n.is_multiple_of(256)
             || std::env::var_os("HORIZON_GPU_SURFACE_BIOMES").is_some()
         {
             eprintln!(

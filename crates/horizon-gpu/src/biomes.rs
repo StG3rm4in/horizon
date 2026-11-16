@@ -83,8 +83,7 @@ impl std::fmt::Debug for BiomeGpu {
 impl Drop for BiomeGpu {
     fn drop(&mut self) {
         let s = &self.stats;
-        let n = s.regions.load(Relaxed);
-        if n > 0 {
+        if let Some(n) = std::num::NonZero::new(s.regions.load(Relaxed)) {
             eprintln!(
                 "GPU biomes: {n} regions of {r} x {r} chunks, {} us per region (max {}); {} chunks from the GPU, {} by the CPU; {} regions failed; test mode: {} chunks compared, {} mismatches",
                 s.ns.load(Relaxed) / n / 1000,
