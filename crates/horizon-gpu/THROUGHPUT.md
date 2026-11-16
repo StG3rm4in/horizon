@@ -198,3 +198,31 @@ and the parity finds 0 differences.
 
 The game binary is now built from `horizon-game`: `cargo build --release -p horizon-game --bin
 horizon-client -p horizon-server`.
+
+## The scheduling thread (16/11)
+
+The thread that schedules the chunks (the server's main thread) took 10.7% of the CPU under
+`/pregen` (call-graph profile after the merge, `~/bancs/perfg-merge.data`): `Game::update_world`
+8.6%, of it `Streaming::complete_commit` 5.1% (`DecorationOrder::blocked` 2.0%, `rank` 0.9%), the
+plan updates 2.5%; the server tick itself 2.1%. Counted with uprobes (`/tmp/calls1.sh`, bpftrace on
+`update_world` and `complete_commit`), it ran **3,300 passes a second**, about 250 us of CPU each,
+for 0.85 of a core: `pump_chunks` waits for one job result (at most 5 ms) and runs `update_world`,
+which rescans every proto chunk the streamer holds, for each result.
+
+`pump_chunks` now leaves at least `HORIZON_PUMP_GAP_US` (1 ms by default) between two passes; the
+results that come back in between wait in the channel, and `Streaming::update` takes them all. The
+decoration order does not depend on when a pass runs (`DecorationOrder::blocked` holds a chunk back
+while a lower-ranked one within two of it is pending, in flight included).
+
+`/tmp/ab26.sh` with the variants `gapN` (the same bench build, `HORIZON_PUMP_GAP_US=N`), two fresh
+zones, the three copies:
+
+| Gap | CPU per chunk, 5950000/−5970000 | −5980000/5990000 | Throughput |
+|---|---|---|---|
+| 0 (a pass per result) | 4.20 ms | 3.14 ms | 2,038 / 2,470 chunks/s |
+| 1 ms | 3.97 ms (−5.5%) | 2.95 ms (−6.1%) | 2,050 / 2,470 |
+| 2 ms | 3.94 ms (−6.2%) | 2.93 ms (−6.7%) | 2,037 / 2,403 |
+
+At 1 ms the thread runs 516 passes a second and takes 0.45 of a core instead of 0.85. The
+throughput does not move: the scheduling thread's CPU was not what held `/pregen` back, and the
+workers do not take the core it leaves (the process uses about 7.4 of the 12 logical CPUs).

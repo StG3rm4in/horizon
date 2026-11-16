@@ -286,6 +286,8 @@ impl Game<'_> {
         // A viewed area's chunks (arismoko/horizon#3716) as the forced ones.
         let players = !paused && self.spawn_wait.is_empty();
         let viewed = self.viewed_level(self.dim).is_some();
+        let gap = pump_gap();
+        let mut last: Option<Instant> = None;
         while self.pregen_runs_here()
             || ((players || viewed || !self.streaming.forced.is_empty()) && self.streaming.busy())
         {
@@ -295,7 +297,18 @@ impl Game<'_> {
             }
             self.streaming
                 .wait((until - now).min(Duration::from_millis(5)));
+            // Each pass rescans every proto chunk the streamer holds: a pass per job result ran
+            // ~3,300 times a second under /pregen, ~250 us each. The results that come back within
+            // the gap wait in the channel and the next pass takes them all.
+            if let Some(last) = last {
+                let rest = gap.saturating_sub(last.elapsed());
+                let left = until.saturating_duration_since(Instant::now());
+                if !rest.is_zero() {
+                    std::thread::sleep(rest.min(left));
+                }
+            }
             self.update_world();
+            last = Some(Instant::now());
         }
     }
 
@@ -317,4 +330,19 @@ impl Game<'_> {
             self.system_message(message);
         }
     }
+}
+
+/// The least time between two passes of `pump_chunks`: 1 ms (`HORIZON_PUMP_GAP_US`, microseconds, 0
+/// for a pass per job result). Under /pregen it took the scheduling thread from 0.85 to 0.45 cores and
+/// the CPU per chunk down by 5.5 to 6 %, the throughput unchanged; 2 ms lost some throughput.
+fn pump_gap() -> Duration {
+    static GAP: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        Duration::from_micros(
+            std::env::var("HORIZON_PUMP_GAP_US")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
+        )
+    })
 }
