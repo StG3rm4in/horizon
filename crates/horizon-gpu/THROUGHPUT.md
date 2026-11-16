@@ -258,3 +258,32 @@ on its own stream (its surface and its readback), which the regions computed ahe
 (8.2 → 10.6 s) by keeping the GPU busier, and the remaining `OnceLock` waits are mostly on the
 surface's regions. What would remove the stream waits is doing the CPU's own work on a chunk while
 its GPU work runs, rather than one after the other.
+
+## Overlapping a chunk's CPU and GPU work: the ceiling (16/11)
+
+A generation job runs its stages one after the other: biomes, structures (references, starts, the
+beardifier), the cave batch sent to the GPU (already asynchronous), the fill (density, block codes
+and surface on the GPU, then a synchronous wait of about 1 ms, then the CPU's writes), the carvers
+(the cave batch's wait, then the mask applied), the heightmaps. The GPU's part of the fill could be
+sent right after the biomes and the structures done while it runs, speculatively without a
+beardifier (about 6% of the chunks have one, and would redo theirs once their structures are
+known).
+
+Waits overlapped inside a job are what more workers give for free, so the worker count bounds what
+such an overlap could bring (`/tmp/ab19.sh`, two fresh zones, `HORIZON_PUMP_GAP_US=1000`):
+
+| Chunk workers | 6250000/−6270000 | −6280000/6290000 | CPU per chunk |
+|---|---|---|---|
+| 11 (default) | 2,622 chunks/s | 2,411 | 2.68 / 3.02 ms |
+| 17 (`worker_threads = 18`) | 2,756 (+5.1%) | 2,547 (+5.7%) | 2.88 / 3.22 ms |
+| 23 | 2,785 (+6.2%) | 2,572 (+6.7%) | 3.05 / 3.38 ms |
+
+Past 17 workers, a sixth more of them adds about 1% while the CPU per chunk keeps rising: the
+hyperthreads share the 6 physical cores, which are close to saturated although only about 8 of the
+12 logical CPUs show busy. Overlapping the GPU wait inside a job would meet the same ceiling, about
+1 to 2% over 17 workers, for an asynchronous chunk API in horizon-gpu, a speculation on the
+beardifier and GPU buffers held across the structure stage: not done. The throughput still comes
+from less CPU per chunk.
+
+At 17 workers too, the scheduling gap of 1 ms holds: against a pass per result, 2,411 → 2,425 and
+2,580 → 2,605 chunks/s, CPU per chunk −4.5 and −3.0%.
