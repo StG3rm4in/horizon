@@ -643,7 +643,7 @@ impl<'r> BlockSection<'r> {
         }
     }
     /// The state at `index`, which must be below 4096 (a `local_index`).
-    #[inline]
+    #[inline(always)]
     pub(crate) fn state(&self, index: usize) -> BlockStateId {
         debug_assert!(index < 4096);
         let id = self.storage.as_ref().map_or(0, |s| s.read(index));
@@ -716,6 +716,46 @@ impl<'r> BlockSection<'r> {
         }
         self.set_slot(index, slot, old_id, state)
             .map(|old| Some((old, state)))
+    }
+    /// The slot of `index`, the palette id it holds and its state, in a section with a word array;
+    /// None in a uniform section.
+    #[inline]
+    pub(crate) fn slot_state(&self, index: usize) -> Option<(Slot, u32, BlockStateId)> {
+        let storage = self.storage.as_ref()?;
+        let slot = storage.slot_of(index);
+        let id = storage.read_at(slot);
+        Some((slot, id, self.palette[id as usize]))
+    }
+    /// [`set`](Self::set) at a slot and id [`slot_state`](Self::slot_state) returned for `index`.
+    /// When `state` is the last state looked up, still live, and the write leaves every palette
+    /// entry live and no count at 4,096, only the word and the two counts change, as `set_slot`
+    /// would change them.
+    #[inline]
+    pub(crate) fn set_at(
+        &mut self,
+        index: usize,
+        slot: Slot,
+        old_id: u32,
+        state: BlockStateId,
+    ) -> io::Result<BlockStateId> {
+        if state.0 as usize >= self.registry.len() {
+            return Err(invalid("state ID outside registry"));
+        }
+        let old = self.palette[old_id as usize];
+        if let Some((seen, id)) = self.last
+            && seen == state
+            && old != state
+            && self.counts[id as usize] != 0
+            && self.counts[id as usize] < 4095
+            && self.counts[old_id as usize] > 1
+            && let Some(storage) = self.storage.as_mut()
+        {
+            storage.write_at(slot, id);
+            self.counts[old_id as usize] -= 1;
+            self.counts[id as usize] += 1;
+            return Ok(old);
+        }
+        self.set_slot(index, slot, old_id, state)
     }
     /// The rest of [`set`](Self::set) in a section with a word array, once the slot of `index` and
     /// the palette id it holds are read.

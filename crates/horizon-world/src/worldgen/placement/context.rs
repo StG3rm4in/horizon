@@ -103,6 +103,18 @@ pub trait PlacementContext {
         }
         Ok(wrote)
     }
+    /// [`replace_row`](Self::replace_row) for a `cell` whose answer depends only on the state it
+    /// is given, which lets a world ask it once per state.
+    fn replace_row_states(
+        &mut self,
+        position: [i32; 3],
+        bits: u32,
+        cell: &mut dyn FnMut(
+            crate::registry::BlockStateId,
+        ) -> Option<crate::registry::BlockStateId>,
+    ) -> Result<bool, PlacementQueryError> {
+        self.replace_row(position, bits, &mut |_, state| cell(state))
+    }
     /// ChunkAccess.setBlockState(pos, state, false) in generation (a
     /// ProtoChunk write with its heightmaps, no neighbour or block-entity
     /// effects), as mods' structure processors write past their template.

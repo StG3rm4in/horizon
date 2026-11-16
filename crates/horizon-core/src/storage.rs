@@ -23,7 +23,7 @@ pub(crate) const MAGIC_LEN: usize = 1 << 14;
 /// so only the x86 targets take the table.
 const MAGIC_BEATS_DIVISION: bool = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
 /// The word and bit shift of entry `i`; exact for `i < MAGIC_LEN`.
-#[inline]
+#[inline(always)]
 pub(crate) fn locate(bits: u8, i: usize) -> (usize, u32) {
     if bits.is_power_of_two() {
         // 64 / bits is a power of two: shifts instead of the multiplication.
@@ -155,7 +155,7 @@ impl PackedStorage {
     }
 
     /// The word and bit shift of an in-range index.
-    #[inline]
+    #[inline(always)]
     fn slot(&self, index: usize) -> (usize, u32) {
         if self.wide || !MAGIC_BEATS_DIVISION {
             (
@@ -185,7 +185,7 @@ impl PackedStorage {
     /// Reads `index` without a bounds check. Callers use this once they hold a
     /// slice length or a section index they have already validated.
     /// `index` must be less than `len`.
-    #[inline]
+    #[inline(always)]
     pub fn read(&self, index: usize) -> u32 {
         debug_assert!(index < self.len);
         let (word, shift) = self.slot(index);

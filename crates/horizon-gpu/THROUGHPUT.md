@@ -152,3 +152,27 @@ Profile (`/tmp/profil_b1.sh`, zone 3850000/−3870000, 1,861 chunks/s with the p
   (`JavaString::from` strings, compounds), about 1.5%.
 - The CUDA driver (`/tmp/sous_gpu.py`) weighs 5.2%: the surface launches (`enqueue`) 1.4%, and the
   light, cave and ore uploads 2.1%.
+
+
+## Dual channel (16/11)
+
+The server now has two 16 GB sticks, one per channel, at 3,600 MT/s (XMP), and new thermal paste.
+Same code as the light cache bench (`/tmp/ab25.sh`, 1,999 to 2,070 chunks/s and 4.01 to 4.20 ms of
+CPU per chunk with 11 workers in single channel). Script `/tmp/ab19.sh`, release, lz4, radius 1,600
+blocks, fresh zones; each setting goes once through each copy:
+
+| Zone | `HORIZON_WORKER_THREADS=5` (4 workers) | default (11 workers) | 15 (14 workers) |
+|---|---|---|---|
+| 4650000/−4670000 | 1,344 chunks/s (−34.1%) | 2,040 | 2,137 (+4.8%) |
+| −4680000/4690000 | 1,498 (−32.8%) | 2,231 | 2,301 (+3.1%) |
+| 4700000/−4720000 | 1,516 (−34.3%) | 2,308 | 2,355 (+2.0%) |
+| CPU per chunk | 2.64 to 2.98 ms | 3.54 to 4.00 ms | 3.63 to 4.09 ms |
+| Busy cores | 3.9 to 4.0 | 7.9 to 8.0 | 8.1 to 8.6 |
+
+- With the default 11 workers: **2,193 chunks/s on average (+7% over single channel), 3.70 ms of CPU
+  per chunk (−8%)**. The zones differ from the single channel ones, so a few percent of that is zone
+  noise.
+- The hyperthreads now pay off: the default gives +51% over 4 workers, against +18% in single
+  channel. In single channel, the threads sharing a core mostly waited for the same memory channel;
+  with two channels, the extra workers add half again as much throughput.
+- The CPU is still the limit: 15 workers only add 2 to 5%.

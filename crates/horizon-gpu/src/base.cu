@@ -132,3 +132,31 @@ __device__ float perlin_get3(const unsigned char *P, const double *O, double x, 
     }
     return lerp3(smooth(p0), smooth(p1), smooth(p2), v);
 }
+
+// ---------- 2D simplex noise (SimplexNoise::get2) ----------
+__device__ __forceinline__ double sf_corner(int g, double p0, double p1, double p2, double rayon) {
+  double att = rayon - p0 * p0 - p1 * p1 - p2 * p2;
+  if (att < 0.0) return 0.0;
+  double sq = att * att;
+  return sq * sq * ((double)GRAD[g][0] * p0 + (double)GRAD[g][1] * p1 + (double)GRAD[g][2] * p2);
+}
+__device__ float sf_simplex2(const unsigned char *P, const double *O, double x, double y) {
+  x = x + O[0];
+  y = y + O[1];
+  double r3 = sqrt(3.0);
+  double bias = 0.5 * (r3 - 1.0);
+  double debias = (3.0 - r3) / 6.0;
+  double dec = (x + y) * bias;
+  int i = floor_i32(x + dec), j = floor_i32(y + dec);
+  double dec2 = (double)(i + j) * debias;
+  double dx = x - ((double)i - dec2), dy = y - ((double)j - dec2);
+  int a = dx > dy ? 1 : 0, b = dx > dy ? 0 : 1;
+  i &= 255;
+  j &= 255;
+#define SF_GRAD(ea, eb) ((int)P[(i + (ea) + (int)P[(j + (eb)) & 255]) & 255] % 12)
+  double first = sf_corner(SF_GRAD(0, 0), dx, dy, 0.0, 0.5);
+  double second = sf_corner(SF_GRAD(a, b), dx - (double)a + debias, dy - (double)b + debias, 0.0, 0.5);
+  double third = sf_corner(SF_GRAD(1, 1), dx - 1.0 + 2.0 * debias, dy - 1.0 + 2.0 * debias, 0.0, 0.5);
+#undef SF_GRAD
+  return (float)(70.0 * (first + second + third));
+}

@@ -623,6 +623,9 @@ impl<'r> BlockSurvivalRegistry<'r> {
         {
             return Ok(true);
         }
+        if let Some(full) = self.fixed_face_full(neighbor, face) {
+            return Ok(full);
+        }
         let shape = self
             .collision
             .collision_shape(world, neighbor, at)
@@ -630,6 +633,13 @@ impl<'r> BlockSurvivalRegistry<'r> {
         SupportType::Full
             .is_supporting(&shape, face)
             .map_err(|error| SurvivalError::Registry(invalid(error.to_string())))
+    }
+    /// `SupportType::Full.is_supporting` of the collision shape of `state` on `face`, when that
+    /// shape is fixed ([`BlockCollisionRegistry::fixed_facts`]); None otherwise (the caller then
+    /// goes the long way, and reports any error).
+    #[inline]
+    fn fixed_face_full(&self, state: BlockStateId, face: Direction) -> Option<bool> {
+        Some(self.collision.fixed_facts(state)? >> face as u8 & 1 != 0)
     }
     fn is_named(&self, state: BlockStateId, name: &str) -> bool {
         self.registry.state(state).unwrap().name == name
@@ -799,13 +809,19 @@ impl<'r> BlockSurvivalRegistry<'r> {
                 if self.snow_override.contains(&neighbor) {
                     return Ok(true);
                 }
-                let shape = self
-                    .collision
-                    .collision_shape(world, neighbor, at)
-                    .map_err(SurvivalError::Collision)?;
-                Ok(SupportType::Full
-                    .is_supporting(&shape, Direction::Up)
-                    .map_err(|error| SurvivalError::Registry(invalid(error.to_string())))?
+                let full = match self.fixed_face_full(neighbor, Direction::Up) {
+                    Some(full) => full,
+                    None => {
+                        let shape = self
+                            .collision
+                            .collision_shape(world, neighbor, at)
+                            .map_err(SurvivalError::Collision)?;
+                        SupportType::Full
+                            .is_supporting(&shape, Direction::Up)
+                            .map_err(|error| SurvivalError::Registry(invalid(error.to_string())))?
+                    }
+                };
+                Ok(full
                     || (self.same_block(neighbor, state)
                         && self
                             .registry
@@ -818,14 +834,20 @@ impl<'r> BlockSurvivalRegistry<'r> {
             Rule::SeaPickle => {
                 let at = relative(position, Direction::Down);
                 let neighbor = self.read(world, at)?;
-                let shape = self
-                    .collision
-                    .collision_shape(world, neighbor, at)
-                    .map_err(SurvivalError::Collision)?;
-                Ok(!shape
-                    .face_shape(Direction::Up)
-                    .map_err(|error| SurvivalError::Registry(invalid(error.to_string())))?
-                    .is_empty()
+                let up_not_empty = match self.collision.fixed_facts(neighbor) {
+                    Some(facts) => facts >> (6 + Direction::Up as u8) & 1 != 0,
+                    None => {
+                        let shape = self
+                            .collision
+                            .collision_shape(world, neighbor, at)
+                            .map_err(SurvivalError::Collision)?;
+                        !shape
+                            .face_shape(Direction::Up)
+                            .map_err(|error| SurvivalError::Registry(invalid(error.to_string())))?
+                            .is_empty()
+                    }
+                };
+                Ok(up_not_empty
                     || self
                         .support
                         .is_face_sturdy(world, neighbor, at, Direction::Up, SupportType::Full)

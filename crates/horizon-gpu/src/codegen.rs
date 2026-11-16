@@ -59,6 +59,42 @@ __device__ __forceinline__ float leaky(float v, float f) { return v > 0.0f ? v :
 __device__ __forceinline__ float signj(float v) { return (v == 0.0f || isnan(v)) ? v : (v > 0.0f ? 1.0f : -1.0f); }
 __device__ __forceinline__ float lerpi(float a, float f, float s) { return __fadd_rn(f, __fmul_rn(a, __fsub_rn(s, f))); }
 __device__ __forceinline__ int fdiv(int a, int b) { int q = a / b; return (a % b != 0 && ((a < 0) != (b < 0))) ? q - 1 : q; }
+
+// EndIslandSampler::density: (height(x / 8, z / 8) - 8) / 128, the outer End islands of a simplex
+// noise; divisions and remainders truncate toward zero, as in Java.
+__device__ __noinline__ float end_islands(const unsigned char *P, const double *O, int bx, int bz) {
+  int x = bx / 8, z = bz / 8;
+  int cx = x / 2, cz = z / 2, lx = x % 2, lz = z % 2;
+  float height = -100.0f;
+  for (int ox = -12; ox <= 12; ++ox) {
+    for (int oz = -12; oz <= 12; ++oz) {
+      long long ix = (long long)(int)((unsigned)cx + (unsigned)ox);
+      long long iz = (long long)(int)((unsigned)cz + (unsigned)oz);
+      if (ix * ix + iz * iz <= 4096LL || sf_simplex2(P, O, (double)ix, (double)iz) >= -0.9f) continue;
+      float scale = __fadd_rn(fmodf(__fadd_rn(__fmul_rn(fabsf((float)ix), 3439.0f), __fmul_rn(fabsf((float)iz), 147.0f)), 13.0f), 9.0f);
+      float dx = (float)(lx - ox * 2), dz = (float)(lz - oz * 2);
+      double d = __dsqrt_rn((double)__fadd_rn(__fmul_rn(dx, dx), __fmul_rn(dz, dz)));
+      float candidate = __fsub_rn(100.0f, __fmul_rn(__double2float_rn(d), scale));
+      candidate = jmin(jmax(candidate, -100.0f), 80.0f);
+      height = jmax(height, candidate);
+    }
+  }
+  return __fdiv_rn(__fsub_rn(height, 8.0f), 128.0f);
+}
+
+// DistanceMetric::compute3 on float deltas, in its order of operations
+__device__ __forceinline__ float dist_squared(float x, float y, float z) {
+  return __fadd_rn(__fadd_rn(__fmul_rn(x, x), __fmul_rn(y, y)), __fmul_rn(z, z));
+}
+__device__ __forceinline__ float dist_euclid(float x, float y, float z) {
+  return __double2float_rn(__dsqrt_rn((double)dist_squared(x, y, z)));
+}
+__device__ __forceinline__ float dist_manhattan(float x, float y, float z) {
+  return __fadd_rn(__fadd_rn(fabsf(x), fabsf(y)), fabsf(z));
+}
+__device__ __forceinline__ float dist_chebyshev(float x, float y, float z) {
+  return jmax(jmax(fabsf(x), fabsf(y)), fabsf(z));
+}
 "#;
 
 fn f32lit(v: f32) -> String {
@@ -269,6 +305,32 @@ impl<'a> Gen<'a> {
                 _ => return None,
             }
         }
+    }
+    /// Whether the subgraph of `id` evaluates the same in point mode as in a volume: only
+    /// constants, references, caches, unary operations (binary ones with a constant operand,
+    /// minimum and maximum excepted), clamps, gradients, distances and slices.
+    fn pointwise(&self, id: FunctionId) -> R<bool> {
+        let mut todo = vec![id];
+        while let Some(id) = todo.pop() {
+            match self.c.graph().node(id).ok_or("missing node")? {
+                GraphNode::Constant(_) | GraphNode::Gradient { .. } | GraphNode::DistanceToPoint { .. } => {}
+                GraphNode::Reference { input, .. }
+                | GraphNode::Cache(input)
+                | GraphNode::Slice { input, .. }
+                | GraphNode::Unary { input, .. }
+                | GraphNode::Clamp { input, .. } => todo.push(*input),
+                // A constant operand makes it a unary operation in both modes (compile_binary)
+                GraphNode::Binary { kind, left, right }
+                    if !matches!(kind, GraphBinary::Minimum | GraphBinary::Maximum)
+                        && (self.constant(*left).is_some() || self.constant(*right).is_some()) =>
+                {
+                    todo.push(*left);
+                    todo.push(*right);
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
     fn var(&mut self) -> String {
         self.nv += 1;
@@ -843,7 +905,7 @@ impl<'a> Gen<'a> {
                 high,
             } => {
                 if !matches!(tiling, TilingMode::ClampToEdge) {
-                    return Err("Gradient en mode Repeat non pris en charge".into());
+                    return Err("Gradient in Repeat mode is not supported".into());
                 }
                 let factor = (high - low) / to.wrapping_sub(from) as f32;
                 let c = ["x", "y", "z"][axis as usize];
@@ -883,6 +945,34 @@ impl<'a> Gen<'a> {
                 c[axis as usize] = coordinate.to_string();
                 format!("{f}({}, {}, {})", c[0], c[1], c[2])
             }
+            // SliceSampler in a volume: an input that does not depend on the sliced axis has the
+            // same value on every plane
+            GraphNode::Slice { axis, input, .. }
+                if self.c.graph().domain_axes(input)? & (1 << axis as u8) == 0 =>
+            {
+                self.value(ssa, input, g, d3)?
+            }
+            // SliceSampler in a volume over an axis its input reads: the input on the plane, in
+            // point mode, when nothing in it evaluates differently in a volume (coordinates,
+            // constants and unary operations only, like the End's central island)
+            GraphNode::Slice { axis, coordinate, input } if self.pointwise(input)? => {
+                let f = self.point_function(input)?;
+                let mut c = ["x".to_string(), "y".to_string(), "z".to_string()];
+                c[axis as usize] = coordinate.to_string();
+                format!("{f}({}, {}, {})", c[0], c[1], c[2])
+            }
+            GraphNode::DistanceToPoint { point, metric } => {
+                // DistanceToPointSampler: (point - position) as float, then the metric
+                let d = |i: usize, c: &str| format!("(float)(int)((unsigned)({}) - (unsigned){c})", point[i]);
+                let (dx, dy, dz) = (d(0, "x"), d(1, "y"), d(2, "z"));
+                use horizon_core::density::DistanceMetric as M;
+                match metric {
+                    M::Euclidean => format!("dist_euclid({dx}, {dy}, {dz})"),
+                    M::EuclideanSquared => format!("dist_squared({dx}, {dy}, {dz})"),
+                    M::Manhattan => format!("dist_manhattan({dx}, {dy}, {dz})"),
+                    M::Chebyshev => format!("dist_chebyshev({dx}, {dy}, {dz})"),
+                }
+            }
             GraphNode::Surface { density, upper, lower, height } if self.point_mode => {
                 // compile_surface_search: Slice Y = 0 around FindTopSurfaceSampler. The upper bound
                 // is read at y = 0; the descent goes from cell to cell until a positive density.
@@ -915,14 +1005,18 @@ impl<'a> Gen<'a> {
             GraphNode::Interpolated { input, xz, y } => {
                 self.interpolated(ssa, id, input, [xz, y, xz], g)?
             }
+            GraphNode::EndIslands => {
+                // EndIslandSampler: the outer islands of a simplex noise drawn from the seed
+                let sampler = Box::new(self.c.end_island_sampler()?);
+                let t = self.table_of(sampler.noise().table());
+                self.kept.push(sampler);
+                format!("end_islands(PERM[{t}], OFF[{t}], x, z)")
+            }
             GraphNode::BlendedNoise(def) => {
                 // BlendedNoise::compile: Lerp(clamp(main + 0.5, 0, 1), min_limit, max_limit), three
                 // stacks of smeared Perlin noises, drawn like DensityCompiler (hash of
                 // "minecraft:terrain")
-                let mut rng = horizon_core::random::XoroshiroRandom::new(self.seed)
-                    .fork_positional()
-                    .from_hash_of("minecraft:terrain");
-                let bbox = Box::new(def.create_fbm_set(&mut rng)?);
+                let bbox = Box::new(self.c.blended_fbm_set(&def)?);
                 let ptr: *const horizon_core::density::BlendedFbmSet = &*bbox;
                 self.kept.push(bbox); // the content of a Box does not move while it lives
                 let set: &horizon_core::density::BlendedFbmSet = unsafe { &*ptr };
@@ -1265,12 +1359,24 @@ const AQUIFER: &str = include_str!("aquifer.cu");
 
 /// CUDA of the aquifers: the six roots (order of AquiferField::ALL: barrier, flood, spread, lava,
 /// exclusion, surface level) in point mode, then the kernels of `aquifer.cu`.
-pub(crate) fn generate_aquifer(c: &DensityCompiler, roots: [FunctionId; 6], seed: i64) -> R<String> {
+/// Without roots (no aquifers), the six fields are a stub the kernels never call.
+pub(crate) fn generate_aquifer(c: &DensityCompiler, roots: Option<[FunctionId; 6]>, seed: i64) -> R<String> {
     let mut g = Gen::new(c, Grid { sizes: [1, 1, 1], step: [1, 1, 1] }, None, seed);
     let mut defs = String::new();
-    for (name, r) in ["AQ_BARRIER", "AQ_FLOOD", "AQ_SPREAD", "AQ_LAVA", "AQ_EXCL", "AQ_SURFACE"].iter().zip(roots) {
-        let f = g.point_function(r)?;
-        writeln!(defs, "#define {name} {f}")?;
+    let names = ["AQ_BARRIER", "AQ_FLOOD", "AQ_SPREAD", "AQ_LAVA", "AQ_EXCL", "AQ_SURFACE"];
+    match roots {
+        Some(roots) => {
+            for (name, r) in names.iter().zip(roots) {
+                let f = g.point_function(r)?;
+                writeln!(defs, "#define {name} {f}")?;
+            }
+        }
+        None => {
+            writeln!(defs, "__device__ __forceinline__ float aq_none(int, int, int) {{ return 0.0f; }}")?;
+            for name in names {
+                writeln!(defs, "#define {name} aq_none")?;
+            }
+        }
     }
     Ok(format!("{}{BASE}\n{OPS}\n{}\n{defs}\n{RANDOM}\n{AQUIFER}", tables_cuda(&g)?, g.defs))
 }
@@ -1382,7 +1488,7 @@ pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, see
         writeln!(defs, "#define T_FREEZE_FREQ_{k} {}", f64lit(l.frequency))?;
         writeln!(defs, "#define T_FREEZE_AMP_{k} {}", f32lit(l.amplitude))?;
     }
-    writeln!(defs, "#define SF_MINY ({})\n#define SF_H {}\n#define SF_ZOOM ({}ll)\n#define SF_SEA ({})", s.min_y, s.height, s.zoom_seed, s.sea_level)?;
+    writeln!(defs, "#define SF_MINY ({})\n#define SF_H {}\n#define SF_BMINY ({})\n#define SF_BH {}\n#define SF_ZOOM ({}ll)\n#define SF_SEA ({})", s.min_y, s.height, s.biome_min_y, s.biome_height, s.zoom_seed, s.sea_level)?;
     let [e_default, e_air, e_fluid, e_lava] = s.fill_states;
     writeln!(defs, "#define SF_E_DEFAULT {e_default}\n#define SF_E_AIR {e_air}\n#define SF_E_FLUID {e_fluid}\n#define SF_E_LAVA {e_lava}")?;
     // Fluid states written by the rule: the CPU surface marks them for post-processing
@@ -1504,8 +1610,16 @@ pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, see
                 }
             ),
             SC::Gradient { low, high, positional } => format!(
-                "if (c.y <= {low}) return true;\n  if (c.y >= {high}) return false;\n  double p = 1.0 + (((double)c.y - (double)({low})) / ((double)({high}) - (double)({low}))) * (0.0 - 1.0);\n  unsigned long long lo, hi;\n  aq_at({}ull, {}ull, c.x, c.y, c.z, lo, hi);\n  return (double)aq_next_float(lo, hi) < p;",
-                positional.0, positional.1
+                "if (c.y <= {low}) return true;\n  if (c.y >= {high}) return false;\n  double p = 1.0 + (((double)c.y - (double)({low})) / ((double)({high}) - (double)({low}))) * (0.0 - 1.0);\n  {}",
+                match positional {
+                    crate::Positional::Xoroshiro(lo, hi) => format!(
+                        "unsigned long long lo, hi;\n  aq_at({lo}ull, {hi}ull, c.x, c.y, c.z, lo, hi);\n  return (double)aq_next_float(lo, hi) < p;"
+                    ),
+                    crate::Positional::Legacy(seed) => format!(
+                        "long long st = lg_at((long long){}ull, c.x, c.y, c.z);\n  return (double)lg_next_float(st) < p;",
+                        *seed as u64
+                    ),
+                }
             ),
             SC::Not(i) => format!("return !C_{i}(c);"),
         };
@@ -1546,7 +1660,22 @@ pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, see
         };
         writeln!(code, "__device__ __noinline__ int R_{k}(Ctx &c) {{\n  {body}\n}}")?;
     }
-    let (rlo, rhi) = s.root_positional;
+    // The root factory: Xoroshiro, or legacy (the Nether, the End) without ore veins nor
+    // extensions, the only other users of its draws.
+    let (rlo, rhi, depth_draw, depth_double) = match s.root_positional {
+        crate::Positional::Xoroshiro(lo, hi) => (
+            lo,
+            hi,
+            format!("unsigned long long lo, hi;\n  aq_at({lo}ull, {hi}ull, x, 0, z, lo, hi);"),
+            "aq_next_double(lo, hi)",
+        ),
+        crate::Positional::Legacy(seed) => {
+            if s.extensions.is_some() || s.rules.iter().any(|r| matches!(r, crate::SurfaceRule::OreVein { .. })) {
+                return Err("legacy random source with ore veins or extensions".into());
+            }
+            (0, 0, format!("long long st = lg_at((long long){}ull, x, 0, z);", seed as u64), "lg_next_double(st)")
+        }
+    };
     let root = s.root;
     write!(
         code,
@@ -1578,9 +1707,8 @@ extern "C" __global__ void ksf_heads(const signed char *CODES, const unsigned sh
   int lx = lc & 15, lz = lc >> 4;
   int x = cx * 16 + lx, z = cz * 16 + lz;
   int error = 0;
-  unsigned long long lo, hi;
-  aq_at({rlo}ull, {rhi}ull, x, 0, z, lo, hi);
-  int depth = (int)(((double){pt_surf}((double)x, 0.0, (double)z) * 2.75 + 3.0) + aq_next_double(lo, hi) * 0.25);
+  {depth_draw}
+  int depth = (int)(((double){pt_surf}((double)x, 0.0, (double)z) * 2.75 + 3.0) + {depth_double} * 0.25);
   double secondary = (double){pt_sec}((double)x, 0.0, (double)z);
   int minimum = (int)((unsigned)floor_sat((double)floorf(PL[lc])) + (unsigned)depth - 8u);
   // The pillar before the descent of its column, the iceberg after. They only depend on the codes (the
@@ -1591,7 +1719,7 @@ extern "C" __global__ void ksf_heads(const signed char *CODES, const unsigned sh
   {{
     int q[3];
     sf_quarter(SF_ZOOM, x, otop, z, q);
-    bcol = sf_biome_quarter(B, cx, cz, SF_MINY >> 2, SF_H >> 2, q);
+    bcol = sf_biome_quarter(B, cx, cz, SF_BMINY >> 2, SF_BH >> 2, q);
   }}
   if (bcol < 0) error = 1;
   if (bcol >= 0 && bcol == SF_ERODE) {{

@@ -202,12 +202,12 @@ impl<B: TerrainBlockStates> TerrainBlocks<'_, B> {
             self.non_air[index] -= 1;
         }
     }
-    #[inline]
+    #[inline(always)]
     fn section_index(&self, y: i32) -> Option<usize> {
         let dy = i64::from(y) - i64::from(self.min_y);
         (dy >= 0 && dy < i64::from(self.height)).then_some((dy >> 4) as usize)
     }
-    #[inline]
+    #[inline(always)]
     fn block(&self, x: i32, y: i32, z: i32) -> BlockStateId {
         let Some(section) = self.section_index(y) else {
             return self.void_air;
@@ -227,9 +227,46 @@ impl<B: TerrainBlockStates> TerrainBlocks<'_, B> {
         }
     }
 }
-#[inline]
+#[inline(always)]
 fn local_index(x: i32, y: i32, z: i32) -> usize {
     (((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize
+}
+
+/// The answers of a [`TerrainChunk::replace_row_states`] decision for the states met in one row:
+/// the state written (if any) and the change it makes to the section's non-air count, as
+/// `count_write` counts it.
+struct StateMemo {
+    entries: [(BlockStateId, Option<BlockStateId>, i16); 6],
+    len: usize,
+    next: usize,
+}
+impl Default for StateMemo {
+    fn default() -> Self {
+        Self { entries: [(BlockStateId(0), None, 0); 6], len: 0, next: 0 }
+    }
+}
+impl StateMemo {
+    #[inline]
+    fn get<B: TerrainBlockStates>(
+        &mut self,
+        old: BlockStateId,
+        f: &mut dyn FnMut(BlockStateId) -> Option<BlockStateId>,
+        properties: &B,
+    ) -> Option<(BlockStateId, i16)> {
+        if let Some(e) = self.entries[..self.len].iter().find(|e| e.0 == old) {
+            return e.1.map(|state| (state, e.2));
+        }
+        let new = f(old);
+        let delta = new.map_or(0, |state| {
+            let old_air = properties.heightmap_state(old).is_air();
+            let new_air = properties.heightmap_state(state).is_air();
+            i16::from(old_air && !new_air) - i16::from(!old_air && new_air)
+        });
+        self.entries[self.next] = (old, new, delta);
+        self.next = (self.next + 1) % self.entries.len();
+        self.len = (self.len + 1).min(self.entries.len());
+        new.map(|state| (state, delta))
+    }
 }
 
 /// `TerrainChunk::worldgen_column_bounds`, indexed by `HeightmapType`.
@@ -496,7 +533,7 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
         self.blocks.highest_section_y()
     }
     /// ProtoChunk reads collapse an all-air section to its default AIR state.
-    #[inline]
+    #[inline(always)]
     pub fn block(&self, x: i32, y: i32, z: i32) -> BlockStateId {
         self.blocks.block(x, y, z)
     }
@@ -700,6 +737,61 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
             };
             self.blocks.count_write(index, old, state);
             wrote = true;
+        }
+        Ok(wrote)
+    }
+    /// [`replace_row_raw`](Self::replace_row_raw) for an `f` whose answer depends only on the
+    /// state it is given: the same cells read, the same writes in the same order. `f` is asked once
+    /// per state met in the row, and the non-air count of a section changes by what its answer
+    /// gives, worked out once per state too.
+    pub fn replace_row_states(
+        &mut self,
+        [x, y, z]: [i32; 3],
+        bits: u32,
+        f: &mut dyn FnMut(BlockStateId) -> Option<BlockStateId>,
+    ) -> Result<bool, TerrainError> {
+        let section = self.blocks.section_index(y);
+        let mut memo = StateMemo::default();
+        let mut wrote = false;
+        let mut bits = bits;
+        while bits != 0 {
+            let zz = z.wrapping_add(bits.trailing_zeros() as i32);
+            bits &= bits - 1;
+            let li = local_index(x, y, zz);
+            let Some(index) = section.filter(|&s| self.blocks.non_air[s] != 0) else {
+                let read = if section.is_some() {
+                    self.blocks.air
+                } else {
+                    self.blocks.void_air
+                };
+                let Some((state, _)) = memo.get(read, f, &self.blocks.properties) else {
+                    continue;
+                };
+                let section = section.ok_or(TerrainError::OutsideBuildHeight)?;
+                let old = self.blocks.sections[section].set(li, state)?;
+                self.blocks.count_write(section, old, state);
+                wrote = true;
+                continue;
+            };
+            let Some((slot, old_id, old)) = self.blocks.sections[index].slot_state(li) else {
+                let old = self.blocks.sections[index].state(li);
+                let Some((state, _)) = memo.get(old, f, &self.blocks.properties) else {
+                    continue;
+                };
+                let old = self.blocks.sections[index].set(li, state)?;
+                self.blocks.count_write(index, old, state);
+                wrote = true;
+                continue;
+            };
+            let Some((state, delta)) = memo.get(old, f, &self.blocks.properties) else {
+                continue;
+            };
+            wrote = true;
+            if state == old {
+                continue;
+            }
+            self.blocks.sections[index].set_at(li, slot, old_id, state)?;
+            self.blocks.non_air[index] = self.blocks.non_air[index].wrapping_add_signed(delta);
         }
         Ok(wrote)
     }
@@ -1465,6 +1557,81 @@ mod tests {
             ),
         ]))
         .unwrap()
+    }
+
+    /// A registry of air, void air and `n - 2` other states (ids below 2 are air for `Properties`).
+    fn wide_registry(n: u32) -> BlockRegistry {
+        let names: Vec<String> = (0..n)
+            .map(|i| match i {
+                0 => "minecraft:air".to_owned(),
+                1 => "minecraft:void_air".to_owned(),
+                _ => format!("minecraft:s{i}"),
+            })
+            .collect();
+        BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(crate::DATA_VERSION)),
+            (
+                "states",
+                Tag::List(
+                    names
+                        .iter()
+                        .map(|n| Tag::compound([("id", Tag::String(n.as_str().into()))]))
+                        .collect(),
+                ),
+            ),
+            (
+                "defaults",
+                Tag::compound(
+                    names.iter().enumerate().map(|(i, n)| (n.as_str(), Tag::Int(i as i32))),
+                ),
+            ),
+        ]))
+        .unwrap()
+    }
+
+    /// `replace_row_states` reads and writes as `replace_row_raw` with the same decision: same
+    /// answers, same sections (palette order, counts, free entries and words, as `to_nbt` writes
+    /// them) and same non-air counts, through uniform, air, growing and shrinking sections.
+    #[test]
+    fn replace_row_states_matches_replace_row_raw() {
+        let registry = wide_registry(40);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..40 {
+            let mut a = TerrainChunk::new(ChunkPos::new(0, 0), -64, 384, &registry, Properties).unwrap();
+            let mut b = TerrainChunk::new(ChunkPos::new(0, 0), -64, 384, &registry, Properties).unwrap();
+            // Few states per round for the first rounds (long runs, uniform sections), up to 38.
+            let kinds = 2 + (round as u64 % 8) * 5;
+            for op in 0..3000 {
+                let y = -70 + next(400) as i32;
+                let x = next(16) as i32;
+                let z = next(16) as i32;
+                let bits = (next(1 << 16) as u32) & (u32::MAX >> (z as u32 + 16));
+                // A decision on the state only: none, or one of a few states (air at times).
+                let table: Vec<Option<BlockStateId>> = (0..40)
+                    .map(|_| match next(10) {
+                        0..=3 => None,
+                        4 => Some(BlockStateId(next(2) as u32)),
+                        _ => Some(BlockStateId(2 + next(kinds.min(38)) as u32)),
+                    })
+                    .collect();
+                let ra = a.replace_row_raw([x, y, z], bits, |_, s| table[s.0 as usize]);
+                let rb = b.replace_row_states([x, y, z], bits, &mut |s| table[s.0 as usize]);
+                assert_eq!(ra.is_ok(), rb.is_ok(), "round {round} op {op}");
+                if let (Ok(ra), Ok(rb)) = (ra, rb) {
+                    assert_eq!(ra, rb, "round {round} op {op}");
+                }
+            }
+            assert_eq!(a.blocks.non_air, b.blocks.non_air, "round {round}");
+            for (i, (sa, sb)) in a.blocks.sections.iter().zip(&b.blocks.sections).enumerate() {
+                assert_eq!(sa.to_nbt().unwrap(), sb.to_nbt().unwrap(), "round {round} section {i}");
+            }
+        }
     }
 
     #[test]

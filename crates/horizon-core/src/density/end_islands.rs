@@ -18,6 +18,11 @@ impl EndIslandSampler {
             noise: SimplexNoise::with_skipped_offsets(&mut random, true),
         }
     }
+    /// The simplex noise of the outer islands (for code that evaluates them elsewhere, such as
+    /// the GPU fork).
+    pub fn noise(&self) -> &SimplexNoise {
+        &self.noise
+    }
     fn height(&self, x: i32, z: i32) -> f32 {
         // These divisions and remainders truncate toward zero, including for
         // negative coordinates. They are not block/chunk floor conversions.

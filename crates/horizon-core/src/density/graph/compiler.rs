@@ -25,6 +25,27 @@ impl DensityCompiler {
             context: None,
         }
     }
+    /// The three noise stacks of a blended noise, drawn as this compiler draws them when it
+    /// compiles the node (a legacy or a Xoroshiro random source): for code that evaluates the same
+    /// noise elsewhere, such as the GPU fork.
+    pub fn blended_fbm_set(
+        &self,
+        definition: &BlendedNoise,
+    ) -> Result<crate::density::BlendedFbmSet, CompileError> {
+        self.context
+            .as_ref()
+            .ok_or(CompileError::MissingSeededContext)?
+            .blended_fbm_set(definition)
+    }
+    /// The sampler the `EndIslands` node compiles to, for this compiler's seed (for code that
+    /// evaluates it elsewhere, such as the GPU fork).
+    pub fn end_island_sampler(&self) -> Result<crate::density::EndIslandSampler, CompileError> {
+        Ok(self
+            .context
+            .as_ref()
+            .ok_or(CompileError::MissingSeededContext)?
+            .end_island_sampler())
+    }
     pub fn new_seeded(graph: DensityGraph, seed: i64, use_legacy_random: bool) -> Self {
         let mut compiler = Self::new(graph);
         compiler.context = Some(seeded::SeededContext::new(seed, use_legacy_random));

@@ -35,3 +35,21 @@ __device__ __forceinline__ void aq_at(unsigned long long LO, unsigned long long 
   hi = HI;
   if ((lo | hi) == 0ull) { lo = 0x9e3779b97f4a7c15ull; hi = 0x6a09e667f3bcc909ull; }
 }
+// LegacyRandomSource (java.util.Random's LCG) and LegacyPositionalRandomFactory::at, whose
+// state is (Mth.getSeed(x, y, z) ^ seed) scrambled
+__device__ __forceinline__ long long lg_at(long long seed, int x, int y, int z) {
+  return (long long)(((unsigned long long)aq_position_seed(x, y, z) ^ (unsigned long long)seed ^ 0x5DEECE66DULL) &
+                     ((1ULL << 48) - 1));
+}
+__device__ __forceinline__ int lg_next(long long &s, int bits) {
+  s = (long long)(((unsigned long long)s * 0x5DEECE66DULL + 0xBULL) & ((1ULL << 48) - 1));
+  return (int)((unsigned long long)s >> (48 - bits));
+}
+__device__ __forceinline__ float lg_next_float(long long &s) {
+  return (float)lg_next(s, 24) * 5.9604644775390625e-8f;
+}
+__device__ __forceinline__ double lg_next_double(long long &s) {
+  long long a = lg_next(s, 26);
+  long long b = lg_next(s, 27);
+  return (double)((a << 27) + b) * 1.1102230246251565e-16;
+}

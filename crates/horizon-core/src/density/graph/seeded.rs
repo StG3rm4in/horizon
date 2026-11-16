@@ -22,6 +22,9 @@ pub(super) struct SeededContext {
     instances: Mutex<HashMap<NoiseId, Arc<dyn Noise>>>,
 }
 impl SeededContext {
+    pub(super) fn end_island_sampler(&self) -> EndIslandSampler {
+        EndIslandSampler::new(self.seed)
+    }
     pub(super) fn end_islands(&self) -> Arc<dyn DensitySampler> {
         Arc::new(EndIslandSampler::new(self.seed))
     }
@@ -76,6 +79,18 @@ impl SeededContext {
         };
         instances.insert(id, noise.clone());
         Ok(noise)
+    }
+    /// The three noise stacks `blended` compiles, drawn from the same random source.
+    pub(super) fn blended_fbm_set(
+        &self,
+        definition: &BlendedNoise,
+    ) -> Result<crate::density::BlendedFbmSet, CompileError> {
+        Ok(match &self.factory {
+            Factory::Legacy(_) => definition.create_fbm_set(&mut LegacyRandom::new(self.seed))?,
+            Factory::Xoroshiro(factory) => {
+                definition.create_fbm_set(&mut factory.from_hash_of("minecraft:terrain"))?
+            }
+        })
     }
     pub(super) fn blended(
         &self,

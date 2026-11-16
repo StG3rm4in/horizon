@@ -242,8 +242,10 @@ impl OreFeature {
             let ranges = heights.iter().enumerate().fold(0u64, |m, (i, &(lo, hi))| {
                 m | u64::from(lo <= y && y <= hi) << i
             });
+            // The rules are pure (`heights`): they read the position's Y only, the row's.
+            let p = [x, y, z_start];
             placed |= world
-                .replace_row([x, y, z_start], bits, &mut |p, state| {
+                .replace_row_states([x, y, z_start], bits, &mut |state| {
                     let matched = matches.get(state, ranges, || {
                         self.targets
                             .iter()

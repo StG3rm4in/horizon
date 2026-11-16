@@ -51,7 +51,7 @@ use crate::{
 use horizon_core::random::{WorldgenRandom, XoroshiroRandom};
 use horizon_core::{
     biome::obfuscate_seed,
-    geometry::{Axis, Direction, VoxelShape},
+    geometry::{Direction, VoxelShape},
     position::{BlockPos, ChunkPos},
 };
 use serde_json::Value;
@@ -173,7 +173,7 @@ fn resource(message: impl Into<String>) -> GeneratorError {
     GeneratorError::Resource(message.into())
 }
 /// Biomes in vanilla's possible-biome encounter order for this source.
-fn possible_biomes(source: &ResolvedBiomeSource) -> Vec<String> {
+pub(super) fn possible_biomes(source: &ResolvedBiomeSource) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let ordered: Vec<String> = match source {
         ResolvedBiomeSource::MultiNoise(source) => source
@@ -499,9 +499,8 @@ impl Decoration {
         let mut random = WorldgenRandom::new(XoroshiroRandom::new(0));
         let decoration_seed = random.set_decoration_seed(seed, origin[0], origin[2]);
         let mut placer = FeaturePlacer::new();
-        let mut planned = Vec::new();
-        let mut attempts: Vec<OreAttempt> = Vec::new();
-        let mut spheres = Vec::new();
+        let OreBuffers { features: mut planned, mut attempts, mut spheres, mut blobs, mut sent } =
+            OreBuffers::take();
         for (index, id) in features {
             let Ok(feature) = &self.features[id.0 as usize] else {
                 continue;
@@ -534,10 +533,10 @@ impl Decoration {
             planned.push((id, first..attempts.len(), ore.size() as usize));
         }
         if planned.is_empty() {
+            OreBuffers { features: planned, attempts, spheres, blobs, sent }.give();
             return None;
         }
-        let mut blobs = vec![None; attempts.len()];
-        let mut sent = Vec::new();
+        blobs.resize(attempts.len(), None);
         let mut next = 0;
         for (_, range, size) in &planned {
             for i in range.clone() {
@@ -554,10 +553,13 @@ impl Decoration {
                 }
             }
         }
-        if next != spheres.len() {
+        let job = (next == spheres.len()).then(|| gpu.submit(&sent, &spheres).ok()).flatten();
+        let Some(job) = job else {
+            OreBuffers { features: planned, attempts, spheres, blobs, sent }.give();
             return None;
-        }
-        let job = gpu.submit(&sent, &spheres).ok()?;
+        };
+        sent.clear();
+        OREBUFFERS.with_borrow_mut(|b| b.sent = sent);
         Some(OrePlan {
             gpu,
             features: planned,
@@ -788,6 +790,14 @@ impl Decoration {
         );
         if let Some(plan) = ore_plan {
             plan.gpu.finish(plan.job);
+            OreBuffers {
+                features: plan.features,
+                attempts: plan.attempts,
+                spheres: plan.spheres,
+                blobs: plan.blobs,
+                sent: Vec::new(),
+            }
+            .give();
         }
         let after = self.times.as_ref().map(|_| std::time::Instant::now());
         // `FillLayerFeature.place` for the chunk: air at the layer's Y becomes the layer.
@@ -953,6 +963,38 @@ impl World<'_> {
 }
 /// The ores of a chunk planned on the GPU (`HORIZON_GPU_ORES`): each planned feature's attempts as
 /// predicted at the start of the chunk's decoration, and the job working out their blobs' cells.
+/// The vectors of a worker's ore plans, kept from one chunk to the next: a chunk's plan holds
+/// some 20,000 spheres, which growing vectors would copy again and again.
+#[derive(Default)]
+struct OreBuffers {
+    features: Vec<(FeatureIdentity, std::ops::Range<usize>, usize)>,
+    attempts: Vec<OreAttempt>,
+    spheres: Vec<[f64; 4]>,
+    blobs: Vec<Option<(usize, usize)>>,
+    sent: Vec<horizon_gpu::OreBlob>,
+}
+thread_local! {
+    static OREBUFFERS: std::cell::RefCell<OreBuffers> = std::cell::RefCell::default();
+}
+impl OreBuffers {
+    /// The worker's buffers, empty.
+    fn take() -> Self {
+        let mut b = OREBUFFERS.take();
+        b.features.clear();
+        b.attempts.clear();
+        b.spheres.clear();
+        b.blobs.clear();
+        b.sent.clear();
+        b
+    }
+    /// Gives the buffers back for the next chunk; an empty `sent` keeps the one already there.
+    fn give(self) {
+        OREBUFFERS.with_borrow_mut(|b| {
+            let sent = if self.sent.capacity() > 0 { self.sent } else { std::mem::take(&mut b.sent) };
+            *b = OreBuffers { sent, ..self };
+        });
+    }
+}
 struct OrePlan<'g> {
     gpu: &'g horizon_gpu::OreGpu,
     /// Each planned feature, the range of its attempts and the sphere count of its blobs.
@@ -1451,7 +1493,10 @@ impl PlacementContext for World<'_> {
         state: BlockStateId,
         position: [i32; 3],
     ) -> Result<bool, PlacementQueryError> {
-        let collision = self.blocks()?.collision.clone();
+        if let Some(facts) = self.blocks()?.collision.fixed_facts(state) {
+            return Ok(facts & crate::block_collision::FIXED_EMPTY != 0);
+        }
+        let collision = &self.blocks()?.collision;
         collision
             .collision_shape(self, state, position)
             .map(|shape| shape.is_empty())
@@ -1564,7 +1609,7 @@ impl PlacementContext for World<'_> {
         if let (None, Some(behaviours)) = (self.blocks, self.behaviours) {
             return Ok(behaviours.is_face_sturdy(state, direction));
         }
-        let support = self.blocks()?.support.clone();
+        let support = &self.blocks()?.support;
         support
             .is_face_sturdy(self, state, position, direction, SupportType::Full)
             .map_err(query)
@@ -1578,7 +1623,7 @@ impl PlacementContext for World<'_> {
         if let (None, Some(behaviours)) = (self.blocks, self.behaviours) {
             return Ok(behaviours.is_face_sturdy_center(state, direction));
         }
-        let support = self.blocks()?.support.clone();
+        let support = &self.blocks()?.support;
         support
             .is_face_sturdy(self, state, position, direction, SupportType::Center)
             .map_err(query)
@@ -1601,18 +1646,14 @@ impl PlacementContext for World<'_> {
         state: BlockStateId,
         position: [i32; 3],
     ) -> Result<bool, PlacementQueryError> {
-        let collision = self.blocks()?.collision.clone();
+        if let Some(facts) = self.blocks()?.collision.fixed_facts(state) {
+            return Ok(facts & crate::block_collision::FIXED_FULL_BLOCK != 0);
+        }
+        let collision = &self.blocks()?.collision;
         let shape = collision
             .collision_shape(self, state, position)
             .map_err(query)?;
-        let [nx, ny, nz] = shape.sizes();
-        Ok(!shape.is_empty()
-            && [Axis::X, Axis::Y, Axis::Z]
-                .into_iter()
-                .all(|axis| shape.min(axis) == 0.0 && shape.max(axis) == 1.0)
-            && (0..nx).all(|x| {
-                (0..ny).all(|y| (0..nz).all(|z| shape.is_full(x as i32, y as i32, z as i32)))
-            }))
+        Ok(crate::block_collision::shape_fills_block(&shape))
     }
     fn add_entity(&mut self, mut nbt: crate::nbt::Compound) -> Result<(), PlacementQueryError> {
         if let Some(mobs) = self.structure_mobs.clone()
@@ -1843,6 +1884,38 @@ impl PlacementContext for World<'_> {
                 .region
                 .chunk_mut(x >> 4, first >> 4)?
                 .replace_row_raw([x, y, z], part, |zz, state| cell([x, y, zz], state))
+                .map_err(|e| query(format!("{e:?}")))?;
+        }
+        Ok(wrote)
+    }
+    fn replace_row_states(
+        &mut self,
+        [x, y, z]: [i32; 3],
+        bits: u32,
+        cell: &mut dyn FnMut(BlockStateId) -> Option<BlockStateId>,
+    ) -> Result<bool, PlacementQueryError> {
+        if self.outside_build_height(y)? {
+            return Ok(false);
+        }
+        let mut wrote = false;
+        let mut rest = bits;
+        while rest != 0 {
+            let first = z.wrapping_add(rest.trailing_zeros() as i32);
+            // The bits up to the last cell of `first`'s chunk
+            let last = (first | 15).wrapping_sub(z);
+            let part = if last >= 31 {
+                rest
+            } else {
+                rest & ((2u32 << last) - 1)
+            };
+            rest &= !part;
+            if !self.zone.contains_block(BlockPos::new(x, y, first)) {
+                continue;
+            }
+            wrote |= self
+                .region
+                .chunk_mut(x >> 4, first >> 4)?
+                .replace_row_states([x, y, z], part, &mut *cell)
                 .map_err(|e| query(format!("{e:?}")))?;
         }
         Ok(wrote)

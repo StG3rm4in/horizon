@@ -933,6 +933,8 @@ struct Pipeline<R: RandomSource> {
     router: RouterSamplers,
     climate: ClimateSampler,
     aquifer: Option<[Arc<dyn DensitySampler>; 6]>,
+    /// The GPU sends block codes (its aquifers, or the global fluid picker without aquifers).
+    gpu_codes: bool,
     rule: MaterialRule,
     preliminary: Arc<dyn DensitySampler>,
     source: ResolvedBiomeSource,
@@ -1196,16 +1198,26 @@ where
         .map(|field| router.function(field));
         let router = library.compile_router(router)?;
         // The aquifers too, when their positional factory is a Xoroshiro one.
-        let gpu_aquifer = aquifers.filter(|_| !settings.legacy).map(|config| {
-            let mut random = root.from_hash_of("minecraft:aquifer");
-            let lo = random.next_long() as u64;
-            let hi = random.next_long() as u64;
-            horizon_gpu::AquiferSetup {
-                roots: AquiferField::ALL.map(|field| config.function(field)),
-                positional: (lo, hi),
-                sea_level: settings.sea_level,
+        // Without aquifers (the Nether, the End), the GPU codes take the global fluid picker.
+        let gpu_aquifer = match aquifers.as_ref() {
+            Some(_) if settings.legacy => None,
+            Some(config) => {
+                let mut random = root.from_hash_of("minecraft:aquifer");
+                let lo = random.next_long() as u64;
+                let hi = random.next_long() as u64;
+                Some(horizon_gpu::AquiferSetup {
+                    roots: Some(AquiferField::ALL.map(|field| config.function(field))),
+                    positional: (lo, hi),
+                    sea_level: settings.sea_level,
+                })
             }
-        });
+            None => Some(horizon_gpu::AquiferSetup {
+                roots: None,
+                positional: (0, 0),
+                sea_level: settings.sea_level,
+            }),
+        };
+        let gpu_codes = gpu_aquifer.is_some();
         let gpu = horizon_gpu::GpuFinalDensity::new(
             library.compiler(),
             final_density_id,
@@ -1365,7 +1377,11 @@ where
                     secondary_noise: sec.as_ref(),
                     clay_noise: clay.as_ref(),
                     bands: surface.bands().states().map(|b| b.0),
-                    root_positional: state(root.xoroshiro_state())?,
+                    root_positional: match (root.xoroshiro_state(), root.legacy_seed()) {
+                        (Some((lo, hi)), _) => horizon_gpu::Positional::Xoroshiro(lo, hi),
+                        (None, Some(seed)) => horizon_gpu::Positional::Legacy(seed),
+                        (None, None) => return Err(state(None).unwrap_err()),
+                    },
                     ore_positional: ore,
                     surface_level: surface_level_id,
                     temperatures: data
@@ -1378,6 +1394,8 @@ where
                     sea_level: settings.sea_level,
                     min_y: settings.noise_min_y,
                     height: settings.noise_height,
+                    biome_min_y: settings.level_min_y,
+                    biome_height: settings.level_height,
                     extensions: Some(horizon_gpu::SurfaceExtensions {
                         eroded_badlands: data.biome_id("minecraft:eroded_badlands").map(|b| b.0),
                         frozen_oceans: ["minecraft:frozen_ocean", "minecraft:deep_frozen_ocean"]
@@ -1398,6 +1416,18 @@ where
                     ],
                     fluid_states: Vec::new(),
                 };
+                // A legacy root (the Nether, the End): the extensions draw from it like the ore
+                // veins, so its dimension must not have their biomes, and goes without them.
+                if root.xoroshiro_state().is_none() {
+                    let extension_biomes = ["minecraft:eroded_badlands", "minecraft:frozen_ocean", "minecraft:deep_frozen_ocean"];
+                    if super::generator_decoration::possible_biomes(&source)
+                        .iter()
+                        .any(|b| extension_biomes.contains(&b.as_str()))
+                    {
+                        return Err("extension biomes with a legacy random source".to_string());
+                    }
+                    setup.extensions = None;
+                }
                 // The final states fit in 30 bits; the rule's fluid states (swamp water) are marked
                 // by the GPU, the extensions and the default fill have none
                 let mut written_blocks: Vec<u32> = setup.bands.to_vec();
@@ -1462,7 +1492,7 @@ where
         // HORIZON_GPU_BIOMES_REGION x HORIZON_GPU_BIOMES_REGION chunks (8); `test` checks each chunk
         // against the CPU's.
         let (biomes_gpu, biomes_test) = match (std::env::var("HORIZON_GPU_BIOMES").as_deref(), &source) {
-            (Ok(v @ ("1" | "test")), ResolvedBiomeSource::MultiNoise(multi)) if !settings.legacy => {
+            (Ok(v @ ("1" | "test")), ResolvedBiomeSource::MultiNoise(multi)) => {
                 let index = multi.parameters();
                 let (spaces, links) = index.tree();
                 let entry_ids: Vec<u32> = index
@@ -1506,6 +1536,7 @@ where
             router,
             climate,
             aquifer,
+            gpu_codes,
             rule,
             preliminary,
             source,
@@ -2465,7 +2496,7 @@ where
             // aquifer, still built for the carvers, must agree on the chunk's air limit.
             let mut codes = Vec::new();
             let lava = data.registry.default_state("minecraft:lava");
-            let from_codes = match (gpu.filter(|_| self.aquifer.is_some()), lava) {
+            let from_codes = match (gpu.filter(|_| self.gpu_codes), lava) {
                 (Some(gpu), Some(_)) => {
                     codes.resize(volume.size(), 0i8);
                     // HORIZON_GPU_SURFACE=1: the chunk's surface runs on the GPU stream of its codes,
@@ -2532,9 +2563,10 @@ where
                         }
                     };
                     match skip {
+                        // A disabled aquifer has no air limit: the GPU took its picker everywhere.
                         Some(skip)
                             if aquifer.as_ref().is_none_or(|a| {
-                                a.air_above_y() == Some(skip.max(self.settings.sea_level))
+                                a.air_above_y().is_none_or(|y| y == skip.max(self.settings.sea_level))
                             }) =>
                         {
                             true
@@ -3654,7 +3686,11 @@ impl<'a, P: PositionalRandom> SurfaceIr<'a, P> {
             MaterialCondition::VerticalGradient { random_name, true_at_and_below, false_at_and_above } => {
                 let name = super::tags::identifier(random_name).map_err(|e| format!("{e:?}"))?;
                 let mut r = self.root.from_hash_of(&name);
-                let positional = (r.next_long() as u64, r.next_long() as u64);
+                // fork_positional: a Xoroshiro factory takes two longs, a legacy one its seed
+                let positional = match self.root.legacy_seed() {
+                    Some(_) => horizon_gpu::Positional::Legacy(r.next_long()),
+                    None => horizon_gpu::Positional::Xoroshiro(r.next_long() as u64, r.next_long() as u64),
+                };
                 self.push_condition(S::Gradient {
                     low: true_at_and_below.resolve(self.generation),
                     high: false_at_and_above.resolve(self.generation),

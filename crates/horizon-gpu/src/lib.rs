@@ -104,8 +104,10 @@ fn priority_stream(ctx: &Arc<CudaContext>) -> Result<Arc<CudaStream>, String> {
 /// The aquifers of a dimension, to decide each block on the GPU too.
 #[derive(Clone, Copy, Debug)]
 pub struct AquiferSetup {
-    /// Roots in AquiferField::ALL order (barrier, flood, spread, lava, exclusion, surface level).
-    pub roots: [FunctionId; 6],
+    /// Roots in AquiferField::ALL order (barrier, flood, spread, lava, exclusion, surface level);
+    /// None for a dimension without aquifers (the Nether, the End), where every block that is not
+    /// solid takes the global fluid picker's substance (`DisabledAquifer`).
+    pub roots: Option<[FunctionId; 6]>,
     /// State (lo, hi) of the aquifers' positional random factory (Xoroshiro).
     pub positional: (u64, u64),
     pub sea_level: i32,
@@ -134,8 +136,9 @@ impl std::fmt::Debug for GpuFinalDensity {
 }
 
 impl GpuFinalDensity {
-    /// `None` if `HORIZON_GPU_DENSITY` is unset or 0, if the random source is legacy, or if a graph
-    /// node has no CUDA translation. `cpu` is the reference sampler of the self-test.
+    /// `None` if `HORIZON_GPU_DENSITY` is unset or 0, or if a graph node has no CUDA translation.
+    /// `cpu` is the reference sampler of the self-test. A legacy random source (the Nether, the
+    /// End) only changes how the compiler draws its noises, which the GPU reads from it.
     pub fn new(
         compiler: &DensityCompiler,
         root: FunctionId,
@@ -151,19 +154,16 @@ impl GpuFinalDensity {
         if mode.is_empty() || mode == "0" {
             return None;
         }
-        if legacy {
-            log::info!("GPU final_density ({name}): legacy random source, staying on the CPU");
-            return None;
-        }
+        let _ = legacy;
         let r = env_or("HORIZON_GPU_REGION", 8).clamp(1, 32);
         let capacity = env_or("HORIZON_GPU_REGIONS_MAX", 128).max(1) as usize;
         let t = Instant::now();
         let prog = match codegen::generate(compiler, root, seed, [16 * r, height, 16 * r]) {
             Ok(p) => p,
             Err(e) => {
-                log::info!(
-                    "GPU final_density ({name}): no CUDA translation ({e}), staying on the CPU"
-                );
+                let msg = format!("GPU final_density ({name}): no CUDA translation ({e}), staying on the CPU");
+                log::info!("{msg}");
+                eprintln!("{msg}");
                 return None;
             }
         };
@@ -419,6 +419,9 @@ struct Aquifers {
     kernel: CudaSlice<f32>,
     positional: (u64, u64),
     sea: i32,
+    /// No aquifers: the skip height of every chunk is below every block, so `aq_substance` takes
+    /// the global fluid picker without reading any cell.
+    disabled: bool,
 }
 
 type Launch = (CudaFunction, usize, usize);
@@ -544,6 +547,7 @@ impl Engine {
                     _module: m,
                     positional: a.positional,
                     sea: a.sea_level,
+                    disabled: a.roots.is_none(),
                 })
             }
             None => None,
@@ -998,7 +1002,7 @@ impl Engine {
                     .arg(&mins[*k][0])
                     .arg(&mins[*k][1])
                     .arg(&mins[*k][2]);
-                unsafe { b.launch(config(*nb)) }.ctx("passe 2D")?;
+                unsafe { b.launch(config(*nb)) }.ctx("2D pass")?;
             }
             let mut b = st.launch_builder(k3d);
             b.arg(&mut mem)
@@ -1040,6 +1044,21 @@ impl Engine {
         let (nqx, nqz) = (qx1 - qx0 + 1, qz1 - qz0 + 1);
         let nch = self.r * self.r;
         let (chx0, chz0) = (x0 >> 4, z0 >> 4);
+        if aq.disabled {
+            // Every block above the skip height takes the global fluid picker: no cell is read.
+            let skips = vec![i32::MIN; nch as usize];
+            let skip = st.clone_htod(&skips).ctx("skips")?;
+            let p = st.alloc_zeros::<i32>(3).ctx("positions")?;
+            let stt = st.alloc_zeros::<i32>(2).ctx("statuses")?;
+            let mut codes = st.alloc_zeros::<i8>(self.n_chunk * nch as usize).ctx("codes")?;
+            let zero = 0i32;
+            let mut l = st.launch_builder(&aq.blocks);
+            l.arg(mem).arg(&mut codes).arg(&p).arg(&stt).arg(&skip).arg(&x0).arg(&z0).arg(&gx).arg(&gx).arg(&self.r);
+            l.arg(&self.min_y).arg(&h).arg(&zero).arg(&zero).arg(&zero).arg(&zero).arg(&zero).arg(&zero).arg(&aq.sea);
+            unsafe { l.launch(config(self.n_chunk * nch as usize)) }.ctx("blocks")?;
+            st.synchronize().ctx("region aquifers")?;
+            return Ok((codes, skips, Cells { p, st: stt, grid: [0; 6] }));
+        }
         let mut s = st.alloc_zeros::<i32>((nqx * nqz) as usize).ctx("surface")?;
         let mut p = st.alloc_zeros::<i32>((3 * ncx * ncy * ncz) as usize).ctx("positions")?;
         let mut stt = st.alloc_zeros::<i32>((2 * ncx * ncy * ncz) as usize).ctx("statuses")?;
@@ -1139,7 +1158,7 @@ pub struct AquiferBatch<'a> {
 /// Codes of each block (0 default block, 1 air, 2 default fluid, 3 lava, +4 scheduled update, -1
 /// outside the grid) and skip_sampling_above_y of each chunk.
 pub fn aquifer_blocks(compiler: &DensityCompiler, seed: i64, b: &AquiferBatch) -> Result<(Vec<i8>, Vec<i32>), String> {
-    let src = codegen::generate_aquifer(compiler, b.roots, seed).map_err(|e| e.to_string())?;
+    let src = codegen::generate_aquifer(compiler, Some(b.roots), seed).map_err(|e| e.to_string())?;
     if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP") {
         let _ = std::fs::write(f, &src);
     }
@@ -1329,6 +1348,15 @@ pub enum SurfaceRule {
     /// there).
     OreVein { blocks: [u32; 3], raw_chance: f32, density: FunctionId, richness: FunctionId, gap: FunctionId, positive_y: [i32; 2] },
 }
+/// A positional random factory the surface draws from, as a kernel rebuilds it.
+#[derive(Clone, Copy, Debug)]
+pub enum Positional {
+    /// `XoroshiroPositionalRandomFactory`: its (lo, hi) state.
+    Xoroshiro(u64, u64),
+    /// `LegacyPositionalRandomFactory` (the Nether, the End): its seed.
+    Legacy(i64),
+}
+
 /// Surface condition in neutral form (anchors already resolved, names already translated to
 /// indices).
 #[derive(Clone, Debug)]
@@ -1342,7 +1370,7 @@ pub enum SurfaceCondition {
     YAbove { anchor: i32, multiplier: i32, add_stone: bool },
     Water { offset: i32, multiplier: i32, add_stone: bool },
     StoneDepth { offset: i32, add_surface: bool, secondary_range: i32, ceiling: bool },
-    Gradient { low: i32, high: i32, positional: (u64, u64) },
+    Gradient { low: i32, high: i32, positional: Positional },
     Not(usize),
 }
 /// Everything a world's surface uses (S3 milestone).
@@ -1355,7 +1383,7 @@ pub struct SurfaceSetup<'a> {
     pub secondary_noise: &'a dyn horizon_core::noise::Noise,
     pub clay_noise: &'a dyn horizon_core::noise::Noise,
     pub bands: [u32; 192],
-    pub root_positional: (u64, u64),
+    pub root_positional: Positional,
     pub ore_positional: (u64, u64),
     pub surface_level: FunctionId,
     /// Per biome: base temperature and frozen modifier.
@@ -1365,6 +1393,10 @@ pub struct SurfaceSetup<'a> {
     pub sea_level: i32,
     pub min_y: i32,
     pub height: i32,
+    /// The level whose biomes `chunk_states` is given; the noise may cover less of it (the
+    /// Nether's noise covers 128 of its 256 blocks).
+    pub biome_min_y: i32,
+    pub biome_height: i32,
     /// Eroded badlands pillars and icebergs (S4 milestone); `None`: columns without extensions.
     pub extensions: Option<SurfaceExtensions<'a>>,
     /// The fill states per code (& 3): default block, air, default fluid, lava.
@@ -1422,7 +1454,7 @@ impl Volume {
             if let Some((f, nb)) = k2d {
                 let mut b = st.launch_builder(f);
                 b.arg(&mut *mem).arg(&mins[*k][0]).arg(&mins[*k][1]).arg(&mins[*k][2]);
-                unsafe { b.launch(config(*nb)) }.ctx("passe 2D")?;
+                unsafe { b.launch(config(*nb)) }.ctx("2D pass")?;
             }
             let mut b = st.launch_builder(k3d);
             b.arg(&mut *mem).arg(&mins[*k][0]).arg(&mins[*k][1]).arg(&mins[*k][2]);
@@ -1491,6 +1523,7 @@ pub struct SurfaceGpu {
     volumes: Vec<Volume>,
     level: Volume,
     height: i32,
+    biome_height: i32,
     pool: Mutex<Vec<SurfaceResources>>,
     stats: SurfaceStats,
     /// Per region of LEVEL_R x LEVEL_R chunks, computed once for its chunks; the oldest are dropped
@@ -1571,6 +1604,7 @@ impl SurfaceGpu {
             volumes,
             level,
             height: setup.height,
+            biome_height: setup.biome_height,
             pool: Mutex::new(Vec::new()),
             stats: SurfaceStats::default(),
             regions: Mutex::new(Regions::default()),
@@ -1672,7 +1706,7 @@ impl SurfaceGpu {
     }
     /// Number of biomes `chunk_states` expects: the quarts of the 3 x 3 chunks around the chunk.
     pub fn biome_count(&self) -> usize {
-        9 * 16 * (self.height as usize / 4)
+        9 * 16 * (self.biome_height as usize / 4)
     }
     /// The chunk went through the CPU.
     pub fn note_cpu_fallback(&self) {

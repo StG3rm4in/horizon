@@ -13,6 +13,11 @@ pub trait PositionalRandom {
     fn xoroshiro_state(&self) -> Option<(u64, u64)> {
         None
     }
+    /// The seed of a legacy factory (`LegacyPositionalRandomFactory`), for samplers evaluated
+    /// elsewhere (the GPU fork); `None` for every other factory.
+    fn legacy_seed(&self) -> Option<i64> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +33,9 @@ impl LegacyPositionalRandom {
 }
 impl PositionalRandom for LegacyPositionalRandom {
     type Source = LegacyRandom;
+    fn legacy_seed(&self) -> Option<i64> {
+        Some(self.seed)
+    }
     fn at(&self, position: BlockPos) -> Self::Source {
         let p = (position_seed(position) as u64) & ((1 << 48) - 1);
         LegacyRandom::from_state(p ^ self.base)

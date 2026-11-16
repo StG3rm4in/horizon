@@ -118,7 +118,7 @@ impl ChunkIndex {
             cells,
         })
     }
-    #[inline]
+    #[inline(always)]
     fn get(&self, x: i32, z: i32) -> Option<usize> {
         match self {
             Self::Grid {
@@ -139,8 +139,14 @@ impl ChunkIndex {
                     i => Some(i as usize),
                 }
             }
-            Self::Sparse(map) => map.get(&(x, z)).map(|&i| i as usize),
+            Self::Sparse(map) => Self::sparse_get(map, x, z),
         }
+    }
+    /// `get` for chunks spread far apart: rare, kept out of the grid's inlined path.
+    #[cold]
+    #[inline(never)]
+    fn sparse_get(map: &HashMap<(i32, i32), u32>, x: i32, z: i32) -> Option<usize> {
+        map.get(&(x, z)).map(|&i| i as usize)
     }
 }
 impl<'r, B: TerrainBlockStates> TerrainRegion<'r, B> {
@@ -265,9 +271,17 @@ impl<'r, B: TerrainBlockStates> TerrainRegion<'r, B> {
             None => Err(RegionError::MissingChunk([x, z])),
         }
     }
+    /// The state at `[x, y, z]`, `None` outside the region's chunks: the read behind `block`,
+    /// with the chunk lookup and the section read inlined into it, and returned in a register
+    /// (the `RegionError` result of `block` goes through memory).
+    pub fn block_at(&self, [x, y, z]: [i32; 3]) -> Option<BlockStateId> {
+        let index = self.index.get(x >> 4, z >> 4)?;
+        Some(self.chunks[index].block(x, y, z))
+    }
     #[inline]
-    pub fn block(&self, [x, y, z]: [i32; 3]) -> Result<BlockStateId, RegionError> {
-        Ok(self.chunk(x >> 4, z >> 4)?.block(x, y, z))
+    pub fn block(&self, position: [i32; 3]) -> Result<BlockStateId, RegionError> {
+        self.block_at(position)
+            .ok_or_else(|| RegionError::MissingChunk([position[0] >> 4, position[2] >> 4]))
     }
     /// `FeatureWorld::scan_column` within one chunk's column.
     pub fn scan_column(

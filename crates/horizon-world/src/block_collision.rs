@@ -75,7 +75,25 @@ impl<E: std::fmt::Display> std::fmt::Display for CollisionQueryError<E> {
 }
 impl<E: std::error::Error + 'static> std::error::Error for CollisionQueryError<E> {}
 
+/// [`BlockCollisionRegistry::fixed_facts`]: the shape is empty.
+pub const FIXED_EMPTY: u16 = 1 << 12;
+/// [`BlockCollisionRegistry::fixed_facts`]: the shape fills the whole block.
+pub const FIXED_FULL_BLOCK: u16 = 1 << 13;
+const FIXED_KNOWN: u16 = 1 << 15;
+
+/// Whether `shape` fills the whole block: not empty, bounds 0 to 1 on every axis, every cell full.
+pub fn shape_fills_block(shape: &VoxelShape) -> bool {
+    let [nx, ny, nz] = shape.sizes();
+    !shape.is_empty()
+        && [Axis::X, Axis::Y, Axis::Z]
+            .into_iter()
+            .all(|axis| shape.min(axis) == 0.0 && shape.max(axis) == 1.0)
+        && (0..nx).all(|x| (0..ny).all(|y| (0..nz).all(|z| shape.is_full(x as i32, y as i32, z as i32))))
+}
+
 pub struct BlockCollisionRegistry<'r> {
+    /// Per state, the facts of [`fixed_facts`](Self::fixed_facts) once worked out; 0 until then.
+    fixed: Vec<std::sync::atomic::AtomicU16>,
     cached: Arc<CachedCollisionRegistry<'r>>,
     dynamic: HashMap<BlockStateId, DynamicSupport>,
     contextual: HashMap<BlockStateId, ContextualRule>,
@@ -137,6 +155,7 @@ impl<'r> BlockCollisionRegistry<'r> {
         }
         let pistons = PistonBlockBindings::new(cached.registry()).ok();
         Ok(Self {
+            fixed: (0..cached.registry().len()).map(|_| std::sync::atomic::AtomicU16::new(0)).collect(),
             cached,
             dynamic,
             contextual,
@@ -188,6 +207,42 @@ impl<'r> BlockCollisionRegistry<'r> {
         self.scan_flags
             .get(state.0 as usize)
             .is_none_or(|flags| flags & 3 != 0)
+    }
+    /// Facts about the collision shape of `state` when it is fixed (the cached shape that
+    /// [`collision_shape`](Self::collision_shape) clones), worked out once per state and shared
+    /// by every thread: bits 0 to 5 whether the face in each direction is full
+    /// (`SupportType::Full.is_supporting`), bits 6 to 11 whether it is not empty (`face_shape`),
+    /// [`FIXED_EMPTY`] and [`FIXED_FULL_BLOCK`]. None for a state without a fixed shape, or when
+    /// a fact cannot be worked out (the caller then goes through `collision_shape`).
+    #[inline]
+    pub fn fixed_facts(&self, state: BlockStateId) -> Option<u16> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let cell = self.fixed.get(state.0 as usize)?;
+        let known = cell.load(Relaxed);
+        if known & FIXED_KNOWN != 0 {
+            return Some(known);
+        }
+        let shape = self.cached.cached_shape(state).ok()??;
+        let mut facts = FIXED_KNOWN;
+        for direction in Direction::ALL {
+            if crate::block_support::SupportType::Full
+                .is_supporting(shape, direction)
+                .ok()?
+            {
+                facts |= 1 << direction as u8;
+            }
+            if !shape.face_shape(direction).ok()?.is_empty() {
+                facts |= 1 << (6 + direction as u8);
+            }
+        }
+        if shape.is_empty() {
+            facts |= FIXED_EMPTY;
+        }
+        if shape_fills_block(shape) {
+            facts |= FIXED_FULL_BLOCK;
+        }
+        cell.store(facts, Relaxed);
+        Some(facts)
     }
     pub fn collision_shape<W: DynamicCollisionWorld>(
         &self,

@@ -135,3 +135,168 @@ without the geode):
 About −1.5% of CPU per chunk: less than the estimated 3 to 5%, because the geode was abandoned and
 writing the ore cells only gains about ten percent, not a third. The throughput stays within the
 noise between zones.
+
+
+## Ore cells by row and by state (16/11, dual channel)
+
+Profile before (`/tmp/profil_b1.sh`, zone 4750000/−4770000, `/tmp/sous_deco.py`): the ores weigh
+11.5% of the CPU, 7.4% for writing the cells the GPU computed (`OrePlan::place`; per cell, a dynamic
+call to the target test, `set_slot`, and two property lookups for the non-air count) and 4.6% for
+the prediction.
+
+What changed:
+
+- `TerrainChunk::replace_row_states` (terrain.rs) is `replace_row_raw` for a decision that depends
+  only on the state: it asks the decision once per state met in the row (`StateMemo`, with the change
+  to the non-air count), reads the slot once (`BlockSection::slot_state`) and writes through
+  `BlockSection::set_at`, which only changes the word and two counts when the new state is the last
+  one looked up and no palette entry dies or fills the section; otherwise `set_slot` as before.
+  `PlacementContext::replace_row_states` (default: `replace_row`) and `World` route it per chunk.
+  `OreFeature::place_cells` uses it: its rules are pure and only read the position's Y, the row's.
+- `predict_ores` keeps its vectors from one chunk to the next (`OreBuffers`, per worker thread): a
+  chunk's plan holds some 20,000 spheres, which growing vectors copied again and again.
+
+Checks:
+
+- unit test `replace_row_states_matches_replace_row_raw`: 40 rounds of 3,000 random rows through
+  uniform, air, growing and shrinking sections, with decisions that sometimes write air: same
+  answers, same sections (`to_nbt`) and same non-air counts;
+- probe byte-identical on 4 zones, all on the GPU and with `HORIZON_GPU_ORES=test` (0 mismatches);
+  vanilla parity at 0 differences on 785 chunks.
+
+Bench `/tmp/ab26.sh` (release, lz4; binaries from before in `target/avant-ores/`; the copies
+alternate between the variants):
+
+| Zone | CPU per chunk before → after | Throughput before → after |
+|---|---|---|
+| 4800000/−4820000 | 3.35 → 3.32 ms (−0.9%) | 2,343 → 2,344 chunks/s |
+| −4830000/4840000 | 3.68 → 3.59 ms (−2.4%) | 2,225 → 2,269 (+2.0%) |
+| 4850000/−4870000 | 2.89 → 2.85 ms (−1.4%) | 2,539 → 2,540 |
+
+**About −1.6% of CPU per chunk.** Profile after (zone 5000000/−5020000): writing the cells goes
+from 7.4% to 6.6% of the CPU (`set_slot` 1.3% → 0.3%, the decision 1.0% → 0.3%) and the prediction
+from 4.6% to 4.2%. What is left of the writes is the loop over the cells itself, 3.7% in self time:
+locating each cell in the packed words and reading it, spread over the sections of the 3 × 3
+region. The prediction left is the placement chain and its biome tests (2.8%), shared with the
+CPU path.
+
+
+## Fixed collision faces for `can_attach` (16/11)
+
+The shape updates looked like the next target (3% of the CPU in a forest zone), but they only weigh
+1.2% on the zone of the ore profile (5000000/−5020000), plus 0.9% on the main thread, spread over
+`update_shape_at`, tick scheduling and survival checks; `updateShape` reads other blocks and
+schedules ticks, so it cannot be cached safely. Left as is.
+
+That zone has deep dark: the sculk patches weigh **9.9% of the CPU** there (`spread_all` 7.9%), of
+which `BlockSurvivalRegistry::can_attach_to` 3.7%. For each face, `can_attach` cloned the
+neighbour's collision shape, took its face, built a full block to compare with, and dropped the
+three (`collision_shape`, `face_shape`, `VoxelShape::block`, `drop_glue`).
+
+`BlockSurvivalRegistry::fixed_face_full` (block_survival.rs) answers that second test once per
+state, for its six faces, when the state's collision shape is the cached one (`collision_shape`
+clones exactly that shape): a byte per state, bit 7 once known, kept in atomics shared by the
+workers. States with a dynamic shape, and any face whose test fails, go the long way as before. It
+serves the sculk spread and every multiface block (glow lichen, sculk veins, vines).
+
+Checks: 507 horizon-world tests; probe byte-identical on 4 zones; vanilla parity at 0 differences on
+785 chunks.
+
+Bench `/tmp/ab26.sh` (release, lz4; binaries from before, with the ore change, in
+`target/avant-sculk/`; the copies alternate):
+
+| Zone | CPU per chunk before → after | Throughput before → after |
+|---|---|---|
+| 5000000/−5020000 (deep dark) | 3.50 → 3.30 ms (−5.7%) | 2,207 → 2,301 chunks/s (+4.3%) |
+| 5050000/−5070000 | 3.18 → 3.14 ms (−1.3%) | 2,403 → 2,403 |
+| −5080000/5090000 | 3.01 → 2.95 ms (−2.0%) | 2,516 → 2,521 |
+
+From −1.3% to −5.7% of CPU per chunk depending on how much deep dark and lichen a zone has.
+
+
+## Average over six zones (16/11, dual channel)
+
+The composition of the decorations changes a lot from one zone to the next: sculk weighed 1.4% of
+the CPU in one profile and 9.9% in another, trees 10.6% and 4.2%. To choose the next target on an
+average, `/tmp/ft1.sh` (`HORIZON_FEATURE_TIMES=1`, profiling binaries, everything on the GPU)
+measured six fresh zones of 40,401 chunks spread over the map (5200000/−5220000, −5230000/5240000,
+5250000/5270000, −5280000/−5290000, 5300000/−5320000, −5330000/5340000), averaged by
+`/tmp/ft_avg.py` with each zone weighted the same.
+
+The decoration takes 1,525 to 2,450 µs per chunk, **1,890 on average**:
+
+| Family | µs per chunk | Share | Range over the zones |
+|---|---|---|---|
+| Ores (GPU prediction included) | 596 | 31.6% | 575 to 624 |
+| Deep dark sculk | 262 | 13.9% | 74 to 591 |
+| Trees | 259 | 13.7% | 77 to 377 |
+| Other features | 135 | 7.1% | 98 to 211 |
+| Amethyst geode | 134 | 7.1% | 128 to 138 |
+| Structures | 118 | 6.2% | 68 to 189 |
+| Lush caves, lichen, vines | 107 | 5.7% | 65 to 150 |
+| Speleothems | 79 | 4.2% | 24 to 180 |
+| Snow and ice | 49 | 2.6% | 29 to 79 |
+| Monster rooms | 38 | 2.0% | 36 to 41 |
+| `decorate` setup and the rest | 113 | 6.0% | |
+
+The largest single features: `sculk_patch_deep_dark` 251 µs (70 to 568), the ore prediction 148,
+`ore_dirt` 136, `amethyst_geode` 134, `trees_birch_and_oak_leaf_litter` 129 (26 to 223).
+
+These are wall times measured while the other workers run. `ore_dirt`, the first planned ore of
+the step, also waits for the chunk's GPU ore batch (its 136 µs against 37 for granite, diorite or
+andesite): part of the ores' share is that wait, which leaves the core to the other thread and
+does not cost CPU. Since the decoration is about 45% of the CPU, the averages in CPU terms are
+roughly: ores below 14%, sculk 6%, trees 6%, geode 3%.
+
+## Shared decoration infrastructure (16/11)
+
+Features (trees, sculk, geodes, monster rooms, placement modifiers, block predicates) all read
+blocks through `TerrainRegion::block`. A profile with call graphs (`/tmp/profil_b1.sh 5400000
+-5420000`) put the decoration code that belongs to no feature at 17% of the CPU, but spread out: the
+callers of the block reads are scattered over every feature. The profiling binaries (no LTO, 16
+codegen units) inline less than the release build, so the targets were taken from a flat profile of
+the release binaries themselves (`/tmp/profil_rel.sh copy x z`, `perf record -F 999` without call
+graph, zone 5450000/−5470000):
+
+- **Block reads, 12.1% of the CPU** in three functions that release never inlined:
+  `BlockSection::state` 4.8%, `TerrainRegion::block` 4.5%, `ChunkIndex::get` 2.8%.
+  `ChunkIndex::get` stayed out of line because of its `HashMap` arm (chunks spread far apart), and
+  `TerrainRegion::block` returned a `Result<_, RegionError>` of at least 24 bytes, through memory.
+- **`state_face_sturdy`, 1.4%**, 92% of it on `lock incq` / `lock decq`: every call cloned
+  `BlockBehavior::support`, an `Arc` shared by the eleven workers, so its counter's cache line
+  travelled between cores. `center_sturdy`, `state_collision_empty` and `collision_full_block`
+  cloned `support` or `collision` the same way. The clones were not needed: `World::blocks` gives an
+  `&'a BlockBehavior` that does not borrow the world.
+- An audit of the atomic instructions of every function above 0.15% (`perf annotate`, share of the
+  samples on `lock` instructions) found only `StartCache::get` besides (0.7%, half of it on its
+  `RwLock`), left as it is.
+
+Changes:
+
+- `TerrainRegion::block_at` (feature_region.rs) returns an `Option<BlockStateId>`, in a register;
+  `block` wraps it. The chunk lookup (`ChunkIndex::get`, its sparse arm moved to a cold
+  `sparse_get`), `TerrainChunk::block`, `TerrainBlocks::block`, `BlockSection::state` and
+  `PackedStorage::read` are `#[inline(always)]`: a block read is one call instead of three. In the
+  release binary only `block_at` and `sparse_get` remain as functions.
+- `World` borrows `support` and `collision` instead of cloning them (generator_decoration.rs).
+
+Checks: 507 horizon-world tests and 162 horizon-core tests; probe identical on the 4 overworld zones
+(CPU and everything on the GPU), the 2 Nether zones and the 3 End zones; vanilla parity 0
+differences on 785 chunks.
+
+In the release profile afterwards (zone 5560000/−5570000), the block reads weigh 7.6% (`block_at`)
+instead of 12.1%, and `state_face_sturdy` 0.08% instead of 1.4%. What is left of the read is mostly
+its loads (section, storage word, palette), which miss the cache. The bench `/tmp/ab26.sh`
+(`HS_AVANT` = `target/avant-infra/`, copies alternated) measures less than the profile suggests:
+
+| Zone | CPU per chunk before → after | Throughput before → after |
+|---|---|---|
+| 5500000/−5520000 | 3.42 → 3.34 ms (−2.3%) | 2,341 → 2,368 chunks/s |
+| −5530000/5540000 | 3.27 → 3.21 ms (−1.8%) | 2,411 → 2,404 chunks/s |
+
+About 2% less CPU per chunk; the throughput difference is within the noise.
+
+Left in the shared infrastructure, from the same profile: the biome filter (`BiomeZoom::quart_at_block`
+0.9%, `uniform_section` 0.8%, `chunk_biomes` 0.7%, `biome_identity` 0.6%), the write path
+(`BlockSection::set_slot` 1.9%, `set_block_worldgen` 1.7%, `World::set_block` 0.5%) and the
+placement modifiers' own code (`modify_inner` 1.2%).
