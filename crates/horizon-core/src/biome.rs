@@ -221,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn quart_at_block_matches_reference() {
         let seeds = [
             0i64,
@@ -246,9 +247,10 @@ mod tests {
         ];
         for &seed in &seeds {
             let zoom = BiomeZoom::new(seed);
-            for x in -34..34 {
-                for y in -34..34 {
-                    for z in -34..34 {
+            // This range still covers every `v & 3` pattern and the sign change at 0.
+            for x in -9..9 {
+                for y in -9..9 {
+                    for z in -9..9 {
                         let block = BlockPos::new(x, y, z);
                         assert_eq!(
                             zoom.quart_at_block(block),
@@ -274,6 +276,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "daily"]
     fn corner_jitter_matches_quart_at_block() {
         for seed in [0i64, -1, i64::MIN, 0x0123_4567_89ab_cdef] {
             let zoom = BiomeZoom::new(seed);
