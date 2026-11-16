@@ -176,3 +176,25 @@ blocks, fresh zones; each setting goes once through each copy:
   channel. In single channel, the threads sharing a core mostly waited for the same memory channel;
   with two channels, the extra workers add half again as much throughput.
 - The CPU is still the limit: 15 workers only add 2 to 5%.
+
+## After merging upstream main (16/11)
+
+The merge of upstream main at 54717b2965 (436 commits, the mod API merge among them) leaves the
+throughput where it was. `/tmp/ab26.sh` against the binaries from before the merge (kept in
+`~/bancs/avant-merge/bin/`, next to a copy of the resources they were prepared with), copies
+alternated:
+
+| Zone | CPU per chunk before → after | Throughput before → after |
+|---|---|---|
+| 5600000/−5620000 | 3.62 → 3.59 ms | 2,183 → 2,231 chunks/s |
+| −5630000/5640000 | 3.29 → 3.28 ms | 2,425 → 2,432 chunks/s |
+
+After a merge, the resources must be prepared again (`horizon-prepare`, a few seconds) before the
+tests, the probe or the parity harness say anything: with the resources of 14/11, 202 horizon-world
+tests failed on pure upstream as on the merge, upstream's own probe output differed in 4 of the 9
+zones, and the vanilla parity found 372 chunks apart. Prepared again, the probe of the merge is
+byte-identical to pure upstream's in the three dimensions (CPU, everything on the GPU, test modes)
+and the parity finds 0 differences.
+
+The game binary is now built from `horizon-game`: `cargo build --release -p horizon-game --bin
+horizon-client -p horizon-server`.
