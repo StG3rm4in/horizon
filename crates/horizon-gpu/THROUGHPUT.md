@@ -226,3 +226,35 @@ zones, the three copies:
 At 1 ms the thread runs 516 passes a second and takes 0.45 of a core instead of 0.85. The
 throughput does not move: the scheduling thread's CPU was not what held `/pregen` back, and the
 workers do not take the core it leaves (the process uses about 7.4 of the 12 logical CPUs).
+
+## What the workers wait for (16/11)
+
+With the scheduling thread at 0.45 of a core, the 11 chunk workers were busy 58% of the time each
+and the machine's logical CPUs 65%. Their time off the CPU over 10 s of `/pregen` (`/tmp/pg1.sh`,
+offcputime on the bench build), 37.9 s in all:
+
+| What | Time |
+|---|---|
+| No job queued (the pool's wait) | 12.1 s |
+| The chunk's own GPU stream (`Engine::chunk_codes`: the copy, and the surface queued behind it) | 8.2 s |
+| Structure starts (`StructureState::build_starts`, a lock) | 6.3 s |
+| A region another worker computes (`OnceLock`, density and surface regions) | 2.8 s |
+| Ore and cave batches, structure chunks, aquifers, biomes (stream waits) | 5.5 s |
+
+The `/pregen` trace (`HORIZON_PREGEN_TRACE=1`) finds the job queue empty at 7 to 13% of the
+passes, generation near its cap (about 29 of 33 jobs, `workers * 3`), decoration at 11 to 19 of 22.
+
+**More workers.** Waiting threads leave their core to others, so more workers than the machine's
+threads overlap the waits: with `HORIZON_WORKER_THREADS=18` (17 chunk workers), `/pregen` ran
+2,301 → 2,418 and 2,126 → 2,213 chunks/s (+5.1 and +4.1%), for 5 to 7.5% more CPU per chunk. The
+server's `[engine] worker_threads` sets the variable (docs/hosting.md).
+
+**Computing the density regions ahead: no gain, not kept.** A thread computed the eight neighbours
+of each region a worker first asked for, so that workers would find them ready (patch kept in
+`~/bancs/avant/prefetch/prefetch.diff`; exact: probe identical, parity 0). Against the same build
+with `HORIZON_GPU_PREFETCH=0`: 2,213 → 2,225 and 2,605 → 2,572 chunks/s, within the noise, for up to
+2 GB more GPU memory. A region is 3 ms of GPU work for 64 chunks; each chunk then waits about 1 ms
+on its own stream (its surface and its readback), which the regions computed ahead made longer
+(8.2 → 10.6 s) by keeping the GPU busier, and the remaining `OnceLock` waits are mostly on the
+surface's regions. What would remove the stream waits is doing the CPU's own work on a chunk while
+its GPU work runs, rather than one after the other.
