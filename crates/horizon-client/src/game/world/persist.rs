@@ -1497,23 +1497,28 @@ impl Game<'_> {
     /// The vehicle with this UUID, among the ones in the world.
     pub(super) fn vehicle_by_uuid(&self, uuid: [i32; 4]) -> Option<u32> {
         self.persist.uuids.iter().find_map(|(&id, &found)| {
+            // The UUID first: the checks below scan every mob, boat and cart, and ran for every
+            // entity with a UUID; saving the entities of unloading chunks (`entity_chunks`, a call
+            // per saved entity) took 59 % of the server tick with 100 players.
+            if found != uuid {
+                return None;
+            }
             let mob_boat_or_cart = self.mobs.iter().any(|mob| mob.id == id)
                 || self.boats.iter().any(|boat| boat.id == id)
                 || self.carts.iter().any(|cart| cart.id == id);
-            (found == uuid
-                && (self.mobs.iter().any(|mob| mob.id == id && !mob.removed)
-                    || (self.boats.iter().any(|boat| boat.id == id)
-                        && self.resident_source_target_visible(
-                            self.dim.key(),
-                            super::commands::Target::Boat(id),
-                        ))
-                    || (self.carts.iter().any(|cart| cart.id == id)
-                        && self.resident_source_target_visible(
-                            self.dim.key(),
-                            super::commands::Target::Cart(id),
-                        ))
-                    // A vehicle of another kind (an armor stand, a display...).
-                    || (!mob_boat_or_cart && self.passenger_present(id))))
+            (self.mobs.iter().any(|mob| mob.id == id && !mob.removed)
+                || (self.boats.iter().any(|boat| boat.id == id)
+                    && self.resident_source_target_visible(
+                        self.dim.key(),
+                        super::commands::Target::Boat(id),
+                    ))
+                || (self.carts.iter().any(|cart| cart.id == id)
+                    && self.resident_source_target_visible(
+                        self.dim.key(),
+                        super::commands::Target::Cart(id),
+                    ))
+                // A vehicle of another kind (an armor stand, a display...).
+                || (!mob_boat_or_cart && self.passenger_present(id)))
             .then_some(id)
         })
     }
