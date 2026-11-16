@@ -17,7 +17,8 @@
           "parallel_tick": false,
           "path": "",
           "resources": "",
-          "restart_on_crash": true
+          "restart_on_crash": true,
+          "worker_threads": 0
         },
         "panel": {"allow_public": false, "bind": "127.0.0.1:8130"},
         "properties": {},

@@ -186,6 +186,7 @@ resources = ""               # the prepared game files; empty: resources/ here, 
 restart_on_crash = true
 low_memory = false           # true: less memory, slightly slower ticks (see below)
 parallel_tick = false        # true: the tick shares its work among helper threads (see below)
+worker_threads = 0           # the game's worker threads; 0: as many as the machine has (see below)
 
 [backups]
 every = "6h"                 # 30m, 6h, 1d...; "0" turns automatic backups off
@@ -816,6 +817,18 @@ the game with huge pages off. Measured on a 4-core EPYC VPS with 20 bots playing
 Turn it on when memory is what you're short of, for example on a small VPS. It applies at the next start.
 A game started without `horizon-server` (`horizon-client --dedicated`, a container of your own) gets the same
 effect from the environment variable `MIMALLOC_ALLOW_THP=0`. On macOS and Windows it changes nothing.
+
+### Worker threads: `worker_threads`
+
+0 by default: the game's thread pools share out as many threads as the machine offers it, the pool that
+generates, lights and saves chunks one fewer. Under `[engine]`, `worker_threads = 18` gives them 18 instead,
+at the next start. It is the environment variable `HORIZON_WORKER_THREADS`, for a host that cannot set one;
+at 0, a `HORIZON_WORKER_THREADS` already in the server's environment still applies.
+
+The chunk workers wait for much of their time (the GPU's results, other workers' structure starts), so more of
+them than the machine has threads can generate faster: on 6 cores and 12 threads, `/pregen` with GPU
+generation ran 4 to 5 % faster with 18 (17 chunk workers) than with the default, for 5 to 7 % more CPU per
+chunk.
 
 ### Parallel tick: `parallel_tick`
 

@@ -122,6 +122,7 @@ Any other server.properties key, spelled as vanilla spells it, for example: spaw
 | `restart_on_crash` | `true` |  | start the game again when it crashes |
 | `low_memory` | `false` |  | true: no transparent huge pages, ~60 MB less idle for ~1 % more tick time |
 | `parallel_tick` | `false` |  | true: the server tick shares its work among helper threads (docs/hosting.md) |
+| `worker_threads` | `0` |  | the game's worker threads (docs/hosting.md); 0: as many as the machine has |
 
 ### `[backups]`
 

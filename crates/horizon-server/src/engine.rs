@@ -146,6 +146,7 @@ pub fn spawn(
     dir: &Path,
     low_memory: bool,
     parallel_tick: bool,
+    worker_threads: u32,
     entities: &Entities,
     transfers: Option<&str>,
 ) -> std::io::Result<Child> {
@@ -155,6 +156,7 @@ pub fn spawn(
         dir,
         low_memory,
         parallel_tick,
+        worker_threads,
         entities,
         transfers,
     )?
@@ -168,6 +170,7 @@ fn command(
     dir: &Path,
     low_memory: bool,
     parallel_tick: bool,
+    worker_threads: u32,
     entities: &Entities,
     transfers: Option<&str>,
 ) -> std::io::Result<Command> {
@@ -178,6 +181,11 @@ fn command(
     // the variable alone, so one the operator set still works.
     if parallel_tick {
         command.env("HORIZON_PARALLEL_TICK", "1");
+    }
+    // `[engine] worker_threads`: the threads the game's pools share out, the chunk workers one fewer. 0 leaves
+    // the variable alone (the machine's count, or one the operator set).
+    if worker_threads > 0 {
+        command.env("HORIZON_WORKER_THREADS", worker_threads.to_string());
     }
     // `[entities] dab`: the game's switch and its three numbers (mobs/dab.rs). Off leaves the variables alone.
     if entities.dab {
@@ -324,6 +332,7 @@ mod tests {
                 &dir,
                 low_memory,
                 false,
+                0,
                 &Entities::default(),
                 None,
             )
@@ -338,6 +347,30 @@ mod tests {
     }
 
     #[test]
+    fn worker_threads_reach_the_game_only_when_set() {
+        let threads = |worker_threads| {
+            let dir = std::env::temp_dir();
+            let command = command(
+                Path::new("horizon-client"),
+                &dir,
+                &dir,
+                false,
+                false,
+                worker_threads,
+                &Entities::default(),
+                None,
+            )
+            .unwrap();
+            command
+                .get_envs()
+                .find(|(k, _)| *k == "HORIZON_WORKER_THREADS")
+                .and_then(|(_, v)| v.map(|v| v.to_owned()))
+        };
+        assert_eq!(threads(18).as_deref(), Some(std::ffi::OsStr::new("18")));
+        assert_eq!(threads(0), None);
+    }
+
+    #[test]
     fn parallel_tick_reaches_the_game_only_when_it_is_on() {
         let switch = |parallel_tick| {
             let dir = std::env::temp_dir();
@@ -347,6 +380,7 @@ mod tests {
                 &dir,
                 false,
                 parallel_tick,
+                0,
                 &Entities::default(),
                 None,
             )
@@ -370,6 +404,7 @@ mod tests {
                 &dir,
                 false,
                 false,
+                0,
                 &entities,
                 None,
             )
@@ -424,6 +459,7 @@ mod tests {
                 &dir,
                 false,
                 false,
+                0,
                 &Entities::default(),
                 transfers,
             )
@@ -579,6 +615,7 @@ mod tests {
                 &server,
                 false,
                 false,
+                0,
                 &Entities::default(),
                 None,
             ) {
