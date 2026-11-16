@@ -57,7 +57,11 @@ impl CarvingMask {
     }
     /// A mask from its packed words (bit `y - min_y + (z + x * 16) * height`), as `words` gives
     /// them; extra zero words are dropped.
-    pub fn from_words(min_y: i32, max_y: i32, mut words: Vec<u64>) -> Result<Self, CarvingMaskError> {
+    pub fn from_words(
+        min_y: i32,
+        max_y: i32,
+        mut words: Vec<u64>,
+    ) -> Result<Self, CarvingMaskError> {
         let mut mask = Self::new(min_y, max_y)?;
         if words.len() > (1 << 24) / 64 {
             return Err(CarvingMaskError::Capacity);

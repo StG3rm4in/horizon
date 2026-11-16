@@ -424,9 +424,14 @@ impl VanillaTerrain {
             static BY_VALUES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let by_values = *BY_VALUES
                 .get_or_init(|| std::env::var("HORIZON_COLUMN").as_deref() == Ok("values"));
-            if by_values && base >= lo && base + 16 <= hi && chunk.terrain.section_states(base, &mut values) {
+            if by_values
+                && base >= lo
+                && base + 16 <= hi
+                && chunk.terrain.section_states(base, &mut values)
+            {
                 if values.iter().any(|&id| id != 0) {
-                    Arc::make_mut(&mut out.sections[si as usize]).blocks = Section::from_blocks(&values);
+                    Arc::make_mut(&mut out.sections[si as usize]).blocks =
+                        Section::from_blocks(&values);
                 }
                 continue;
             }

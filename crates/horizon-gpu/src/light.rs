@@ -10,7 +10,8 @@
 //! again.
 use super::{Context, context, ptx};
 use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
+    PushKernelArg,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -411,7 +412,8 @@ impl LightGpu {
         let n_output = 8 + STRIDE * self.nsec;
         Ok(LightResources {
             input: st.alloc_zeros::<u64>(n_input).ctx("input")?,
-            h_input: unsafe { self.ctx.alloc_pinned_with_flags::<u64>(n_input, 0) }.ctx("host buffer")?,
+            h_input: unsafe { self.ctx.alloc_pinned_with_flags::<u64>(n_input, 0) }
+                .ctx("host buffer")?,
             states: st.alloc_zeros::<u16>(cells).ctx("states")?,
             sky: st.alloc_zeros::<u8>(cells).ctx("sky")?,
             blocks: st.alloc_zeros::<u8>(cells).ctx("blocks")?,
@@ -420,7 +422,8 @@ impl LightGpu {
             f1: st.alloc_zeros::<u32>(cells).ctx("front")?,
             seeds: st.alloc_zeros::<u32>(cells).ctx("seeds")?,
             output: st.alloc_zeros::<u8>(n_output).ctx("output")?,
-            h_output: unsafe { self.ctx.alloc_pinned_with_flags::<u8>(n_output, 0) }.ctx("host buffer")?,
+            h_output: unsafe { self.ctx.alloc_pinned_with_flags::<u8>(n_output, 0) }
+                .ctx("host buffer")?,
             st,
             end,
             fill_done,
@@ -440,7 +443,13 @@ impl LightGpu {
         if h == 0 || h % 16 != 0 || h > 16 * self.nsec {
             return Err("light height".into());
         }
-        self.launch(h, sky, present, |e| fill(e).map(|n| (n, 0, 0, 0)), Plan::default())
+        self.launch(
+            h,
+            sky,
+            present,
+            |e| fill(e).map(|n| (n, 0, 0, 0)),
+            Plan::default(),
+        )
     }
     /// [`submit`](Self::submit) of a batch described section by section: the sections already on
     /// the GPU are read from the cache, the others are sent inline and put in the cache for the
@@ -533,7 +542,8 @@ impl LightGpu {
                                     Some(s) => {
                                         e.slots[s as usize] = Slot {
                                             key,
-                                            guard: Arc::downgrade(section) as Weak<dyn Any + Send + Sync>,
+                                            guard: Arc::downgrade(section)
+                                                as Weak<dyn Any + Send + Sync>,
                                             list: palette.is_some(),
                                             bits: *bits,
                                             npal,
@@ -571,7 +581,11 @@ impl LightGpu {
         self.stats.inline.fetch_add(inline, Relaxed);
         // A section inline from `at`: the infos of its palette (two per word), then its words; the
         // start of the palette and that of the words.
-        let inline_at = |e: &mut [u64], at: &mut usize, palette: Option<&[u32]>, words: &[u64]| -> Option<(usize, usize)> {
+        let inline_at = |e: &mut [u64],
+                         at: &mut usize,
+                         palette: Option<&[u32]>,
+                         words: &[u64]|
+         -> Option<(usize, usize)> {
             let pal = *at;
             if let Some(list) = palette {
                 if list.len() > 0xFFFF || *at + list.len().div_ceil(2) + words.len() > e.len() {
@@ -609,7 +623,15 @@ impl LightGpu {
                         e[kk] = 1 | u64::from(v) << 32;
                         e[kk + 1] = 0;
                     }
-                    (LightInput::Packed { bits, palette, words, .. }, InputKind::Inline | InputKind::Fill(_)) => {
+                    (
+                        LightInput::Packed {
+                            bits,
+                            palette,
+                            words,
+                            ..
+                        },
+                        InputKind::Inline | InputKind::Fill(_),
+                    ) => {
                         let (pal, words_at) = inline_at(e, &mut at, *palette, words)?;
                         let b = u64::from(*bits);
                         match palette {
@@ -627,7 +649,15 @@ impl LightGpu {
                             copies.push((start, at - start, s as usize * SLOT_WORDS));
                         }
                     }
-                    (LightInput::Packed { bits, palette, words, .. }, InputKind::Cache(s)) => {
+                    (
+                        LightInput::Packed {
+                            bits,
+                            palette,
+                            words,
+                            ..
+                        },
+                        InputKind::Cache(s),
+                    ) => {
                         let base = s as usize * SLOT_WORDS;
                         let b = u64::from(*bits);
                         match palette {
@@ -706,8 +736,11 @@ impl LightGpu {
                 fill(e).ok_or("light input too big")?
             };
             let st = res.st.clone();
-            st.memcpy_htod(&res.h_input.as_slice().ctx("host buffer")?[..n], &mut res.input.slice_mut(0..n))
-                .ctx("section upload")?;
+            st.memcpy_htod(
+                &res.h_input.as_slice().ctx("host buffer")?[..n],
+                &mut res.input.slice_mut(0..n),
+            )
+            .ctx("section upload")?;
             let dev_cache = self.cache.as_ref().map_or(&self.empty, |c| &c.dev);
             if ncopies > 0 {
                 let at = copies_at as u32;
@@ -733,31 +766,59 @@ impl LightGpu {
             let counters = res.input.slice(2..3);
             {
                 let mut l = st.launch_builder(&self.k_states);
-                l.arg(&res.input).arg(dev_cache).arg(&self.info).arg(&mut res.states).arg(&mut res.blocks);
-                l.arg(&mut res.seeds).arg(&counters).arg(&cells).arg(&nsh).arg(&ninfo).arg(&check);
+                l.arg(&res.input)
+                    .arg(dev_cache)
+                    .arg(&self.info)
+                    .arg(&mut res.states)
+                    .arg(&mut res.blocks);
+                l.arg(&mut res.seeds)
+                    .arg(&counters)
+                    .arg(&cells)
+                    .arg(&nsh)
+                    .arg(&ninfo)
+                    .arg(&check);
                 unsafe { l.launch(config(9 * nsh as usize, 256)) }.ctx("states")?;
             }
             {
                 let mut l = st.launch_builder(&self.k_sky);
-                l.arg(&res.input).arg(&res.states).arg(&mut res.sky).arg(&mut res.floors).arg(&self.masks_d);
+                l.arg(&res.input)
+                    .arg(&res.states)
+                    .arg(&mut res.sky)
+                    .arg(&mut res.floors)
+                    .arg(&self.masks_d);
                 l.arg(&self.types);
                 unsafe { l.launch(config(WW.div_ceil(128), 128)) }.ctx("sky")?;
             }
             {
                 let mut l = st.launch_builder(&self.k_fill);
-                l.arg(&res.input).arg(&res.states).arg(&mut res.sky).arg(&mut res.blocks).arg(&res.floors);
-                l.arg(&self.masks_d).arg(&self.types).arg(&mut res.f0).arg(&mut res.f1).arg(&cells);
+                l.arg(&res.input)
+                    .arg(&res.states)
+                    .arg(&mut res.sky)
+                    .arg(&mut res.blocks)
+                    .arg(&res.floors);
+                l.arg(&self.masks_d)
+                    .arg(&self.types)
+                    .arg(&mut res.f0)
+                    .arg(&mut res.f1)
+                    .arg(&cells);
                 l.arg(&res.seeds).arg(&counters);
                 unsafe { l.launch(config(1, 1024)) }.ctx("filling")?;
             }
             {
                 let mut l = st.launch_builder(&self.k_output);
-                l.arg(&res.input).arg(&res.sky).arg(&res.blocks).arg(&mut res.output).arg(&counters);
+                l.arg(&res.input)
+                    .arg(&res.sky)
+                    .arg(&res.blocks)
+                    .arg(&mut res.output)
+                    .arg(&counters);
                 unsafe { l.launch(config(self.nsec, 256)) }.ctx("output")?;
             }
             let m = 8 + STRIDE * self.nsec;
-            st.memcpy_dtoh(&res.output.slice(0..m), &mut res.h_output.as_mut_slice().ctx("host buffer")?[..m])
-                .ctx("light readback")?;
+            st.memcpy_dtoh(
+                &res.output.slice(0..m),
+                &mut res.h_output.as_mut_slice().ctx("host buffer")?[..m],
+            )
+            .ctx("light readback")?;
             res.end.record(&st).ctx("event")?;
             self.stats.octets.fetch_add(8 * n as u64, Relaxed);
             Ok(())
@@ -768,7 +829,9 @@ impl LightGpu {
             return Err(e);
         }
         let n = self.stats.batches.fetch_add(1, Relaxed) + 1;
-        self.stats.ns_send.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        self.stats
+            .ns_send
+            .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         if n.is_power_of_two() && n >= 1024 || n % 65536 == 0 {
             log::info!("{}", self.summary());
         }
@@ -793,7 +856,12 @@ impl LightGpu {
             Some(r) => {
                 let stream = r.end.synchronize().is_ok();
                 let flags = stream
-                    .then(|| r.h_output.as_slice().ok().map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]])))
+                    .then(|| {
+                        r.h_output
+                            .as_slice()
+                            .ok()
+                            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+                    })
                     .flatten();
                 (stream, flags)
             }
@@ -808,7 +876,9 @@ impl LightGpu {
             self.stats.errors.fetch_add(1, Relaxed);
         }
         job.expected = true;
-        self.stats.ns_wait.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        self.stats
+            .ns_wait
+            .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         job.ok
     }
     /// The sections of the central chunk of a batch waited for without an error, from bottom to

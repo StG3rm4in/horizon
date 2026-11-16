@@ -242,7 +242,11 @@ struct StateMemo {
 }
 impl Default for StateMemo {
     fn default() -> Self {
-        Self { entries: [(BlockStateId(0), None, 0); 6], len: 0, next: 0 }
+        Self {
+            entries: [(BlockStateId(0), None, 0); 6],
+            len: 0,
+            next: 0,
+        }
     }
 }
 impl StateMemo {
@@ -1154,7 +1158,10 @@ impl<B: TerrainBlockStates> TerrainChunk<'_, B> {
     pub fn section_flags(&self) -> Vec<u8> {
         (0..self.blocks.registry.len())
             .map(|i| {
-                let s = self.blocks.properties.heightmap_state(BlockStateId(i as u32));
+                let s = self
+                    .blocks
+                    .properties
+                    .heightmap_state(BlockStateId(i as u32));
                 u8::from(s.is_air())
                     | u8::from(s.has_fluid()) << 1
                     | u8::from(s.blocks_motion_in_heightmap()) << 2
@@ -1187,7 +1194,11 @@ fn gpu_section<'r>(
     registry: &'r BlockRegistry,
 ) -> Result<(BlockSection<'r>, u16), TerrainError> {
     let o = &data[s * horizon_gpu::SECTION_WORDS..(s + 1) * horizon_gpu::SECTION_WORDS];
-    let (kind, bits, len) = (o[0] & 0xFF, ((o[0] >> 8) & 0xFF) as u8, (o[0] >> 16) as usize);
+    let (kind, bits, len) = (
+        o[0] & 0xFF,
+        ((o[0] >> 8) & 0xFF) as u8,
+        (o[0] >> 16) as usize,
+    );
     let non_air = u16::try_from(o[1]).map_err(|_| TerrainError::InvalidState)?;
     let section = match kind {
         0 => BlockSection::uniform(air, registry)?,
@@ -1308,13 +1319,18 @@ pub fn check_noise_sections<B: TerrainBlockStates>(
         let (pg, cg, fg, sg) = gpu.parts();
         let (pc, cc, fc, sc) = cpu.parts();
         if pg != pc || cg != cc || fg != fc {
-            return Err(format!("section {s}: palette {pg:?} {cg:?} {fg:?} against {pc:?} {cc:?} {fc:?}"));
+            return Err(format!(
+                "section {s}: palette {pg:?} {cg:?} {fg:?} against {pc:?} {cc:?} {fc:?}"
+            ));
         }
         if sg.map(|s| (s.bits(), s.words())) != sc.map(|s| (s.bits(), s.words())) {
             return Err(format!("section {s}: different words"));
         }
         if non_air != chunk.blocks.non_air[s] {
-            return Err(format!("section {s}: non-air {non_air} against {}", chunk.blocks.non_air[s]));
+            return Err(format!(
+                "section {s}: non-air {non_air} against {}",
+                chunk.blocks.non_air[s]
+            ));
         }
     }
     let min_y = chunk.min_y();
@@ -1322,14 +1338,18 @@ pub fn check_noise_sections<B: TerrainBlockStates>(
         .into_iter()
         .enumerate()
     {
-        let map = chunk.heightmaps[kind as usize].as_ref().ok_or("missing heightmap")?;
+        let map = chunk.heightmaps[kind as usize]
+            .as_ref()
+            .ok_or("missing heightmap")?;
         for t in 0..256 {
             let gpu = min_y.wrapping_add(data[hm + 256 * i + t] as i32);
             let cpu = map
                 .first_available((t & 15) as i32, (t >> 4) as i32)
                 .map_err(|e| format!("{e:?}"))?;
             if gpu != cpu {
-                return Err(format!("heightmap {kind:?} column {t}: {gpu} against {cpu}"));
+                return Err(format!(
+                    "heightmap {kind:?} column {t}: {gpu} against {cpu}"
+                ));
             }
         }
     }
@@ -1345,7 +1365,14 @@ pub fn check_noise_sections<B: TerrainBlockStates>(
         }
     }
     if marks != chunk.postprocessing {
-        return Err(format!("marks: {na} + {nb} against {:?}", chunk.postprocessing.iter().map(Vec::len).collect::<Vec<_>>()));
+        return Err(format!(
+            "marks: {na} + {nb} against {:?}",
+            chunk
+                .postprocessing
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>()
+        ));
     }
     Ok(())
 }
@@ -1582,7 +1609,10 @@ mod tests {
             (
                 "defaults",
                 Tag::compound(
-                    names.iter().enumerate().map(|(i, n)| (n.as_str(), Tag::Int(i as i32))),
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| (n.as_str(), Tag::Int(i as i32))),
                 ),
             ),
         ]))
@@ -1603,8 +1633,10 @@ mod tests {
             seed % n
         };
         for round in 0..40 {
-            let mut a = TerrainChunk::new(ChunkPos::new(0, 0), -64, 384, &registry, Properties).unwrap();
-            let mut b = TerrainChunk::new(ChunkPos::new(0, 0), -64, 384, &registry, Properties).unwrap();
+            let mut a =
+                TerrainChunk::new(ChunkPos::new(0, 0), -64, 384, &registry, Properties).unwrap();
+            let mut b =
+                TerrainChunk::new(ChunkPos::new(0, 0), -64, 384, &registry, Properties).unwrap();
             // Few states per round for the first rounds (long runs, uniform sections), up to 38.
             let kinds = 2 + (round as u64 % 8) * 5;
             for op in 0..3000 {
@@ -1629,7 +1661,11 @@ mod tests {
             }
             assert_eq!(a.blocks.non_air, b.blocks.non_air, "round {round}");
             for (i, (sa, sb)) in a.blocks.sections.iter().zip(&b.blocks.sections).enumerate() {
-                assert_eq!(sa.to_nbt().unwrap(), sb.to_nbt().unwrap(), "round {round} section {i}");
+                assert_eq!(
+                    sa.to_nbt().unwrap(),
+                    sb.to_nbt().unwrap(),
+                    "round {round} section {i}"
+                );
             }
         }
     }

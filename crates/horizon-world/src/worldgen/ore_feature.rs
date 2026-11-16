@@ -276,15 +276,16 @@ impl OreFeature {
             if sphere[3] < 0.0 {
                 continue;
             }
-            squares.each_cell(sphere, attempt.start, |[x, y, z]| {
-                let b = [0, 1, 2].map(|i| [x, y, z][i].wrapping_sub(attempt.start[i]));
-                if b.iter().any(|&v| v < 0) || b[0] >= sx || b[1] >= sy || b[2] >= sx.min(32) {
-                    return Err(());
-                }
-                rows[(b[0] * sy + b[1]) as usize] |= 1 << b[2];
-                Ok(())
-            })
-            .ok()?;
+            squares
+                .each_cell(sphere, attempt.start, |[x, y, z]| {
+                    let b = [0, 1, 2].map(|i| [x, y, z][i].wrapping_sub(attempt.start[i]));
+                    if b.iter().any(|&v| v < 0) || b[0] >= sx || b[1] >= sy || b[2] >= sx.min(32) {
+                        return Err(());
+                    }
+                    rows[(b[0] * sy + b[1]) as usize] |= 1 << b[2];
+                    Ok(())
+                })
+                .ok()?;
         }
         Some(rows)
     }

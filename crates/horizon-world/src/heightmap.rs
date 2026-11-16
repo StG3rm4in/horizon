@@ -291,7 +291,8 @@ impl Heightmap {
                         }
                         let mut y = hi;
                         while y >= lo {
-                            let cell = (((y - section) as usize) << 8) | ((z as usize) << 4) | x as usize;
+                            let cell =
+                                (((y - section) as usize) << 8) | ((z as usize) << 4) | x as usize;
                             let m = masks[cell] & remaining[column];
                             if m != 0 {
                                 for (i, map) in maps.iter_mut().enumerate() {
@@ -391,7 +392,9 @@ mod prime_sections_tests {
             384
         }
         fn highest_section_y(&self) -> i32 {
-            let top = (0..24).rev().find(|&s| self.cells[s * 4096..(s + 1) * 4096].iter().any(|&c| c != 0));
+            let top = (0..24)
+                .rev()
+                .find(|&s| self.cells[s * 4096..(s + 1) * 4096].iter().any(|&c| c != 0));
             -64 + top.unwrap_or(0) as i32 * 16
         }
         fn block_state(&self, x: i32, y: i32, z: i32) -> S {
@@ -402,10 +405,19 @@ mod prime_sections_tests {
         fn sections_min_y(&self) -> i32 {
             -64
         }
-        fn section_masks(&self, bottom: i32, kinds: &[HeightmapType], out: &mut [u8; 4096]) -> bool {
+        fn section_masks(
+            &self,
+            bottom: i32,
+            kinds: &[HeightmapType],
+            out: &mut [u8; 4096],
+        ) -> bool {
             let mut any = false;
             for (i, cell) in out.iter_mut().enumerate() {
-                let s = self.block_state((i & 15) as i32, bottom + (i >> 8) as i32, ((i >> 4) & 15) as i32);
+                let s = self.block_state(
+                    (i & 15) as i32,
+                    bottom + (i >> 8) as i32,
+                    ((i >> 4) & 15) as i32,
+                );
                 *cell = kinds.iter().enumerate().fold(0, |m, (k, kind)| {
                     m | u8::from(!s.is_air_block() && kind.is_opaque(s)) << k
                 });
@@ -447,8 +459,14 @@ mod prime_sections_tests {
                 })
                 .collect();
             let column = Column { cells };
-            let mut a: Vec<Heightmap> = kinds.iter().map(|k| Heightmap::new(*k, -64, 384).unwrap()).collect();
-            let mut b: Vec<Heightmap> = kinds.iter().map(|k| Heightmap::new(*k, -64, 384).unwrap()).collect();
+            let mut a: Vec<Heightmap> = kinds
+                .iter()
+                .map(|k| Heightmap::new(*k, -64, 384).unwrap())
+                .collect();
+            let mut b: Vec<Heightmap> = kinds
+                .iter()
+                .map(|k| Heightmap::new(*k, -64, 384).unwrap())
+                .collect();
             Heightmap::prime(&column, &mut a.iter_mut().collect::<Vec<_>>()).unwrap();
             Heightmap::prime_sections(&column, &mut b.iter_mut().collect::<Vec<_>>()).unwrap();
             for (x, y) in a.iter().zip(&b) {

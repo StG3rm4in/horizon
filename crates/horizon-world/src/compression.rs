@@ -423,7 +423,9 @@ mod tests {
     #[test]
     fn a_configured_deflate_level_reads_back() {
         use super::*;
-        let raw: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8 ^ (i / 97) as u8).collect();
+        let raw: Vec<u8> = (0..20_000u32)
+            .map(|i| (i % 251) as u8 ^ (i / 97) as u8)
+            .collect();
         let mut sizes = Vec::new();
         for level in [1, 9] {
             assert!(Compression::configure_deflate_level(level));
@@ -433,7 +435,10 @@ mod tests {
             assert_eq!(Compression::Gzip.decode(&gz, usize::MAX).unwrap(), raw);
             sizes.push(encoded.len());
         }
-        assert!(sizes[0] >= sizes[1], "level 1 is not smaller than 9: {sizes:?}");
+        assert!(
+            sizes[0] >= sizes[1],
+            "level 1 is not smaller than 9: {sizes:?}"
+        );
         assert!(!Compression::configure_deflate_level(10));
         assert!(Compression::configure_deflate_level(6));
     }

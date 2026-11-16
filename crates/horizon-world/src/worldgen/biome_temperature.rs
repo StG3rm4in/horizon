@@ -58,7 +58,11 @@ fn noises() -> &'static TemperatureNoises {
 }
 /// The fixed temperature noises (height variation, frozen stack, biome info),
 /// for samplers evaluated elsewhere (the GPU fork).
-pub fn temperature_noises() -> (&'static SimplexNoise, &'static NoiseStack, &'static SimplexNoise) {
+pub fn temperature_noises() -> (
+    &'static SimplexNoise,
+    &'static NoiseStack,
+    &'static SimplexNoise,
+) {
     let n = noises();
     (&n.height, &n.frozen, &n.info)
 }

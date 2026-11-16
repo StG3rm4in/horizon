@@ -590,7 +590,12 @@ impl<'r> BlockSection<'r> {
     }
     /// Its parts, as `from_parts` takes them.
     pub fn parts(&self) -> (&[BlockStateId], &[u16], &[u32], Option<&PackedStorage>) {
-        (&self.palette, &self.counts, &self.free, self.storage.as_ref())
+        (
+            &self.palette,
+            &self.counts,
+            &self.free,
+            self.storage.as_ref(),
+        )
     }
     pub fn from_nbt(tag: &Tag, registry: &'r BlockRegistry) -> io::Result<Self> {
         let container = PalettedContainer::from_nbt(tag, 4096, 4)?;
@@ -1366,7 +1371,15 @@ mod tests {
         use horizon_core::paletted::{PalettedContainer as Container, Strategy};
         let registry = benchmark_registry(400);
         let strategy = Strategy::blocks(9);
-        for &(distinct, seed) in &[(1u64, 1u64), (2, 2), (5, 9), (16, 3), (17, 4), (64, 6), (300, 8)] {
+        for &(distinct, seed) in &[
+            (1u64, 1u64),
+            (2, 2),
+            (5, 9),
+            (16, 3),
+            (17, 4),
+            (64, 6),
+            (300, 8),
+        ] {
             let mut section = BlockSection::uniform(BlockStateId(0), &registry).unwrap();
             let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
             let mut out = [0u32; 4096];
@@ -1380,7 +1393,11 @@ mod tests {
                     rng ^= rng << 13;
                     rng ^= rng >> 7;
                     rng ^= rng << 17;
-                    let index = if round % 2 == 0 { k } else { (rng % 4096) as usize };
+                    let index = if round % 2 == 0 {
+                        k
+                    } else {
+                        (rng % 4096) as usize
+                    };
                     let value = ((rng >> 20) % distinct) as u32;
                     section.set(index, BlockStateId(value)).unwrap();
                 }

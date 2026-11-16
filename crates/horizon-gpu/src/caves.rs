@@ -239,7 +239,8 @@ impl CaveGpu {
             Some(r) => r.st.clone(),
             None => self.ctx.new_stream().ctx("CUDA stream")?,
         };
-        let pinned = |n: usize| unsafe { self.ctx.alloc_pinned_with_flags::<u64>(n, 0) }.ctx("host buffer");
+        let pinned =
+            |n: usize| unsafe { self.ctx.alloc_pinned_with_flags::<u64>(n, 0) }.ctx("host buffer");
         Ok(CaveResources {
             buffer: st.alloc_zeros::<u64>(cap).ctx("cave buffer")?,
             h_input: pinned(cap)?,
@@ -250,7 +251,13 @@ impl CaveGpu {
     }
     /// Sends the elements of a chunk (`calls` carver calls) and launches their trace on the batch's
     /// stream.
-    pub fn submit(&self, target: CaveTarget, items: &[CaveItem], widths: &[f32], calls: usize) -> Result<CaveJob, String> {
+    pub fn submit(
+        &self,
+        target: CaveTarget,
+        items: &[CaveItem],
+        widths: &[f32],
+        calls: usize,
+    ) -> Result<CaveJob, String> {
         let t = Instant::now();
         let height = target.max_y - target.min_y + 1;
         if !(1..=384).contains(&height) {
@@ -269,7 +276,8 @@ impl CaveGpu {
                 m.copy_from_slice(&it.words());
             }
             for (m, w) in h[ni..e].iter_mut().zip(widths.chunks(2)) {
-                *m = u64::from(w[0].to_bits()) | (u64::from(w.get(1).map_or(0, |v| v.to_bits())) << 32);
+                *m = u64::from(w[0].to_bits())
+                    | (u64::from(w.get(1).map_or(0, |v| v.to_bits())) << 32);
             }
             h[e..e + head].fill(0);
         }
@@ -287,13 +295,21 @@ impl CaveGpu {
             let output = res.buffer.slice(e..e + head);
             let mut l = st.launch_builder(&self.k_trace);
             l.arg(&input).arg(&widths_d).arg(&self.sines).arg(&output);
-            l.arg(&nwi).arg(&nci).arg(&cx).arg(&cz).arg(&target.min_y).arg(&target.max_y).arg(&h);
+            l.arg(&nwi)
+                .arg(&nci)
+                .arg(&cx)
+                .arg(&cz)
+                .arg(&target.min_y)
+                .arg(&target.max_y)
+                .arg(&h);
             l.arg(&target.generation_min_y).arg(&nwidth);
             unsafe { l.launch(config(items.len(), 128)) }.ctx("carver trace")?;
         }
         self.stats.batches.fetch_add(1, Relaxed);
         self.stats.elements.fetch_add(items.len() as u64, Relaxed);
-        self.stats.ns_send.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        self.stats
+            .ns_send
+            .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         Ok(CaveJob {
             res: Some(res),
             target,
@@ -319,7 +335,10 @@ impl CaveGpu {
             if job.codes == 0 {
                 let (e, n) = (job.e, job.nw + job.nc + 1);
                 res.st
-                    .memcpy_dtoh(&res.buffer.slice(e..e + n), &mut res.h_output.as_mut_slice().ctx("host buffer")?[..n])
+                    .memcpy_dtoh(
+                        &res.buffer.slice(e..e + n),
+                        &mut res.h_output.as_mut_slice().ctx("host buffer")?[..n],
+                    )
                     .ctx("mask readback")?;
             }
             res.st.synchronize().ctx("cave wait")
@@ -331,7 +350,9 @@ impl CaveGpu {
         .is_ok();
         job.expected = true;
         job.region = None;
-        self.stats.ns_wait.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        self.stats
+            .ns_wait
+            .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         job.ok
     }
     /// The mask of a waited batch (CarvingMask words), or None if the GPU flagged an error or a
@@ -360,7 +381,8 @@ impl CaveGpu {
             return None;
         }
         if cells > job.codes {
-            self.cap_codes.fetch_max((cells as u64).next_power_of_two(), Relaxed);
+            self.cap_codes
+                .fetch_max((cells as u64).next_power_of_two(), Relaxed);
             return None;
         }
         let head = job.nw + job.nc + 1;
@@ -414,9 +436,20 @@ impl CaveJob {
         let mask = res.buffer.slice(e..e + self.nw);
         let codes = res.buffer.slice(e + head..e + head + cw);
         let mut l = st.launch_builder(aq.f);
-        l.arg(&mask).arg(&codes).arg(&nw).arg(&ci).arg(&self.target.min_y).arg(&h);
+        l.arg(&mask)
+            .arg(&codes)
+            .arg(&nw)
+            .arg(&ci)
+            .arg(&self.target.min_y)
+            .arg(&h);
         l.arg(&x0).arg(&z0).arg(aq.p).arg(aq.st).arg(&aq.skip);
-        l.arg(&g[0]).arg(&g[1]).arg(&g[2]).arg(&g[3]).arg(&g[4]).arg(&g[5]).arg(&aq.sea);
+        l.arg(&g[0])
+            .arg(&g[1])
+            .arg(&g[2])
+            .arg(&g[3])
+            .arg(&g[4])
+            .arg(&g[5])
+            .arg(&aq.sea);
         unsafe { l.launch(config(self.nw.div_ceil(32), 256)) }.ctx("cave substance")?;
         st.memcpy_dtoh(
             &res.buffer.slice(e..e + head + cw),

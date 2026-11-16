@@ -88,7 +88,8 @@ pub fn shape_fills_block(shape: &VoxelShape) -> bool {
         && [Axis::X, Axis::Y, Axis::Z]
             .into_iter()
             .all(|axis| shape.min(axis) == 0.0 && shape.max(axis) == 1.0)
-        && (0..nx).all(|x| (0..ny).all(|y| (0..nz).all(|z| shape.is_full(x as i32, y as i32, z as i32))))
+        && (0..nx)
+            .all(|x| (0..ny).all(|y| (0..nz).all(|z| shape.is_full(x as i32, y as i32, z as i32))))
 }
 
 pub struct BlockCollisionRegistry<'r> {
@@ -155,7 +156,9 @@ impl<'r> BlockCollisionRegistry<'r> {
         }
         let pistons = PistonBlockBindings::new(cached.registry()).ok();
         Ok(Self {
-            fixed: (0..cached.registry().len()).map(|_| std::sync::atomic::AtomicU16::new(0)).collect(),
+            fixed: (0..cached.registry().len())
+                .map(|_| std::sync::atomic::AtomicU16::new(0))
+                .collect(),
             cached,
             dynamic,
             contextual,

@@ -1374,7 +1374,12 @@ fn heightmap_test() -> bool {
 static HEIGHTMAP_TESTS: AtomicU64 = AtomicU64::new(0);
 static HEIGHTMAP_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 /// The heightmaps `heightmaps` saves, primed section by section (`fast`) or cell by cell.
-fn primed_heightmaps(chunk: &Chunk, tables: &SaveTables, shape: LevelShape, fast: bool) -> Option<Vec<Heightmap>> {
+fn primed_heightmaps(
+    chunk: &Chunk,
+    tables: &SaveTables,
+    shape: LevelShape,
+    fast: bool,
+) -> Option<Vec<Heightmap>> {
     let kinds = [
         HeightmapType::WorldSurface,
         HeightmapType::OceanFloor,
@@ -1406,7 +1411,9 @@ fn heightmaps(chunk: &Chunk, tables: &SaveTables, shape: LevelShape) -> Tag {
     let maps = if heightmap_test() {
         let slow = primed_heightmaps(chunk, tables, shape, false);
         let same = match (&fast, &slow) {
-            (Some(a), Some(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.raw_data() == y.raw_data()),
+            (Some(a), Some(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.raw_data() == y.raw_data())
+            }
             (None, None) => true,
             _ => false,
         };
@@ -1414,10 +1421,17 @@ fn heightmaps(chunk: &Chunk, tables: &SaveTables, shape: LevelShape) -> Tag {
         if !same {
             let m = HEIGHTMAP_MISMATCHES.fetch_add(1, Ordering::Relaxed) + 1;
             if m <= 8 {
-                log::warn!("heightmap test: chunk {} {}: primed by sections, the heightmaps differ", chunk.x, chunk.z);
+                log::warn!(
+                    "heightmap test: chunk {} {}: primed by sections, the heightmaps differ",
+                    chunk.x,
+                    chunk.z
+                );
             }
         } else if n.is_power_of_two() {
-            log::info!("heightmap test: {n} chunks, {} mismatches", HEIGHTMAP_MISMATCHES.load(Ordering::Relaxed));
+            log::info!(
+                "heightmap test: {n} chunks, {} mismatches",
+                HEIGHTMAP_MISMATCHES.load(Ordering::Relaxed)
+            );
         }
         slow
     } else {
@@ -1613,7 +1627,12 @@ fn encode_saved_bytes(
 }
 /// Whether a compound key is the ASCII `name`.
 fn is_key(key: &JavaString, name: &str) -> bool {
-    key.0.len() == name.len() && key.0.iter().zip(name.bytes()).all(|(&u, b)| u == u16::from(b))
+    key.0.len() == name.len()
+        && key
+            .0
+            .iter()
+            .zip(name.bytes())
+            .all(|(&u, b)| u == u16::from(b))
 }
 /// [`fluid_name`] without the copy.
 fn fluid_str(kind: u32) -> Option<&'static str> {
@@ -2716,8 +2735,13 @@ impl Record {
     /// The record's NBT, as `nbt::write_named` writes its tag; a chunk is written straight from its
     /// data ([`encode_saved_bytes`], [`NbtMode`]).
     fn encoded(&self, limits: Limits) -> Option<std::io::Result<Vec<u8>>> {
-        let invalid = |e: nbt::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
-        let tree = |record: &Self| record.tag().map(|tag| nbt::write_named(&tag, limits).map_err(invalid));
+        let invalid =
+            |e: nbt::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string());
+        let tree = |record: &Self| {
+            record
+                .tag()
+                .map(|tag| nbt::write_named(&tag, limits).map_err(invalid))
+        };
         let mode = nbt_mode();
         if let Record::Chunk(c, e, blending) = self
             && mode != NbtMode::Tree
@@ -2740,7 +2764,11 @@ impl Record {
                     let m = NBT_MISMATCHES.fetch_add(1, Ordering::Relaxed) + 1;
                     if m <= 8 {
                         let at = match (&direct, &reference) {
-                            (Ok(a), Some(Ok(b))) => a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len())),
+                            (Ok(a), Some(Ok(b))) => a
+                                .iter()
+                                .zip(b)
+                                .position(|(x, y)| x != y)
+                                .unwrap_or(a.len().min(b.len())),
                             _ => 0,
                         };
                         log::warn!(
@@ -2748,7 +2776,9 @@ impl Record {
                             c.x,
                             c.z,
                             direct.as_ref().map(Vec::len).ok(),
-                            reference.as_ref().and_then(|r| r.as_ref().map(Vec::len).ok())
+                            reference
+                                .as_ref()
+                                .and_then(|r| r.as_ref().map(Vec::len).ok())
                         );
                     }
                     return reference;
@@ -5721,7 +5751,11 @@ mod tests {
                 seed ^= seed << 17;
                 let y = -64 + i / 256;
                 if y < ground || (y < ground + 30 && seed % 11 == 0) {
-                    let state = if seed % 5 == 0 { (seed % states) as u32 } else { (seed % 60) as u32 };
+                    let state = if seed % 5 == 0 {
+                        (seed % states) as u32
+                    } else {
+                        (seed % 60) as u32
+                    };
                     chunk.set(i % 16, y, (i / 16) % 16, state);
                 }
             }
@@ -5753,7 +5787,11 @@ mod tests {
             seed ^= seed >> 7;
             seed ^= seed << 17;
             // A few states per section, from all over the registry
-            let state = if i % 7 == 0 { (seed % states) as u32 } else { (seed % 40) as u32 };
+            let state = if i % 7 == 0 {
+                (seed % states) as u32
+            } else {
+                (seed % 40) as u32
+            };
             chunk.set(i % 16, -64 + (i / 256) % 384, (i / 16) % 16, state);
         }
         let limits = super::Limits::saved();

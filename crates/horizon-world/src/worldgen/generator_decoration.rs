@@ -126,7 +126,11 @@ impl FeatureTimes {
         self.stages[stage].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
     }
     /// One more decorated chunk; the list every 10 000.
-    fn chunk(&self, names: &[String], structures: Option<&super::generator_structures::StructureState>) {
+    fn chunk(
+        &self,
+        names: &[String],
+        structures: Option<&super::generator_structures::StructureState>,
+    ) {
         use std::sync::atomic::Ordering::Relaxed;
         let n = self.chunks.fetch_add(1, Relaxed) + 1;
         if n % 10_000 != 0 {
@@ -137,17 +141,32 @@ impl FeatureTimes {
             .features
             .iter()
             .zip(names)
-            .map(|(f, name)| (f[0].load(Relaxed), f[1].load(Relaxed), f[2].load(Relaxed), name.clone()))
+            .map(|(f, name)| {
+                (
+                    f[0].load(Relaxed),
+                    f[1].load(Relaxed),
+                    f[2].load(Relaxed),
+                    name.clone(),
+                )
+            })
             .collect();
         if let Some(st) = structures {
             for (i, [ns, calls]) in self.structures.lock().unwrap().iter().enumerate() {
-                let name = st.registry.structures.get(i).map_or("?", |d| d.name.as_str());
+                let name = st
+                    .registry
+                    .structures
+                    .get(i)
+                    .map_or("?", |d| d.name.as_str());
                 rows.push((*ns, *calls, *calls, format!("structure {name}")));
             }
         }
-        for (k, name) in ["(setup before the plan)", "(ore prediction)", "(top layers and after)"]
-            .iter()
-            .enumerate()
+        for (k, name) in [
+            "(setup before the plan)",
+            "(ore prediction)",
+            "(top layers and after)",
+        ]
+        .iter()
+        .enumerate()
         {
             rows.push((self.stages[k + 1].load(Relaxed), n, n, name.to_string()));
         }
@@ -499,8 +518,13 @@ impl Decoration {
         let mut random = WorldgenRandom::new(XoroshiroRandom::new(0));
         let decoration_seed = random.set_decoration_seed(seed, origin[0], origin[2]);
         let mut placer = FeaturePlacer::new();
-        let OreBuffers { features: mut planned, mut attempts, mut spheres, mut blobs, mut sent } =
-            OreBuffers::take();
+        let OreBuffers {
+            features: mut planned,
+            mut attempts,
+            mut spheres,
+            mut blobs,
+            mut sent,
+        } = OreBuffers::take();
         for (index, id) in features {
             let Ok(feature) = &self.features[id.0 as usize] else {
                 continue;
@@ -533,7 +557,14 @@ impl Decoration {
             planned.push((id, first..attempts.len(), ore.size() as usize));
         }
         if planned.is_empty() {
-            OreBuffers { features: planned, attempts, spheres, blobs, sent }.give();
+            OreBuffers {
+                features: planned,
+                attempts,
+                spheres,
+                blobs,
+                sent,
+            }
+            .give();
             return None;
         }
         blobs.resize(attempts.len(), None);
@@ -553,9 +584,18 @@ impl Decoration {
                 }
             }
         }
-        let job = (next == spheres.len()).then(|| gpu.submit(&sent, &spheres).ok()).flatten();
+        let job = (next == spheres.len())
+            .then(|| gpu.submit(&sent, &spheres).ok())
+            .flatten();
         let Some(job) = job else {
-            OreBuffers { features: planned, attempts, spheres, blobs, sent }.give();
+            OreBuffers {
+                features: planned,
+                attempts,
+                spheres,
+                blobs,
+                sent,
+            }
+            .give();
             return None;
         };
         sent.clear();
@@ -990,7 +1030,11 @@ impl OreBuffers {
     /// Gives the buffers back for the next chunk; an empty `sent` keeps the one already there.
     fn give(self) {
         OREBUFFERS.with_borrow_mut(|b| {
-            let sent = if self.sent.capacity() > 0 { self.sent } else { std::mem::take(&mut b.sent) };
+            let sent = if self.sent.capacity() > 0 {
+                self.sent
+            } else {
+                std::mem::take(&mut b.sent)
+            };
             *b = OreBuffers { sent, ..self };
         });
     }

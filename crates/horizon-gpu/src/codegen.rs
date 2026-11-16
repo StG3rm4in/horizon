@@ -281,7 +281,11 @@ impl<'a> Gen<'a> {
         self.point_mode = previous;
         let v = v?;
         let name = format!("pf{}", self.point_functions.len());
-        writeln!(self.defs, "__device__ __noinline__ float {name}(int x, int y, int z) {{\n{}  return {v};\n}}", ssa.code)?;
+        writeln!(
+            self.defs,
+            "__device__ __noinline__ float {name}(int x, int y, int z) {{\n{}  return {v};\n}}",
+            ssa.code
+        )?;
         self.point_functions.insert(id, name.clone());
         Ok(name)
     }
@@ -313,7 +317,9 @@ impl<'a> Gen<'a> {
         let mut todo = vec![id];
         while let Some(id) = todo.pop() {
             match self.c.graph().node(id).ok_or("missing node")? {
-                GraphNode::Constant(_) | GraphNode::Gradient { .. } | GraphNode::DistanceToPoint { .. } => {}
+                GraphNode::Constant(_)
+                | GraphNode::Gradient { .. }
+                | GraphNode::DistanceToPoint { .. } => {}
                 GraphNode::Reference { input, .. }
                 | GraphNode::Cache(input)
                 | GraphNode::Slice { input, .. }
@@ -585,7 +591,11 @@ impl<'a> Gen<'a> {
 
     // ---------- splines: one CUDA function per multipoint node, coordinates passed as an array
     // ----------
-    fn spline_root(&mut self, id: FunctionId, m: &MultipointSpline<FunctionId>) -> R<(String, Vec<FunctionId>)> {
+    fn spline_root(
+        &mut self,
+        id: FunctionId,
+        m: &MultipointSpline<FunctionId>,
+    ) -> R<(String, Vec<FunctionId>)> {
         if let Some(r) = self.splines.get(&id) {
             return Ok(r.clone());
         }
@@ -620,7 +630,9 @@ impl<'a> Gen<'a> {
         for p in pts {
             values.push(match &p.value {
                 CubicSpline::Constant(v) => f32lit(*v),
-                CubicSpline::Multipoint(sub) => format!("{}(C)", self.spline_fn(sub, coords, local_splines)?),
+                CubicSpline::Multipoint(sub) => {
+                    format!("{}(C)", self.spline_fn(sub, coords, local_splines)?)
+                }
             });
         }
         let locs = pts
@@ -746,9 +758,15 @@ impl<'a> Gen<'a> {
                 let pt = self.point(&*n)?;
                 let q = f64lit(0.25);
                 let call = match kind {
-                    ShiftNoiseKind::Shift => format!("{pt}(__dmul_rn((double)x, {q}), __dmul_rn((double)y, {q}), __dmul_rn((double)z, {q}))"),
-                    ShiftNoiseKind::ShiftA => format!("{pt}(__dmul_rn((double)x, {q}), __dmul_rn((double)y, 0.0), __dmul_rn((double)z, {q}))"),
-                    ShiftNoiseKind::ShiftB => format!("{pt}(__dmul_rn((double)z, {q}), __dmul_rn((double)x, {q}), 0.0)"),
+                    ShiftNoiseKind::Shift => format!(
+                        "{pt}(__dmul_rn((double)x, {q}), __dmul_rn((double)y, {q}), __dmul_rn((double)z, {q}))"
+                    ),
+                    ShiftNoiseKind::ShiftA => format!(
+                        "{pt}(__dmul_rn((double)x, {q}), __dmul_rn((double)y, 0.0), __dmul_rn((double)z, {q}))"
+                    ),
+                    ShiftNoiseKind::ShiftB => {
+                        format!("{pt}(__dmul_rn((double)z, {q}), __dmul_rn((double)x, {q}), 0.0)")
+                    }
                 };
                 format!("__fmul_rn({call}, {})", f32lit(4.0))
             }
@@ -784,7 +802,9 @@ impl<'a> Gen<'a> {
                         // NoiseSampler::sample_value: get3(x * xz, y * y_scale, z * xz)
                         let pt = self.point(&*n)?;
                         let (xz, ys) = (f64lit(xz_scale), f64lit(y_scale));
-                        format!("{pt}(__dmul_rn((double)x, {xz}), __dmul_rn((double)y, {ys}), __dmul_rn((double)z, {xz}))")
+                        format!(
+                            "{pt}(__dmul_rn((double)x, {xz}), __dmul_rn((double)y, {ys}), __dmul_rn((double)z, {xz}))"
+                        )
                     } else if d3 {
                         format!(
                             "{}(MEM, ix, iy, iz)",
@@ -936,9 +956,15 @@ impl<'a> Gen<'a> {
                 }
             },
             GraphNode::Interpolated { .. } | GraphNode::BlendedNoise(_) if self.point_mode => {
-                return Err("interpolation and BlendedNoise are not supported in point mode".into());
+                return Err(
+                    "interpolation and BlendedNoise are not supported in point mode".into(),
+                );
             }
-            GraphNode::Slice { axis, coordinate, input } if self.point_mode => {
+            GraphNode::Slice {
+                axis,
+                coordinate,
+                input,
+            } if self.point_mode => {
                 // SliceSampler: the input evaluated with one coordinate fixed
                 let f = self.point_function(input)?;
                 let mut c = ["x".to_string(), "y".to_string(), "z".to_string()];
@@ -955,7 +981,11 @@ impl<'a> Gen<'a> {
             // SliceSampler in a volume over an axis its input reads: the input on the plane, in
             // point mode, when nothing in it evaluates differently in a volume (coordinates,
             // constants and unary operations only, like the End's central island)
-            GraphNode::Slice { axis, coordinate, input } if self.pointwise(input)? => {
+            GraphNode::Slice {
+                axis,
+                coordinate,
+                input,
+            } if self.pointwise(input)? => {
                 let f = self.point_function(input)?;
                 let mut c = ["x".to_string(), "y".to_string(), "z".to_string()];
                 c[axis as usize] = coordinate.to_string();
@@ -963,7 +993,9 @@ impl<'a> Gen<'a> {
             }
             GraphNode::DistanceToPoint { point, metric } => {
                 // DistanceToPointSampler: (point - position) as float, then the metric
-                let d = |i: usize, c: &str| format!("(float)(int)((unsigned)({}) - (unsigned){c})", point[i]);
+                let d = |i: usize, c: &str| {
+                    format!("(float)(int)((unsigned)({}) - (unsigned){c})", point[i])
+                };
                 let (dx, dy, dz) = (d(0, "x"), d(1, "y"), d(2, "z"));
                 use horizon_core::density::DistanceMetric as M;
                 match metric {
@@ -973,7 +1005,12 @@ impl<'a> Gen<'a> {
                     M::Chebyshev => format!("dist_chebyshev({dx}, {dy}, {dz})"),
                 }
             }
-            GraphNode::Surface { density, upper, lower, height } if self.point_mode => {
+            GraphNode::Surface {
+                density,
+                upper,
+                lower,
+                height,
+            } if self.point_mode => {
                 // compile_surface_search: Slice Y = 0 around FindTopSurfaceSampler. The upper bound
                 // is read at y = 0; the descent goes from cell to cell until a positive density.
                 if height <= 0 {
@@ -989,7 +1026,12 @@ impl<'a> Gen<'a> {
                 )?;
                 format!("{name}(x, z)")
             }
-            GraphNode::Surface { density, upper, lower, height } => {
+            GraphNode::Surface {
+                density,
+                upper,
+                lower,
+                height,
+            } => {
                 // FindTopSurfaceSampler::sample_volume under the Slice Y = 0: the upper bound as a
                 // volume on the y = 0 plane, then the density point by point, going down from cell
                 // to cell.
@@ -1156,10 +1198,7 @@ impl<'a> Gen<'a> {
             // Aligned volume: (size / cell) + 1 corners per axis
             // (InterpolatedSampler::sample_block_volume)
             let sizes = std::array::from_fn(|i| v.sizes[i] / cell[i] + 1);
-            self.grids.push(Grid {
-                sizes,
-                step: cell,
-            });
+            self.grids.push(Grid { sizes, step: cell });
             self.edges.push(Vec::new());
             self.roots.push(input);
             self.interps.insert(id, (self.grids.len() - 1, cell));
@@ -1326,11 +1365,25 @@ pub(crate) fn generate(
 
 /// Permutation tables and offsets of the Perlin noises `g` uses.
 fn tables_cuda(g: &Gen) -> R<String> {
-    let mut src = format!("__device__ const unsigned char PERM[{}][256] = {{\n", g.tables.len().max(1));
+    let mut src = format!(
+        "__device__ const unsigned char PERM[{}][256] = {{\n",
+        g.tables.len().max(1)
+    );
     for (p, _) in &g.tables {
-        writeln!(src, "  {{{}}},", p.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))?;
+        writeln!(
+            src,
+            "  {{{}}},",
+            p.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )?;
     }
-    writeln!(src, "}};\n__device__ const double OFF[{}][3] = {{", g.tables.len().max(1))?;
+    writeln!(
+        src,
+        "}};\n__device__ const double OFF[{}][3] = {{",
+        g.tables.len().max(1)
+    )?;
     for (_, o) in &g.tables {
         writeln!(src, "  {{{:e}, {:e}, {:e}}},", o[0], o[1], o[2])?;
     }
@@ -1342,7 +1395,15 @@ fn tables_cuda(g: &Gen) -> R<String> {
 /// `kpt_K(const int *P, float *OUT, int n)` for root K, points (x, y, z) one after the other in P.
 pub(crate) fn generate_points(c: &DensityCompiler, roots: &[FunctionId], seed: i64) -> R<String> {
     let first_root = *roots.first().ok_or("no root")?;
-    let mut g = Gen::new(c, Grid { sizes: [1, 1, 1], step: [1, 1, 1] }, Some(first_root), seed);
+    let mut g = Gen::new(
+        c,
+        Grid {
+            sizes: [1, 1, 1],
+            step: [1, 1, 1],
+        },
+        Some(first_root),
+        seed,
+    );
     let mut kernels = String::new();
     for (k, &r) in roots.iter().enumerate() {
         let f = g.point_function(r)?;
@@ -1351,7 +1412,11 @@ pub(crate) fn generate_points(c: &DensityCompiler, roots: &[FunctionId], seed: i
             "extern \"C\" __global__ void kpt_{k}(const int *P, float *OUT, int n) {{\n  int i = blockIdx.x * blockDim.x + threadIdx.x;\n  if (i >= n) return;\n  OUT[i] = {f}(P[3 * i], P[3 * i + 1], P[3 * i + 2]);\n}}"
         )?;
     }
-    Ok(format!("{}{BASE}\n{OPS}\n{}\n{kernels}", tables_cuda(&g)?, g.defs))
+    Ok(format!(
+        "{}{BASE}\n{OPS}\n{}\n{kernels}",
+        tables_cuda(&g)?,
+        g.defs
+    ))
 }
 
 const RANDOM: &str = include_str!("random.cu");
@@ -1360,10 +1425,29 @@ const AQUIFER: &str = include_str!("aquifer.cu");
 /// CUDA of the aquifers: the six roots (order of AquiferField::ALL: barrier, flood, spread, lava,
 /// exclusion, surface level) in point mode, then the kernels of `aquifer.cu`.
 /// Without roots (no aquifers), the six fields are a stub the kernels never call.
-pub(crate) fn generate_aquifer(c: &DensityCompiler, roots: Option<[FunctionId; 6]>, seed: i64) -> R<String> {
-    let mut g = Gen::new(c, Grid { sizes: [1, 1, 1], step: [1, 1, 1] }, None, seed);
+pub(crate) fn generate_aquifer(
+    c: &DensityCompiler,
+    roots: Option<[FunctionId; 6]>,
+    seed: i64,
+) -> R<String> {
+    let mut g = Gen::new(
+        c,
+        Grid {
+            sizes: [1, 1, 1],
+            step: [1, 1, 1],
+        },
+        None,
+        seed,
+    );
     let mut defs = String::new();
-    let names = ["AQ_BARRIER", "AQ_FLOOD", "AQ_SPREAD", "AQ_LAVA", "AQ_EXCL", "AQ_SURFACE"];
+    let names = [
+        "AQ_BARRIER",
+        "AQ_FLOOD",
+        "AQ_SPREAD",
+        "AQ_LAVA",
+        "AQ_EXCL",
+        "AQ_SURFACE",
+    ];
     match roots {
         Some(roots) => {
             for (name, r) in names.iter().zip(roots) {
@@ -1372,13 +1456,20 @@ pub(crate) fn generate_aquifer(c: &DensityCompiler, roots: Option<[FunctionId; 6
             }
         }
         None => {
-            writeln!(defs, "__device__ __forceinline__ float aq_none(int, int, int) {{ return 0.0f; }}")?;
+            writeln!(
+                defs,
+                "__device__ __forceinline__ float aq_none(int, int, int) {{ return 0.0f; }}"
+            )?;
             for name in names {
                 writeln!(defs, "#define {name} aq_none")?;
             }
         }
     }
-    Ok(format!("{}{BASE}\n{OPS}\n{}\n{defs}\n{RANDOM}\n{AQUIFER}", tables_cuda(&g)?, g.defs))
+    Ok(format!(
+        "{}{BASE}\n{OPS}\n{}\n{defs}\n{RANDOM}\n{AQUIFER}",
+        tables_cuda(&g)?,
+        g.defs
+    ))
 }
 
 const BIOMES: &str = include_str!("biomes.cu");
@@ -1387,15 +1478,35 @@ const BIOMES: &str = include_str!("biomes.cu");
 /// depth, weirdness) per column of quarts (`cl_column`, see `Gen::column_points`), like
 /// `ClimateSampler::sample`, then the kernels of `biomes.cu`.
 pub(crate) fn generate_biomes(c: &DensityCompiler, roots: [FunctionId; 6], seed: i64) -> R<String> {
-    let mut g = Gen::new(c, Grid { sizes: [1, 1, 1], step: [1, 1, 1] }, None, seed);
+    let mut g = Gen::new(
+        c,
+        Grid {
+            sizes: [1, 1, 1],
+            step: [1, 1, 1],
+        },
+        None,
+        seed,
+    );
     let column = g.column_points("cl_column", &roots)?;
-    Ok(format!("{}{BASE}\n{OPS}\n{}\n{column}\n{BIOMES}", tables_cuda(&g)?, g.defs))
+    Ok(format!(
+        "{}{BASE}\n{OPS}\n{}\n{column}\n{BIOMES}",
+        tables_cuda(&g)?,
+        g.defs
+    ))
 }
 
 /// CUDA that evaluates noises (Horizon's `Noise::get3`) at points given in double:
 /// `knz_K(const double *P, float *OUT, int n)` for noise K.
 pub(crate) fn generate_noises(c: &DensityCompiler, noises: &[&dyn Noise]) -> R<String> {
-    let mut g = Gen::new(c, Grid { sizes: [1, 1, 1], step: [1, 1, 1] }, None, 0);
+    let mut g = Gen::new(
+        c,
+        Grid {
+            sizes: [1, 1, 1],
+            step: [1, 1, 1],
+        },
+        None,
+        0,
+    );
     let mut kernels = String::new();
     for (k, n) in noises.iter().enumerate() {
         let f = g.point(*n)?;
@@ -1404,7 +1515,11 @@ pub(crate) fn generate_noises(c: &DensityCompiler, noises: &[&dyn Noise]) -> R<S
             "extern \"C\" __global__ void knz_{k}(const double *P, float *OUT, int n) {{\n  int i = blockIdx.x * blockDim.x + threadIdx.x;\n  if (i >= n) return;\n  OUT[i] = {f}(P[3 * i], P[3 * i + 1], P[3 * i + 2]);\n}}"
         )?;
     }
-    Ok(format!("{}{BASE}\n{OPS}\n{}\n{kernels}\n{RANDOM}\n{DRAWS}", tables_cuda(&g)?, g.defs))
+    Ok(format!(
+        "{}{BASE}\n{OPS}\n{}\n{kernels}\n{RANDOM}\n{DRAWS}",
+        tables_cuda(&g)?,
+        g.defs
+    ))
 }
 
 /// Positional draws: first next_float, first next_double and three next_float in a row.
@@ -1431,7 +1546,15 @@ pub(crate) fn generate_surface_s2(
     freeze: &horizon_core::noise::NoiseStack,
     info: &horizon_core::noise::SimplexNoise,
 ) -> R<String> {
-    let mut g = Gen::new(c, Grid { sizes: [1, 1, 1], step: [1, 1, 1] }, None, 0);
+    let mut g = Gen::new(
+        c,
+        Grid {
+            sizes: [1, 1, 1],
+            step: [1, 1, 1],
+        },
+        None,
+        0,
+    );
     let mut defs = String::new();
     writeln!(defs, "#define T_HEIGHT {}", g.table_of(height.table()))?;
     writeln!(defs, "#define T_INFO {}", g.table_of(info.table()))?;
@@ -1440,12 +1563,18 @@ pub(crate) fn generate_surface_s2(
         return Err("freeze noise: 3 layers expected".into());
     }
     for (k, l) in layers.iter().enumerate() {
-        let sx = l.noise.as_simplex().ok_or("freeze noise: layer is not simplex")?;
+        let sx = l
+            .noise
+            .as_simplex()
+            .ok_or("freeze noise: layer is not simplex")?;
         writeln!(defs, "#define T_FREEZE{k} {}", g.table_of(sx.table()))?;
         writeln!(defs, "#define T_FREEZE_FREQ_{k} {}", f64lit(l.frequency))?;
         writeln!(defs, "#define T_FREEZE_AMP_{k} {}", f32lit(l.amplitude))?;
     }
-    Ok(format!("{}{BASE}\n{OPS}\n{defs}\n{SURFACE}", tables_cuda(&g)?))
+    Ok(format!(
+        "{}{BASE}\n{OPS}\n{defs}\n{SURFACE}",
+        tables_cuda(&g)?
+    ))
 }
 
 /// A world's surface program: the CUDA of the `ksurface` kernel and the vein roots computed as
@@ -1462,9 +1591,21 @@ pub(crate) struct SurfaceProgram {
 }
 
 /// The surface rule translated to CUDA (functions R_k and C_k) and the descent of the columns.
-pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, seed: i64) -> R<SurfaceProgram> {
+pub(crate) fn generate_surface(
+    c: &DensityCompiler,
+    s: &crate::SurfaceSetup,
+    seed: i64,
+) -> R<SurfaceProgram> {
     use crate::{SurfaceCondition as SC, SurfaceRule as SR};
-    let mut g = Gen::new(c, Grid { sizes: [1, 1, 1], step: [1, 1, 1] }, None, seed);
+    let mut g = Gen::new(
+        c,
+        Grid {
+            sizes: [1, 1, 1],
+            step: [1, 1, 1],
+        },
+        None,
+        seed,
+    );
     let mut defs = String::new();
     // Noises of the column, of the conditions and of the bands
     let pt_surf = g.point(s.surface_noise)?;
@@ -1483,20 +1624,38 @@ pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, see
         return Err("freeze noise: 3 layers expected".into());
     }
     for (k, l) in layers.iter().enumerate() {
-        let sx = l.noise.as_simplex().ok_or("freeze noise: layer is not simplex")?;
+        let sx = l
+            .noise
+            .as_simplex()
+            .ok_or("freeze noise: layer is not simplex")?;
         writeln!(defs, "#define T_FREEZE{k} {}", g.table_of(sx.table()))?;
         writeln!(defs, "#define T_FREEZE_FREQ_{k} {}", f64lit(l.frequency))?;
         writeln!(defs, "#define T_FREEZE_AMP_{k} {}", f32lit(l.amplitude))?;
     }
-    writeln!(defs, "#define SF_MINY ({})\n#define SF_H {}\n#define SF_BMINY ({})\n#define SF_BH {}\n#define SF_ZOOM ({}ll)\n#define SF_SEA ({})", s.min_y, s.height, s.biome_min_y, s.biome_height, s.zoom_seed, s.sea_level)?;
+    writeln!(
+        defs,
+        "#define SF_MINY ({})\n#define SF_H {}\n#define SF_BMINY ({})\n#define SF_BH {}\n#define SF_ZOOM ({}ll)\n#define SF_SEA ({})",
+        s.min_y, s.height, s.biome_min_y, s.biome_height, s.zoom_seed, s.sea_level
+    )?;
     let [e_default, e_air, e_fluid, e_lava] = s.fill_states;
-    writeln!(defs, "#define SF_E_DEFAULT {e_default}\n#define SF_E_AIR {e_air}\n#define SF_E_FLUID {e_fluid}\n#define SF_E_LAVA {e_lava}")?;
+    writeln!(
+        defs,
+        "#define SF_E_DEFAULT {e_default}\n#define SF_E_AIR {e_air}\n#define SF_E_FLUID {e_fluid}\n#define SF_E_LAVA {e_lava}"
+    )?;
     // Fluid states written by the rule: the CPU surface marks them for post-processing
-    let fluids = s.fluid_states.iter().map(|e| format!("e == {e}")).collect::<Vec<_>>();
+    let fluids = s
+        .fluid_states
+        .iter()
+        .map(|e| format!("e == {e}"))
+        .collect::<Vec<_>>();
     writeln!(
         defs,
         "__device__ __forceinline__ bool sf_fluid(int e) {{ return {}; }}",
-        if fluids.is_empty() { "false".to_string() } else { fluids.join(" || ") }
+        if fluids.is_empty() {
+            "false".to_string()
+        } else {
+            fluids.join(" || ")
+        }
     )?;
     // Extensions (S4 milestone): biomes, blocks and noises of the pillars and icebergs
     if let Some(e) = &s.extensions {
@@ -1518,7 +1677,10 @@ pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, see
             e.packed_ice,
             e.snow
         )?;
-        for (name, f) in ["BD_S", "BD_P", "BD_R", "IC_S", "IC_P", "IC_R"].iter().zip(&noises) {
+        for (name, f) in ["BD_S", "BD_P", "BD_R", "IC_S", "IC_P", "IC_R"]
+            .iter()
+            .zip(&noises)
+        {
             writeln!(defs, "#define {name} {f}")?;
         }
     }
@@ -1528,7 +1690,14 @@ pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, see
     let mut mismatches = HashMap::new();
     let (world_top, mut low_v, mut high_v) = (s.min_y + s.height - 1, i32::MAX, i32::MIN);
     for r in &s.rules {
-        if let SR::OreVein { density, richness, gap, positive_y: [low, high], .. } = r {
+        if let SR::OreVein {
+            density,
+            richness,
+            gap,
+            positive_y: [low, high],
+            ..
+        } = r
+        {
             for id in [*density, *richness] {
                 if !volumes.contains(&id) {
                     volumes.push(id);
@@ -1553,14 +1722,42 @@ pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, see
         (0, 16)
     };
     let vr = 16 * LEVEL_R;
-    writeln!(defs, "#define SF_VLO ({vlo})\n#define SF_VH {vh}\n#define SF_VR {vr}\n#define SF_VN ({}L)", i64::from(vr) * i64::from(vr) * i64::from(vh))?;
+    writeln!(
+        defs,
+        "#define SF_VLO ({vlo})\n#define SF_VH {vh}\n#define SF_VR {vr}\n#define SF_VN ({}L)",
+        i64::from(vr) * i64::from(vr) * i64::from(vh)
+    )?;
     let mut tables = String::new();
-    writeln!(tables, "__device__ const int BANDS[192] = {{{}}};", s.bands.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))?;
+    writeln!(
+        tables,
+        "__device__ const int BANDS[192] = {{{}}};",
+        s.bands
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )?;
     let nt = s.temperatures.len().max(1);
     writeln!(tables, "#define NTB {}", s.temperatures.len())?;
     // Bits of the base temperatures (a __device__ initializer must be constant)
-    writeln!(tables, "__device__ const unsigned TB[{nt}] = {{{}}};", s.temperatures.iter().map(|t| format!("{:#010x}u", t.0.to_bits())).collect::<Vec<_>>().join(","))?;
-    writeln!(tables, "__device__ const int TG[{nt}] = {{{}}};", s.temperatures.iter().map(|t| i32::from(t.1).to_string()).collect::<Vec<_>>().join(","))?;
+    writeln!(
+        tables,
+        "__device__ const unsigned TB[{nt}] = {{{}}};",
+        s.temperatures
+            .iter()
+            .map(|t| format!("{:#010x}u", t.0.to_bits()))
+            .collect::<Vec<_>>()
+            .join(",")
+    )?;
+    writeln!(
+        tables,
+        "__device__ const int TG[{nt}] = {{{}}};",
+        s.temperatures
+            .iter()
+            .map(|t| i32::from(t.1).to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )?;
     // Declarations, conditions then rules
     let mut code = String::new();
     for k in 0..s.conditions.len() {
@@ -1638,11 +1835,20 @@ pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, see
                 t.push_str("\n  return -1;");
                 t
             }
-            SR::Condition { condition, rule } => format!("if (!C_{condition}(c)) return -1;\n  return R_{rule}(c);"),
+            SR::Condition { condition, rule } => {
+                format!("if (!C_{condition}(c)) return -1;\n  return R_{rule}(c);")
+            }
             SR::Bandlands => format!(
                 "float n = {pt_clay}((double)c.x, 0.0, (double)c.z);\n  int o = floor_sat((double)__fmul_rn(n, 4.0f) + 0.5);\n  int i = (int)((unsigned)c.y + (unsigned)o + 192u) % 192;\n  if (i < 0) {{ c.error = 1; return -1; }}\n  return BANDS[i];"
             ),
-            SR::OreVein { blocks, raw_chance, density, richness, gap, positive_y: [low, high] } => {
+            SR::OreVein {
+                blocks,
+                raw_chance,
+                density,
+                richness,
+                gap,
+                positive_y: [low, high],
+            } => {
                 let vd = volumes.iter().position(|v| v == density).unwrap();
                 let vr = volumes.iter().position(|v| v == richness).unwrap();
                 // Outside positive_y the density is never positive: nothing, without a draw (like
@@ -1658,7 +1864,10 @@ pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, see
                 )
             }
         };
-        writeln!(code, "__device__ __noinline__ int R_{k}(Ctx &c) {{\n  {body}\n}}")?;
+        writeln!(
+            code,
+            "__device__ __noinline__ int R_{k}(Ctx &c) {{\n  {body}\n}}"
+        )?;
     }
     // The root factory: Xoroshiro, or legacy (the Nether, the End) without ore veins nor
     // extensions, the only other users of its draws.
@@ -1670,10 +1879,22 @@ pub(crate) fn generate_surface(c: &DensityCompiler, s: &crate::SurfaceSetup, see
             "aq_next_double(lo, hi)",
         ),
         crate::Positional::Legacy(seed) => {
-            if s.extensions.is_some() || s.rules.iter().any(|r| matches!(r, crate::SurfaceRule::OreVein { .. })) {
+            if s.extensions.is_some()
+                || s.rules
+                    .iter()
+                    .any(|r| matches!(r, crate::SurfaceRule::OreVein { .. }))
+            {
                 return Err("legacy random source with ore veins or extensions".into());
             }
-            (0, 0, format!("long long st = lg_at((long long){}ull, x, 0, z);", seed as u64), "lg_next_double(st)")
+            (
+                0,
+                0,
+                format!(
+                    "long long st = lg_at((long long){}ull, x, 0, z);",
+                    seed as u64
+                ),
+                "lg_next_double(st)",
+            )
         }
     };
     let root = s.root;
@@ -1832,7 +2053,11 @@ extern "C" __global__ void ksf_blocks(const signed char *CODES, const unsigned s
 }}
 "#
     )?;
-    let src = format!("{}{BASE}\n{OPS}\n{}\n{defs}\n{tables}\n{RANDOM}\n{SURFACE}\n{code}", tables_cuda(&g)?, g.defs);
+    let src = format!(
+        "{}{BASE}\n{OPS}\n{}\n{defs}\n{tables}\n{RANDOM}\n{SURFACE}\n{code}",
+        tables_cuda(&g)?,
+        g.defs
+    );
     let mut progs = Vec::new();
     for id in volumes {
         progs.push(generate(c, id, seed, [vr, vh, vr])?);
@@ -1841,5 +2066,10 @@ extern "C" __global__ void ksf_blocks(const signed char *CODES, const unsigned s
     // region of LEVEL_R x LEVEL_R chunks: same corners (multiples of 16) and same interpolation as
     // a chunk's plane
     let level = generate(c, s.surface_level, seed, [vr, 1, vr])?;
-    Ok(SurfaceProgram { src, volumes: progs, level, veins_y: (vlo, vh) })
+    Ok(SurfaceProgram {
+        src,
+        volumes: progs,
+        level,
+        veins_y: (vlo, vh),
+    })
 }

@@ -870,7 +870,9 @@ impl GpuLighting {
                         }
                     }
                     drop(p.region);
-                    shared.done.send(Done::Lit(p.x, p.z, lights.unwrap(), p.seq));
+                    shared
+                        .done
+                        .send(Done::Lit(p.x, p.z, lights.unwrap(), p.seq));
                 }
             })
             .ok()?;

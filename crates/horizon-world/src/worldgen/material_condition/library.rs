@@ -167,7 +167,11 @@ impl MaterialRuleLibrary {
                     .graph()
                     .positive_y_bounds(self.roots[roots[0]])?
                     .unwrap_or([i32::MIN, i32::MAX]),
-                roots: Some([self.roots[roots[0]], self.roots[roots[1]], self.roots[roots[2]]]),
+                roots: Some([
+                    self.roots[roots[0]],
+                    self.roots[roots[1]],
+                    self.roots[roots[2]],
+                ]),
             },
         });
         self.compiled.insert(key, value.clone());

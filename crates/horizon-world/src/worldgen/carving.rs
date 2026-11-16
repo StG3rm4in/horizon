@@ -120,11 +120,7 @@ pub type CarvedSubstance = (Option<BlockStateId>, bool);
 /// order the aquifer would be. The material worker that restores exposed dirt is only built for a
 /// chunk that needs it.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_carving_mask_with<
-    R: RandomSource,
-    S: MaterialSurfaceQueries,
-    B: TerrainBlockStates,
->(
+pub fn apply_carving_mask_with<R: RandomSource, S: MaterialSurfaceQueries, B: TerrainBlockStates>(
     chunk: &mut TerrainChunk<'_, B>,
     mask: &CarvingMask,
     rule: &MaterialRule,
@@ -188,20 +184,16 @@ where
                         preliminary_surface,
                         SamplerContext::default(),
                     )?;
-                    let mut w =
-                        MaterialConditions::<R, _>::with_possible_biomes(generation, root, sources, None);
+                    let mut w = MaterialConditions::<R, _>::with_possible_biomes(
+                        generation, root, sources, None,
+                    );
                     let rule = w.add_shared_rule(rule, shared)?;
                     worker = Some((w, rule));
                 }
                 let (worker, rule) = worker.as_mut().unwrap();
                 worker.retarget_surface_densities([x, below, z])?;
-                let replacement = top_material_cell(
-                    worker,
-                    chunk,
-                    *rule,
-                    BlockPos::new(x, below, z),
-                    submerged,
-                )?;
+                let replacement =
+                    top_material_cell(worker, chunk, *rule, BlockPos::new(x, below, z), submerged)?;
                 if let Some(replacement) = replacement {
                     chunk.set_block_worldgen(x, below, z, replacement)?;
                     if chunk.block_properties(replacement).has_fluid() {

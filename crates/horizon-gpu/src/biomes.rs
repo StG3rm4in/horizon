@@ -4,9 +4,10 @@
 //! climate column by column, `kbi_search` searches each quart in the climate tree without a
 //! starting point, then `kbi_order` applies, chunk by chunk and in fill order, the previous search
 //! result (`ClimateSearch::last`). The CPU builds each `BiomeChunk` from the region.
-use super::{Context, context, priority_stream, ptx, codegen};
+use super::{Context, codegen, context, priority_stream, ptx};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
+    PushKernelArg,
 };
 use horizon_core::density::graph::{DensityCompiler, FunctionId};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -227,14 +228,30 @@ impl BiomeGpu {
             st.memset_zeros(&mut res.err).ctx("flags")?;
             let (r, qy0, nqy) = (self.r, self.qy0, self.nqy);
             let mut b = st.launch_builder(&self.k_climate);
-            b.arg(&cx0).arg(&cz0).arg(&r).arg(&qy0).arg(&nqy).arg(&mut res.qf);
+            b.arg(&cx0)
+                .arg(&cz0)
+                .arg(&r)
+                .arg(&qy0)
+                .arg(&nqy)
+                .arg(&mut res.qf);
             unsafe { b.launch(config((r * r * 16) as usize, 32)) }.ctx("climate")?;
             let mut b = st.launch_builder(&self.k_search);
-            b.arg(&r).arg(&nqy).arg(&res.qf).arg(&mut res.q).arg(&mut res.best).arg(&mut res.fmin);
+            b.arg(&r)
+                .arg(&nqy)
+                .arg(&res.qf)
+                .arg(&mut res.q)
+                .arg(&mut res.best)
+                .arg(&mut res.fmin);
             b.arg(&self.e).arg(&self.l).arg(&mut res.err);
             unsafe { b.launch(config(n, 128)) }.ctx("search")?;
             let mut b = st.launch_builder(&self.k_order);
-            b.arg(&r).arg(&nqy).arg(&res.q).arg(&res.best).arg(&res.fmin).arg(&self.e).arg(&self.l);
+            b.arg(&r)
+                .arg(&nqy)
+                .arg(&res.q)
+                .arg(&res.best)
+                .arg(&res.fmin)
+                .arg(&self.e)
+                .arg(&self.l);
             b.arg(&self.ids).arg(&mut res.out).arg(&mut res.err);
             let blocks = LaunchConfig {
                 grid_dim: ((r * r) as u32, 1, 1),
@@ -242,8 +259,11 @@ impl BiomeGpu {
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(blocks) }.ctx("search order")?;
-            st.memcpy_dtoh(&res.out, &mut res.h_out.as_mut_slice().ctx("host buffer")?[..n])
-                .ctx("biome readback")?;
+            st.memcpy_dtoh(
+                &res.out,
+                &mut res.h_out.as_mut_slice().ctx("host buffer")?[..n],
+            )
+            .ctx("biome readback")?;
             st.memcpy_dtoh(&res.err, res.h_err.as_mut_slice().ctx("host buffer")?)
                 .ctx("flag readback")?;
             st.synchronize().ctx("biome wait")?;

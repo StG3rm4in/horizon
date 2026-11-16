@@ -11,15 +11,17 @@ use super::{
     DecodeError,
     anchor::WorldGenerationContext,
     aquifer::{
-        AquiferConfig, AquiferField, AquiferSamplers, DisabledAquifer, FluidPicker, GlobalFluidPicker,
-        NoiseBasedAquifer, RegistryAquiferBlockStates,
+        AquiferConfig, AquiferField, AquiferSamplers, DisabledAquifer, FluidPicker,
+        GlobalFluidPicker, NoiseBasedAquifer, RegistryAquiferBlockStates,
     },
     biome::BiomeId,
     biome_chunk::{BiomeChunk, BiomeRegion},
     biome_chunks::BiomeChunks,
     biome_source::{BiomeSourceCatalog, ResolvedBiomeSource},
     biome_temperature::{BiomeTemperature, BiomeTemperatureSettings},
-    carver::{CarverCatalog, PlannedCarve, WorldCarver, generate_carving_mask, large_feature_random},
+    carver::{
+        CarverCatalog, PlannedCarve, WorldCarver, generate_carving_mask, large_feature_random,
+    },
     carving::{CarvedSubstance, CarvingBlocks, apply_carving_mask_shared, apply_carving_mask_with},
     climate::{ClimateSampler, decode_parameter, quantize},
     decode_noise,
@@ -38,11 +40,11 @@ use super::{
     settings::NoiseSettings,
     spawn_finder::{SpawnTargetPoint, find_spawn_position},
     tags::TagDefinitions,
-    value_provider::FloatProvider,
     terrain::{
-        PreLightChunkStage, TerrainAquifer, TerrainBlockStates, TerrainChunk, check_noise_sections, fill_noise_codes,
-        fill_noise_sections, fill_noise_states, fill_noise_with,
+        PreLightChunkStage, TerrainAquifer, TerrainBlockStates, TerrainChunk, check_noise_sections,
+        fill_noise_codes, fill_noise_sections, fill_noise_states, fill_noise_with,
     },
+    value_provider::FloatProvider,
 };
 use crate::{
     heightmap::{HeightmapState, HeightmapType},
@@ -1327,13 +1329,24 @@ where
         );
         let mut surface_gpu = None;
         let surface_test = std::env::var_os("HORIZON_GPU_SURFACE_TEST").is_some();
-        let surface_inline = !surface_test && std::env::var("HORIZON_GPU_SURFACE").is_ok_and(|v| v == "1");
+        let surface_inline =
+            !surface_test && std::env::var("HORIZON_GPU_SURFACE").is_ok_and(|v| v == "1");
         if (surface_test || surface_inline) && gpu.is_some() {
             if surface_test {
-                surface_gpu_test(library.compiler(), &noises, &surface, &root, seed, settings.sea_level);
+                surface_gpu_test(
+                    library.compiler(),
+                    &noises,
+                    &surface,
+                    &root,
+                    seed,
+                    settings.sea_level,
+                );
             }
-            let generation =
-                WorldGenerationContext::new(settings.noise_min_y, settings.noise_height, settings.sea_level);
+            let generation = WorldGenerationContext::new(
+                settings.noise_min_y,
+                settings.noise_height,
+                settings.sea_level,
+            );
             let mut ir = SurfaceIr {
                 rules: Vec::new(),
                 conditions: Vec::new(),
@@ -1346,11 +1359,22 @@ where
                 root: &root,
             };
             let built = ir.rule(&rule).and_then(|rule_root| {
-                let state = |r: Option<(u64, u64)>| r.ok_or_else(|| "the factory is not Xoroshiro".to_string());
+                let state = |r: Option<(u64, u64)>| {
+                    r.ok_or_else(|| "the factory is not Xoroshiro".to_string())
+                };
                 let mut ore = root.from_hash_of("minecraft:ore");
                 let ore = (ore.next_long() as u64, ore.next_long() as u64);
-                let get = |name: &str| noises.get(name).cloned().ok_or_else(|| format!("missing noise {name}"));
-                let (surf, sec, clay) = (get("minecraft:surface")?, get("minecraft:surface_secondary")?, get("minecraft:clay_bands_offset")?);
+                let get = |name: &str| {
+                    noises
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| format!("missing noise {name}"))
+                };
+                let (surf, sec, clay) = (
+                    get("minecraft:surface")?,
+                    get("minecraft:surface_secondary")?,
+                    get("minecraft:clay_bands_offset")?,
+                );
                 // The extension noises, like MaterialExtensions (Pipeline::new)
                 let ext_noises = [
                     "minecraft:badlands_surface",
@@ -1366,7 +1390,10 @@ where
                     ext.push(b?);
                 }
                 let block = |name: &str| {
-                    data.registry.default_state(name).map(|b| b.0).ok_or_else(|| format!("missing block {name}"))
+                    data.registry
+                        .default_state(name)
+                        .map(|b| b.0)
+                        .ok_or_else(|| format!("missing block {name}"))
                 };
                 let mut setup = horizon_gpu::SurfaceSetup {
                     rules: ir.rules.clone(),
@@ -1387,7 +1414,12 @@ where
                     temperatures: data
                         .temperatures
                         .iter()
-                        .map(|t| (t.base_temperature, t.modifier == super::biome_temperature::TemperatureModifier::Frozen))
+                        .map(|t| {
+                            (
+                                t.base_temperature,
+                                t.modifier == super::biome_temperature::TemperatureModifier::Frozen,
+                            )
+                        })
                         .collect(),
                     temperature_noises: super::biome_temperature::temperature_noises(),
                     zoom_seed: horizon_core::biome::obfuscate_seed(seed),
@@ -1419,7 +1451,11 @@ where
                 // A legacy root (the Nether, the End): the extensions draw from it like the ore
                 // veins, so its dimension must not have their biomes, and goes without them.
                 if root.xoroshiro_state().is_none() {
-                    let extension_biomes = ["minecraft:eroded_badlands", "minecraft:frozen_ocean", "minecraft:deep_frozen_ocean"];
+                    let extension_biomes = [
+                        "minecraft:eroded_badlands",
+                        "minecraft:frozen_ocean",
+                        "minecraft:deep_frozen_ocean",
+                    ];
                     if super::generator_decoration::possible_biomes(&source)
                         .iter()
                         .any(|b| extension_biomes.contains(&b.as_str()))
@@ -1434,7 +1470,9 @@ where
                 for r in &setup.rules {
                     match r {
                         horizon_gpu::SurfaceRule::Block(b) => written_blocks.push(*b),
-                        horizon_gpu::SurfaceRule::OreVein { blocks, .. } => written_blocks.extend(blocks),
+                        horizon_gpu::SurfaceRule::OreVein { blocks, .. } => {
+                            written_blocks.extend(blocks)
+                        }
                         _ => {}
                     }
                 }
@@ -1446,7 +1484,12 @@ where
                 if let Some(e) = &setup.extensions {
                     no_fluid.extend([e.default_block, e.packed_ice, e.snow]);
                 }
-                if written_blocks.iter().chain(&no_fluid).chain(&setup.fill_states).any(|&b| b >= 0x4000_0000) {
+                if written_blocks
+                    .iter()
+                    .chain(&no_fluid)
+                    .chain(&setup.fill_states)
+                    .any(|&b| b >= 0x4000_0000)
+                {
                     return Err("a state does not fit in 30 bits".to_string());
                 }
                 if no_fluid.iter().any(fluid) {
@@ -1491,42 +1534,43 @@ where
         // HORIZON_GPU_BIOMES=1: the biomes of a multi-noise source on the GPU, by regions of
         // HORIZON_GPU_BIOMES_REGION x HORIZON_GPU_BIOMES_REGION chunks (8); `test` checks each chunk
         // against the CPU's.
-        let (biomes_gpu, biomes_test) = match (std::env::var("HORIZON_GPU_BIOMES").as_deref(), &source) {
-            (Ok(v @ ("1" | "test")), ResolvedBiomeSource::MultiNoise(multi)) => {
-                let index = multi.parameters();
-                let (spaces, links) = index.tree();
-                let entry_ids: Vec<u32> = index
-                    .entries()
-                    .iter()
-                    .map(|(_, name)| data.biome_ids.get(name).map_or(u32::MAX, |id| id.0))
-                    .collect();
-                let region = std::env::var("HORIZON_GPU_BIOMES_REGION")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(8);
-                let tree = horizon_gpu::BiomeTree {
-                    spaces: &spaces,
-                    links,
-                    entry_ids: &entry_ids,
-                };
-                match horizon_gpu::BiomeGpu::new(
-                    library.compiler(),
-                    climate_roots,
-                    seed,
-                    &tree,
-                    settings.level_min_y,
-                    settings.level_height,
-                    region,
-                ) {
-                    Ok(g) => (Some(g), v == "test"),
-                    Err(e) => {
-                        eprintln!("GPU biomes: no biomes on the GPU: {e}");
-                        (None, false)
+        let (biomes_gpu, biomes_test) =
+            match (std::env::var("HORIZON_GPU_BIOMES").as_deref(), &source) {
+                (Ok(v @ ("1" | "test")), ResolvedBiomeSource::MultiNoise(multi)) => {
+                    let index = multi.parameters();
+                    let (spaces, links) = index.tree();
+                    let entry_ids: Vec<u32> = index
+                        .entries()
+                        .iter()
+                        .map(|(_, name)| data.biome_ids.get(name).map_or(u32::MAX, |id| id.0))
+                        .collect();
+                    let region = std::env::var("HORIZON_GPU_BIOMES_REGION")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(8);
+                    let tree = horizon_gpu::BiomeTree {
+                        spaces: &spaces,
+                        links,
+                        entry_ids: &entry_ids,
+                    };
+                    match horizon_gpu::BiomeGpu::new(
+                        library.compiler(),
+                        climate_roots,
+                        seed,
+                        &tree,
+                        settings.level_min_y,
+                        settings.level_height,
+                        region,
+                    ) {
+                        Ok(g) => (Some(g), v == "test"),
+                        Err(e) => {
+                            eprintln!("GPU biomes: no biomes on the GPU: {e}");
+                            (None, false)
+                        }
                     }
                 }
-            }
-            _ => (None, false),
-        };
+                _ => (None, false),
+            };
         let mut pipeline = Self {
             zoom: BiomeZoom::new(obfuscate_seed(seed)),
             data,
@@ -1759,7 +1803,10 @@ where
                         );
                     }
                     if n.is_power_of_two() {
-                        log::info!("GPU biomes test: {n} chunks, {} mismatches", bg.mismatches());
+                        log::info!(
+                            "GPU biomes test: {n} chunks, {} mismatches",
+                            bg.mismatches()
+                        );
                     }
                 }
             }
@@ -1811,13 +1858,15 @@ where
                     }
                 };
                 slot.done
-                    .get_or_init(|| match bg.region(key.0.wrapping_mul(r), key.1.wrapping_mul(r)) {
-                        Ok(values) => Some(Arc::new(values)),
-                        Err(e) => {
-                            log::error!("GPU biomes: region {key:?}: {e}");
-                            None
-                        }
-                    })
+                    .get_or_init(
+                        || match bg.region(key.0.wrapping_mul(r), key.1.wrapping_mul(r)) {
+                            Ok(values) => Some(Arc::new(values)),
+                            Err(e) => {
+                                log::error!("GPU biomes: region {key:?}: {e}");
+                                None
+                            }
+                        },
+                    )
                     .clone()
             }
         };
@@ -1832,12 +1881,16 @@ where
         }
         let (min, height) = (self.settings.level_min_y, self.settings.level_height);
         let mut next = ids.iter();
-        let chunk = BiomeChunk::new(pos, min, height, BiomeId(0)).ok().and_then(|mut chunk| {
-            chunk
-                .fill(min, min + height - 1, |_| next.next().map(|&id| BiomeId(id)).ok_or(()))
-                .ok()
-                .map(|()| chunk)
-        });
+        let chunk = BiomeChunk::new(pos, min, height, BiomeId(0))
+            .ok()
+            .and_then(|mut chunk| {
+                chunk
+                    .fill(min, min + height - 1, |_| {
+                        next.next().map(|&id| BiomeId(id)).ok_or(())
+                    })
+                    .ok()
+                    .map(|()| chunk)
+            });
         Some(chunk)
     }
     /// The chunk's biomes from the CPU's climate and search, blended with an old world's chunks.
@@ -1934,7 +1987,9 @@ where
                         large_feature_random(self.seed.wrapping_add(index as i64), origin);
                     if carver.is_start_chunk(&mut random) {
                         let mut items = Vec::new();
-                        error |= carver.plan(generation, &mut random, origin, &mut items).is_err();
+                        error |= carver
+                            .plan(generation, &mut random, origin, &mut items)
+                            .is_err();
                         calls.push((carver.clone(), items));
                     }
                 }
@@ -2002,7 +2057,8 @@ where
                                 floor,
                             } => {
                                 let reach = 16. + horizontal * 2.;
-                                if (center[0] - cx).abs() > reach || (center[2] - cz).abs() > reach {
+                                if (center[0] - cx).abs() > reach || (center[2] - cz).abs() > reach
+                                {
                                     continue;
                                 }
                                 CaveItem {
@@ -2402,10 +2458,8 @@ where
         if beard.is_some() || !blender.is_empty() {
             let mut fields = horizon_core::density::WorldFields::default();
             if let Some(beard) = &beard {
-                fields = fields.with_field(
-                    horizon_core::density::WorldField::Beardifier,
-                    beard.clone(),
-                );
+                fields =
+                    fields.with_field(horizon_core::density::WorldField::Beardifier, beard.clone());
             }
             if !blender.is_empty() {
                 let buffer = Arc::new(blender.output_buffer(volume));
@@ -2433,35 +2487,42 @@ where
             _ => None,
         };
         worker.timings.carvers += lap(&mut clock);
-        let cpu_aquifer = |context: &mut SamplerContext| -> Result<Box<dyn TerrainAquifer>, GeneratorError> {
-            Ok(match &self.aquifer {
-                Some(samplers) => Box::new(
-                    NoiseBasedAquifer::new(
-                        AquiferSamplers::new(samplers.clone()),
+        let cpu_aquifer =
+            |context: &mut SamplerContext| -> Result<Box<dyn TerrainAquifer>, GeneratorError> {
+                Ok(match &self.aquifer {
+                    Some(samplers) => Box::new(
+                        NoiseBasedAquifer::new(
+                            AquiferSamplers::new(samplers.clone()),
+                            self.picker,
+                            self.root
+                                .from_hash_of("minecraft:aquifer")
+                                .fork_positional(),
+                            RegistryAquiferBlockStates::new(data.registry)
+                                .map_err(stage("aquifer"))?,
+                            volume,
+                            context,
+                        )
+                        .map_err(stage("aquifer"))?,
+                    ),
+                    None => Box::new(DisabledAquifer::new(
                         self.picker,
-                        self.root
-                            .from_hash_of("minecraft:aquifer")
-                            .fork_positional(),
-                        RegistryAquiferBlockStates::new(data.registry).map_err(stage("aquifer"))?,
-                        volume,
-                        context,
-                    )
-                    .map_err(stage("aquifer"))?,
-                ),
-                None => Box::new(DisabledAquifer::new(
-                    self.picker,
-                    data.registry.default_state("minecraft:air").unwrap(),
-                )),
-            })
-        };
+                        data.registry.default_state("minecraft:air").unwrap(),
+                    )),
+                })
+            };
         // With the carvers' cells on the GPU too, the CPU aquifer is only built for a chunk that
         // needs it (CPU fill or carving). Its air limit then is the GPU's: the fluid picker is the
         // same at every x/z, at sea level.
-        let lazy_aquifer = self.caves_gpu.is_some() && !self.caves_test && self.aquifer.is_some() && {
-            let levels = [[0, i32::MAX, 0], [i32::MAX; 3], [i32::MIN, i32::MAX, i32::MIN]]
+        let lazy_aquifer =
+            self.caves_gpu.is_some() && !self.caves_test && self.aquifer.is_some() && {
+                let levels = [
+                    [0, i32::MAX, 0],
+                    [i32::MAX; 3],
+                    [i32::MIN, i32::MAX, i32::MIN],
+                ]
                 .map(|p| self.picker.compute(p).level);
-            levels.iter().all(|&l| l == self.settings.sea_level)
-        };
+                levels.iter().all(|&l| l == self.settings.sea_level)
+            };
         let mut aquifer: Option<Box<dyn TerrainAquifer>> = if lazy_aquifer {
             None
         } else {
@@ -2501,10 +2562,9 @@ where
                     codes.resize(volume.size(), 0i8);
                     // HORIZON_GPU_SURFACE=1: the chunk's surface runs on the GPU stream of its codes,
                     // which do not come back to the GPU; its final states are written below.
-                    let surface = self
-                        .surface_gpu
-                        .as_ref()
-                        .filter(|_| self.surface_inline && run_surface && !self.identity_end_surface(pos));
+                    let surface = self.surface_gpu.as_ref().filter(|_| {
+                        self.surface_inline && run_surface && !self.identity_end_surface(pos)
+                    });
                     let quarters = surface.and_then(|sg| surface_quarters(sg, pos, &biomes));
                     let skip = match (surface, &quarters) {
                         (Some(sg), Some(quarters)) => {
@@ -2552,13 +2612,21 @@ where
                             }
                             match &beard {
                                 Some(beard) => {
-                                    let skip = gpu.chunk_blocks_beard(pos.x, pos.z, beard, &mut codes, caves_job.as_mut());
+                                    let skip = gpu.chunk_blocks_beard(
+                                        pos.x,
+                                        pos.z,
+                                        beard,
+                                        &mut codes,
+                                        caves_job.as_mut(),
+                                    );
                                     if skip.is_none() {
                                         gpu.note_cpu_fallback();
                                     }
                                     skip
                                 }
-                                None => gpu.chunk_blocks(pos.x, pos.z, &mut codes, caves_job.as_mut()),
+                                None => {
+                                    gpu.chunk_blocks(pos.x, pos.z, &mut codes, caves_job.as_mut())
+                                }
                             }
                         }
                     };
@@ -2566,7 +2634,8 @@ where
                         // A disabled aquifer has no air limit: the GPU took its picker everywhere.
                         Some(skip)
                             if aquifer.as_ref().is_none_or(|a| {
-                                a.air_above_y().is_none_or(|y| y == skip.max(self.settings.sea_level))
+                                a.air_above_y()
+                                    .is_none_or(|y| y == skip.max(self.settings.sea_level))
                             }) =>
                         {
                             true
@@ -2583,7 +2652,11 @@ where
             // HORIZON_GPU_SURFACE=1: the final states of the fill and the surface come from the GPU and
             // are written once; the CPU surface is skipped for this chunk.
             let states = if from_codes { gpu_states.take() } else { None };
-            let sections = if from_codes { sections_gpu.take() } else { None };
+            let sections = if from_codes {
+                sections_gpu.take()
+            } else {
+                None
+            };
             let filled = if let (Some(data), 1) = (&sections, self.gpu_sections) {
                 surface_done = true;
                 fill_noise_sections(&mut chunk, volume, data)
@@ -3444,7 +3517,8 @@ where
         static ERRORS: AtomicU64 = AtomicU64::new(0);
         static CHANGES: AtomicU64 = AtomicU64::new(0);
         static EXTENSIONS: AtomicU64 = AtomicU64::new(0);
-        static BIOMES: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
+        static BIOMES: std::sync::Mutex<BTreeMap<String, u64>> =
+            std::sync::Mutex::new(BTreeMap::new());
         let mut seen: BTreeMap<String, u64> = BTreeMap::new();
         let mut quarters = Vec::new();
         for dz in -1..=1 {
@@ -3467,7 +3541,10 @@ where
                 return;
             }
         };
-        let (min, h) = (self.settings.noise_min_y, self.settings.noise_height as usize);
+        let (min, h) = (
+            self.settings.noise_min_y,
+            self.settings.noise_height as usize,
+        );
         let air = self.data.registry.default_state("minecraft:air").unwrap();
         let lava = self.data.registry.default_state("minecraft:lava").unwrap();
         let before = |code: i8| match code & 3 {
@@ -3476,25 +3553,38 @@ where
             2 => self.settings.default_fluid,
             _ => lava,
         };
-        let name = |id: BlockStateId| self.data.registry.state(id).map_or("?".to_owned(), |s| s.name.clone());
-        let (mut mismatches, mut blocks, mut ignored, mut changes, mut ext) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let name = |id: BlockStateId| {
+            self.data
+                .registry
+                .state(id)
+                .map_or("?".to_owned(), |s| s.name.clone())
+        };
+        let (mut mismatches, mut blocks, mut ignored, mut changes, mut ext) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
         let mut example = None;
         for lz in 0..16usize {
             for lx in 0..16usize {
                 let lc = lx + lz * 16;
                 let col = &codes[lc * h..(lc + 1) * h];
-                let top = (0..h).rev().find(|&iy| col[iy] & 3 != 1).map_or(min, |iy| min + iy as i32 + 1);
+                let top = (0..h)
+                    .rev()
+                    .find(|&iy| col[iy] & 3 != 1)
+                    .map_or(min, |iy| min + iy as i32 + 1);
                 let (x, z) = (pos.x * 16 + lx as i32, pos.z * 16 + lz as i32);
                 let biome = biomes
                     .biome(BlockPos::new(x, top, z))
                     .map(|id| self.data.biome_names[id.0 as usize].clone());
                 if let Ok(b) = &biome {
-                    *seen.entry(b.trim_start_matches("minecraft:").to_owned()).or_default() += 1;
+                    *seen
+                        .entry(b.trim_start_matches("minecraft:").to_owned())
+                        .or_default() += 1;
                 }
                 if std::env::var_os("HORIZON_GPU_SURFACE_SKIP_EXT").is_some()
                     && matches!(
                         biome.as_deref(),
-                        Ok("minecraft:eroded_badlands" | "minecraft:frozen_ocean" | "minecraft:deep_frozen_ocean")
+                        Ok("minecraft:eroded_badlands"
+                            | "minecraft:frozen_ocean"
+                            | "minecraft:deep_frozen_ocean")
                     )
                 {
                     ignored += 1;
@@ -3515,7 +3605,11 @@ where
                     if gpu != cpu {
                         mismatches += 1;
                         if example.is_none() {
-                            example = Some(format!("({x}, {y}, {z}) gpu {} / cpu {}", name(gpu), name(cpu)));
+                            example = Some(format!(
+                                "({x}, {y}, {z}) gpu {} / cpu {}",
+                                name(gpu),
+                                name(cpu)
+                            ));
                         }
                     }
                 }
@@ -3533,9 +3627,17 @@ where
             *all_biomes.entry(b).or_default() += k;
         }
         if mismatches > 0 && MISMATCHES.load(Relaxed) == mismatches {
-            eprintln!("GPU surface S3: first mismatch, chunk {} {}: {mismatches} blocks, e.g. {}", pos.x, pos.z, example.unwrap_or_default());
+            eprintln!(
+                "GPU surface S3: first mismatch, chunk {} {}: {mismatches} blocks, e.g. {}",
+                pos.x,
+                pos.z,
+                example.unwrap_or_default()
+            );
         }
-        if n.is_power_of_two() || n % 256 == 0 || std::env::var_os("HORIZON_GPU_SURFACE_BIOMES").is_some() {
+        if n.is_power_of_two()
+            || n % 256 == 0
+            || std::env::var_os("HORIZON_GPU_SURFACE_BIOMES").is_some()
+        {
             eprintln!(
                 "GPU surface S3: {n} chunks, {} blocks compared, {} of them changed by the surface ({} by the extensions), {} mismatches, {} columns ignored (extensions), {} chunks with a condition that cannot be evaluated",
                 BLOCKS.load(Relaxed),
@@ -3548,7 +3650,11 @@ where
             if std::env::var_os("HORIZON_GPU_SURFACE_BIOMES").is_some() {
                 eprintln!(
                     "GPU surface S3: columns per biome: {}",
-                    all_biomes.iter().map(|(b, k)| format!("{b} {k}")).collect::<Vec<_>>().join(", ")
+                    all_biomes
+                        .iter()
+                        .map(|(b, k)| format!("{b} {k}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
         }
@@ -3557,7 +3663,11 @@ where
 
 /// The biome quarts of the 3 x 3 chunks around `pos` (dz then dx, each chunk by sections), as
 /// `SurfaceGpu::chunk_states` reads them.
-fn surface_quarters(sg: &horizon_gpu::SurfaceGpu, pos: ChunkPos, biomes: &BiomeRegion<BiomeId>) -> Option<Vec<u16>> {
+fn surface_quarters(
+    sg: &horizon_gpu::SurfaceGpu,
+    pos: ChunkPos,
+    biomes: &BiomeRegion<BiomeId>,
+) -> Option<Vec<u16>> {
     let mut quarters = Vec::with_capacity(sg.biome_count());
     for dz in -1..=1 {
         for dx in -1..=1 {
@@ -3607,19 +3717,30 @@ impl<'a, P: PositionalRandom> SurfaceIr<'a, P> {
                 self.memo.insert(key, i);
                 i
             }
-            M::OreVein { ore, raw_ore, filler, raw_ore_chance, roots, positive_y, .. } => {
+            M::OreVein {
+                ore,
+                raw_ore,
+                filler,
+                raw_ore_chance,
+                roots,
+                positive_y,
+                ..
+            } => {
                 let roots = roots.ok_or_else(|| "vein without graph roots".to_string())?;
                 self.push_rule(S::OreVein {
-                blocks: [ore.0, raw_ore.0, filler.0],
-                raw_chance: *raw_ore_chance,
-                density: roots[0],
-                richness: roots[1],
-                gap: roots[2],
+                    blocks: [ore.0, raw_ore.0, filler.0],
+                    raw_chance: *raw_ore_chance,
+                    density: roots[0],
+                    richness: roots[1],
+                    gap: roots[2],
                     positive_y: *positive_y,
                 })
             }
             M::Sequence(children) => {
-                let ids = children.iter().map(|c| self.rule(c)).collect::<Result<Vec<_>, _>>()?;
+                let ids = children
+                    .iter()
+                    .map(|c| self.rule(c))
+                    .collect::<Result<Vec<_>, _>>()?;
                 self.push_rule(S::Sequence(ids))
             }
             M::Condition { if_true, then_run } => {
@@ -3638,7 +3759,10 @@ impl<'a, P: PositionalRandom> SurfaceIr<'a, P> {
             .map(|id| id.0)
             .collect()
     }
-    fn condition(&mut self, c: &super::material_condition::MaterialCondition) -> Result<usize, String> {
+    fn condition(
+        &mut self,
+        c: &super::material_condition::MaterialCondition,
+    ) -> Result<usize, String> {
         use super::material_condition::MaterialCondition;
         use horizon_gpu::SurfaceCondition as S;
         Ok(match c {
@@ -3654,42 +3778,75 @@ impl<'a, P: PositionalRandom> SurfaceIr<'a, P> {
             }
             MaterialCondition::Temperature => self.push_condition(S::Temperature),
             MaterialCondition::AbovePreliminarySurface => self.push_condition(S::AbovePreliminary),
-            MaterialCondition::NoiseThreshold { noise, min, max, is_3d } => {
+            MaterialCondition::NoiseThreshold {
+                noise,
+                min,
+                max,
+                is_3d,
+            } => {
                 let name = super::tags::identifier(noise).map_err(|e| format!("{e:?}"))?;
                 let index = match self.noise_index.get(&name) {
                     Some(&i) => i,
                     None => {
-                        let n = self.all_noises.get(&name).ok_or_else(|| format!("missing noise {name}"))?;
+                        let n = self
+                            .all_noises
+                            .get(&name)
+                            .ok_or_else(|| format!("missing noise {name}"))?;
                         self.noises.push(n.as_ref());
                         self.noise_index.insert(name, self.noises.len() - 1);
                         self.noises.len() - 1
                     }
                 };
-                self.push_condition(S::Noise { noise: index, min: *min, max: *max, is_3d: *is_3d })
+                self.push_condition(S::Noise {
+                    noise: index,
+                    min: *min,
+                    max: *max,
+                    is_3d: *is_3d,
+                })
             }
-            MaterialCondition::YAbove { anchor, surface_depth_multiplier, add_stone_depth } => self.push_condition(S::YAbove {
+            MaterialCondition::YAbove {
+                anchor,
+                surface_depth_multiplier,
+                add_stone_depth,
+            } => self.push_condition(S::YAbove {
                 anchor: anchor.resolve(self.generation),
                 multiplier: *surface_depth_multiplier,
                 add_stone: *add_stone_depth,
             }),
-            MaterialCondition::Water { offset, surface_depth_multiplier, add_stone_depth } => self.push_condition(S::Water {
+            MaterialCondition::Water {
+                offset,
+                surface_depth_multiplier,
+                add_stone_depth,
+            } => self.push_condition(S::Water {
                 offset: *offset,
                 multiplier: *surface_depth_multiplier,
                 add_stone: *add_stone_depth,
             }),
-            MaterialCondition::StoneDepth { offset, add_surface_depth, secondary_depth_range, ceiling } => self.push_condition(S::StoneDepth {
+            MaterialCondition::StoneDepth {
+                offset,
+                add_surface_depth,
+                secondary_depth_range,
+                ceiling,
+            } => self.push_condition(S::StoneDepth {
                 offset: *offset,
                 add_surface: *add_surface_depth,
                 secondary_range: *secondary_depth_range,
                 ceiling: *ceiling,
             }),
-            MaterialCondition::VerticalGradient { random_name, true_at_and_below, false_at_and_above } => {
+            MaterialCondition::VerticalGradient {
+                random_name,
+                true_at_and_below,
+                false_at_and_above,
+            } => {
                 let name = super::tags::identifier(random_name).map_err(|e| format!("{e:?}"))?;
                 let mut r = self.root.from_hash_of(&name);
                 // fork_positional: a Xoroshiro factory takes two longs, a legacy one its seed
                 let positional = match self.root.legacy_seed() {
                     Some(_) => horizon_gpu::Positional::Legacy(r.next_long()),
-                    None => horizon_gpu::Positional::Xoroshiro(r.next_long() as u64, r.next_long() as u64),
+                    None => horizon_gpu::Positional::Xoroshiro(
+                        r.next_long() as u64,
+                        r.next_long() as u64,
+                    ),
                 };
                 self.push_condition(S::Gradient {
                     low: true_at_and_below.resolve(self.generation),
@@ -3729,7 +3886,11 @@ fn surface_gpu_test<P: PositionalRandom + Clone>(
         let extent = if i % 3 == 0 { 29_999_999 } else { 30_000 };
         let x = (next() % (2 * extent + 1)) as i64 - extent as i64;
         let z = (next() % (2 * extent + 1)) as i64 - extent as i64;
-        let y = if i % 2 == 0 { 0 } else { (next() % 450) as i64 - 64 };
+        let y = if i % 2 == 0 {
+            0
+        } else {
+            (next() % 450) as i64 - 64
+        };
         points.push([x as i32, y as i32, z as i32]);
     }
     let actual: Vec<[f64; 3]> = points.iter().map(|p| p.map(f64::from)).collect();
@@ -3741,14 +3902,24 @@ fn surface_gpu_test<P: PositionalRandom + Clone>(
         Ok(gpu) => {
             for (k, (name, n)) in list.iter().enumerate() {
                 let d = (0..actual.len())
-                    .filter(|&i| n.get3(actual[i][0], actual[i][1], actual[i][2]).to_bits() != gpu[k][i].to_bits())
+                    .filter(|&i| {
+                        n.get3(actual[i][0], actual[i][1], actual[i][2]).to_bits()
+                            != gpu[k][i].to_bits()
+                    })
                     .count();
                 if d > 0 {
-                    eprintln!("GPU surface S1: noise {name}: {d} differences out of {}", actual.len());
+                    eprintln!(
+                        "GPU surface S1: noise {name}: {d} differences out of {}",
+                        actual.len()
+                    );
                 }
                 total += d;
             }
-            eprintln!("GPU surface S1: {} noises compared at {} points", list.len(), actual.len());
+            eprintln!(
+                "GPU surface S1: {} noises compared at {} points",
+                list.len(),
+                actual.len()
+            );
         }
         Err(e) => {
             eprintln!("GPU surface S1: noises: {e}");
@@ -3756,8 +3927,14 @@ fn surface_gpu_test<P: PositionalRandom + Clone>(
         }
     }
     // 2. Positional draws: the root (surface depth) and named factories (gradients, ore veins)
-    let mut factories: Vec<(String, Option<(u64, u64)>, P)> = vec![("root".into(), root.xoroshiro_state(), root.clone())];
-    for name in ["minecraft:ore", "minecraft:bedrock_floor", "minecraft:bedrock_roof", "minecraft:deepslate"] {
+    let mut factories: Vec<(String, Option<(u64, u64)>, P)> =
+        vec![("root".into(), root.xoroshiro_state(), root.clone())];
+    for name in [
+        "minecraft:ore",
+        "minecraft:bedrock_floor",
+        "minecraft:bedrock_roof",
+        "minecraft:deepslate",
+    ] {
         let mut r = root.from_hash_of(name);
         let state = Some((r.next_long() as u64, r.next_long() as u64));
         factories.push((name.into(), state, root.clone()));
@@ -3777,16 +3954,28 @@ fn surface_gpu_test<P: PositionalRandom + Clone>(
                         let mut a = root.at(pos);
                         let mut b = root.at(pos);
                         let mut c = root.at(pos);
-                        (a.next_float(), b.next_double(), [c.next_float(), c.next_float(), c.next_float()])
+                        (
+                            a.next_float(),
+                            b.next_double(),
+                            [c.next_float(), c.next_float(), c.next_float()],
+                        )
                     } else {
                         let factory = root.from_hash_of(name).fork_positional();
                         let mut a = factory.at(pos);
                         let mut b = factory.at(pos);
                         let mut c = factory.at(pos);
-                        (a.next_float(), b.next_double(), [c.next_float(), c.next_float(), c.next_float()])
+                        (
+                            a.next_float(),
+                            b.next_double(),
+                            [c.next_float(), c.next_float(), c.next_float()],
+                        )
                     };
                     let g3 = [f3[3 * i], f3[3 * i + 1], f3[3 * i + 2]];
-                    mismatches += usize::from(cf.to_bits() != f[i].to_bits() || cd.to_bits() != d[i].to_bits() || c3.map(f32::to_bits) != g3.map(f32::to_bits));
+                    mismatches += usize::from(
+                        cf.to_bits() != f[i].to_bits()
+                            || cd.to_bits() != d[i].to_bits()
+                            || c3.map(f32::to_bits) != g3.map(f32::to_bits),
+                    );
                 }
                 if mismatches > 0 {
                     eprintln!("GPU surface S1: draws {name}: {mismatches} positions differ");
@@ -3821,7 +4010,11 @@ fn surface_gpu_test<P: PositionalRandom + Clone>(
     }
     eprintln!(
         "GPU surface S1: {}",
-        if total == 0 { "noises, draws and surface depth identical to the CPU" } else { "DIFFERENCES FOUND" }
+        if total == 0 {
+            "noises, draws and surface depth identical to the CPU"
+        } else {
+            "DIFFERENCES FOUND"
+        }
     );
     // S2: biome zoom and height-adjusted temperature
     let zoom = horizon_core::biome::BiomeZoom::new(horizon_core::biome::obfuscate_seed(seed));
@@ -3837,7 +4030,16 @@ fn surface_gpu_test<P: PositionalRandom + Clone>(
         }
     }
     let mut total2 = 0usize;
-    match horizon_gpu::surface_s2_check(compiler, zoom_seed_of(&zoom), &points2, &combos, sea_level, height, freeze, info) {
+    match horizon_gpu::surface_s2_check(
+        compiler,
+        zoom_seed_of(&zoom),
+        &points2,
+        &combos,
+        sea_level,
+        height,
+        freeze,
+        info,
+    ) {
         Ok((quarters, temperatures)) => {
             let dq = points2
                 .iter()
@@ -3863,12 +4065,16 @@ fn surface_gpu_test<P: PositionalRandom + Clone>(
                     .iter()
                     .enumerate()
                     .filter(|(i, p)| {
-                        settings.height_adjusted(BlockPos::new(p[0], p[1], p[2]), sea_level).to_bits()
+                        settings
+                            .height_adjusted(BlockPos::new(p[0], p[1], p[2]), sea_level)
+                            .to_bits()
                             != temperatures[k][*i].to_bits()
                     })
                     .count();
                 if d > 0 {
-                    eprintln!("GPU surface S2: temperature (base {base}, frozen {frozen}): {d} differences");
+                    eprintln!(
+                        "GPU surface S2: temperature (base {base}, frozen {frozen}): {d} differences"
+                    );
                 }
                 total2 += d;
             }

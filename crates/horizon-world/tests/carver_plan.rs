@@ -24,12 +24,22 @@ fn planned_carvers_carve_the_same_cells() {
                     let target = ChunkPos::new(origin.x + dx, origin.z + dz);
                     let mut a = CarvingMask::new(-63, 312).unwrap();
                     carver
-                        .carve(context, &mut LegacyRandom::new(seed), target, origin, &mut a)
+                        .carve(
+                            context,
+                            &mut LegacyRandom::new(seed),
+                            target,
+                            origin,
+                            &mut a,
+                        )
                         .unwrap();
                     let mut b = CarvingMask::new(-63, 312).unwrap();
                     carver.execute(context, &planned, target, &mut b).unwrap();
                     assert_eq!(a.words(), b.words(), "seed {seed}, target {target:?}");
-                    cells += a.words().iter().map(|w| u64::from(w.count_ones())).sum::<u64>();
+                    cells += a
+                        .words()
+                        .iter()
+                        .map(|w| u64::from(w.count_ones()))
+                        .sum::<u64>();
                 }
             }
         }

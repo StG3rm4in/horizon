@@ -179,7 +179,9 @@ pub fn compress_records_with_pool(
     let compress = move |record: &Record| {
         record
             .encoded(Limits::saved())
-            .map(|bytes| bytes.and_then(|bytes| ChunkRecord::from_bytes(&bytes, compression, timestamp)))
+            .map(|bytes| {
+                bytes.and_then(|bytes| ChunkRecord::from_bytes(&bytes, compression, timestamp))
+            })
             .transpose()
     };
     if count < MIN_PARALLEL_CHUNKS || pool.workers() == 0 {

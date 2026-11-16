@@ -59,7 +59,9 @@ impl WorldCarver {
         match self {
             Self::Cave(c) => c.plan(context, random, origin, out),
             Self::Canyon(c) => {
-                out.push(PlannedCarve::Canyon(Box::new(c.plan(context, random, origin)?)));
+                out.push(PlannedCarve::Canyon(Box::new(
+                    c.plan(context, random, origin)?,
+                )));
                 Ok(())
             }
         }

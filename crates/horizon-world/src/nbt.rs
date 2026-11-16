@@ -855,10 +855,18 @@ impl RootWriter {
     /// A `LongArray` payload of `words` (as i64).
     pub fn long_array(&mut self, words: &[u64]) -> Result<(), Error> {
         self.writer.count(words.len())?;
-        if words.len().saturating_mul(8) <= self.writer.limits.max_bytes.saturating_sub(self.writer.bytes.len()) {
+        if words.len().saturating_mul(8)
+            <= self
+                .writer
+                .limits
+                .max_bytes
+                .saturating_sub(self.writer.bytes.len())
+        {
             self.writer.bytes.reserve(words.len() * 8);
             for &word in words {
-                self.writer.bytes.extend_from_slice(&(word as i64).to_be_bytes());
+                self.writer
+                    .bytes
+                    .extend_from_slice(&(word as i64).to_be_bytes());
             }
             return Ok(());
         }

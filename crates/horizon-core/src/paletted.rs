@@ -228,7 +228,13 @@ fn palette_ids(values: &[u32]) -> (Vec<u32>, Vec<u32>) {
 /// Words holding `ids` in `bits`-wide slots.
 /// The `entries` ids of `src` (`src_bits` wide) through `f`, packed `bits` wide. Four bits to four
 /// bits, the usual widths, maps the two entries of a byte with one table look-up.
-fn remap_words(src_bits: u8, src: &[u64], bits: u8, entries: usize, f: impl Fn(u32) -> u32) -> Vec<u64> {
+fn remap_words(
+    src_bits: u8,
+    src: &[u64],
+    bits: u8,
+    entries: usize,
+    f: impl Fn(u32) -> u32,
+) -> Vec<u64> {
     if src_bits == 4 && bits == 4 && src.len() * 16 == entries {
         let mut table = [0u8; 256];
         for (b, t) in table.iter_mut().enumerate() {
@@ -823,7 +829,13 @@ impl PalettedContainer {
                 if full != fast {
                     let m = PACK_MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if m <= 8 {
-                        eprintln!("pack test: mismatch (bits {} / {}, palette {} / {})", fast.bits, full.bits, fast.palette.len(), full.palette.len());
+                        eprintln!(
+                            "pack test: mismatch (bits {} / {}, palette {} / {})",
+                            fast.bits,
+                            full.bits,
+                            fast.palette.len(),
+                            full.palette.len()
+                        );
                     }
                     return full;
                 }
@@ -1012,9 +1024,15 @@ mod tests {
         for strategy in [Strategy::blocks(15), Strategy::biomes(6)] {
             let entries = strategy.entries();
             for distinct in [2u64, 3, 5, 16, 17, 40, 200, 300] {
-                let values: Vec<u32> = (0..entries).map(|_| next(distinct) as u32 * 7 + 1).collect();
+                let values: Vec<u32> = (0..entries)
+                    .map(|_| next(distinct) as u32 * 7 + 1)
+                    .collect();
                 let container = PalettedContainer::from_values(strategy, &values);
-                assert_eq!(container.pack(), container.pack_full(entries), "{distinct} values");
+                assert_eq!(
+                    container.pack(),
+                    container.pack_full(entries),
+                    "{distinct} values"
+                );
                 let mut written = container.clone();
                 written.set(0, 12345);
                 assert!(!written.packed);
@@ -1025,7 +1043,11 @@ mod tests {
                     let src = pack_words(8, entries, ids.iter().copied());
                     let map: Vec<u32> = (0..256).collect();
                     let mapped = PalettedContainer::from_mapped(strategy, palette, 8, &src, &map);
-                    assert_eq!(mapped.pack(), mapped.pack_full(entries), "mapped {distinct}");
+                    assert_eq!(
+                        mapped.pack(),
+                        mapped.pack_full(entries),
+                        "mapped {distinct}"
+                    );
                 }
             }
         }
