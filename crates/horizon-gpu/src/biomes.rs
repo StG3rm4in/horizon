@@ -5,7 +5,7 @@
 //! starting point, then `kbi_order` applies, chunk by chunk and in fill order, the previous search
 //! result (`ClimateSearch::last`). The CPU builds each `BiomeChunk` from the region.
 use super::{Context, codegen, context, load_module, priority_stream};
-use cudarc::driver::{
+use crate::cuda::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
     PushKernelArg,
 };

@@ -17,7 +17,20 @@
 //! Settings: `HORIZON_GPU_SYNC` (waiting: block by default, spin, yield, auto),
 //! `HORIZON_GPU_PRIORITY=0` (no priority for the critical path streams), `HORIZON_GPU_REGION` (side
 //! of a region in chunks, 8), `HORIZON_GPU_REGIONS_MAX` (regions kept in GPU memory, 128),
-//! `HORIZON_GPU_CACHE` (directory of the compiled PTX).
+//! `HORIZON_GPU_CACHE` (directory of the compiled PTX), `HORIZON_GPU_DEVICE` (the CUDA device, 0),
+//! `HORIZON_GPU_MEMORY_MB` (GPU memory of final_density's region cache; half of the memory free at
+//! startup by default, a region of the overworld takes about 33 MB). The surface
+//! (`HORIZON_GPU_SURFACE_REGIONS`, 48 regions) and the light (`HORIZON_GPU_LIGHT_CACHE`, slots of
+//! sections) have caches of their own. Out of GPU memory, the region cache halves (down to 8
+//! regions) and the chunk goes to the CPU; any other CUDA error, or no memory even for 8 regions,
+//! turns the stage off for the session.
+//!
+//! Build: the `cuda` feature (on by default in horizon-world, horizon-client-render and the game)
+//! compiles the CUDA backend. It needs no CUDA toolkit: the bindings are those of CUDA 13.4, and the
+//! driver and NVRTC libraries (CUDA 11 to 13) are loaded at run time. Without the feature (the
+//! server build with `--no-default-features`, unless it adds `--features cuda`), `cuda_off.rs`
+//! stands in for cudarc and every stage reports CUDA as absent.
+//!
 //! At startup, a self-test compares the final_density of three chunks with the CPU; at the
 //! slightest difference or CUDA error, final_density and the aquifers stay on the CPU. The
 //! self-test covers final_density only: the other stages are checked by their `test` values and
@@ -27,6 +40,14 @@ mod caves;
 mod codegen;
 mod light;
 
+// The CUDA API: cudarc with the `cuda` feature, else a stand-in that reports CUDA as absent.
+#[cfg(feature = "cuda")]
+use cudarc as cuda;
+#[cfg(not(feature = "cuda"))]
+mod cuda_off;
+#[cfg(not(feature = "cuda"))]
+use cuda_off as cuda;
+
 pub use biomes::{BiomeGpu, BiomeTree};
 pub use light::{LightGpu, LightInput, LightJob, LightSection};
 
@@ -34,11 +55,11 @@ pub use caves::{
     CAVE_CANYON, CAVE_MASK_WORDS, CAVE_ROOM, CAVE_TUNNEL, CaveGpu, CaveItem, CaveJob, CaveTarget,
 };
 
-use cudarc::driver::{
+use crate::cuda::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
     PushKernelArg,
 };
-use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
+use crate::cuda::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 use horizon_core::density::graph::{DensityCompiler, FunctionId};
 use horizon_core::density::{Beardifier, DensitySampler, SamplerContext, TerrainAdjustment};
 use horizon_core::noise::DensityVolume;
@@ -68,17 +89,34 @@ fn env_or(name: &str, fallback: i32) -> i32 {
 fn context() -> Result<Arc<CudaContext>, String> {
     static CTX: OnceLock<Result<Arc<CudaContext>, String>> = OnceLock::new();
     CTX.get_or_init(|| {
+        if !cfg!(feature = "cuda") {
+            return Err("built without CUDA (the cuda feature of horizon-gpu)".into());
+        }
         // SAFETY: only tries to open the library; cudarc would panic on a missing one
-        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+        if !unsafe { crate::cuda::driver::sys::is_culib_present() } {
             return Err("CUDA driver library not found".into());
         }
-        let ctx = CudaContext::new(0).ctx("CUDA context")?;
+        // HORIZON_GPU_DEVICE: the CUDA device, 0 by default
+        let device = match std::env::var("HORIZON_GPU_DEVICE") {
+            Ok(v) => v
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("HORIZON_GPU_DEVICE={v}: not a device number"))?,
+            Err(_) => 0,
+        };
+        let ctx = CudaContext::new(device)
+            .map_err(|e| format!("CUDA device {device} (HORIZON_GPU_DEVICE): {e:?}"))?;
+        log::info!(
+            "GPU: CUDA device {device}, {} ({} MB)",
+            ctx.name().unwrap_or_else(|_| "?".into()),
+            ctx.total_mem().map_or(0, |b| b >> 20)
+        );
         // Waiting for a computation to finish: HORIZON_GPU_SYNC = block (default: the thread
         // sleeps), spin, yield or auto (CUDA heuristic, often spin: the core spins idle while
         // waiting).
         // With light on the GPU, the CPU is no longer the bottleneck of /pregen: sleeping gives
         // back 4 to 6 % of the CPU per chunk without changing the throughput (GPU_WAIT.md).
-        use cudarc::driver::sys::CUctx_flags::*;
+        use crate::cuda::driver::sys::CUctx_flags::*;
         let wait = match std::env::var("HORIZON_GPU_SYNC").as_deref() {
             Ok("spin") => Some(CU_CTX_SCHED_SPIN),
             Ok("yield") => Some(CU_CTX_SCHED_YIELD),
@@ -113,7 +151,7 @@ fn priority_stream(ctx: &Arc<CudaContext>) -> Result<Arc<CudaStream>, String> {
         {
             return 0;
         }
-        cudarc::driver::result::stream::get_priority_range().map_or(0, |(_, high)| high)
+        crate::cuda::driver::result::stream::get_priority_range().map_or(0, |(_, high)| high)
     });
     ctx.new_stream_with_priority(p).ctx("CUDA stream")
 }
@@ -425,7 +463,7 @@ struct Cells {
 
 #[derive(Default)]
 struct Region {
-    data: OnceLock<Option<RegionData>>,
+    data: OnceLock<Result<RegionData, String>>,
     served: AtomicU32,
 }
 
@@ -458,11 +496,13 @@ struct Stats {
     mismatches: AtomicU64,
     /// Chunks with structures (beardifier) done on the GPU
     chunks_beard: AtomicU64,
+    /// Times the region cache halved for lack of GPU memory
+    shrinks: AtomicU64,
 }
 
 /// The aquifer kernels and their constants.
 struct Aquifers {
-    _module: Arc<cudarc::driver::CudaModule>,
+    _module: Arc<crate::cuda::driver::CudaModule>,
     surface: CudaFunction,
     cells: CudaFunction,
     skip: CudaFunction,
@@ -546,7 +586,7 @@ fn ptx_cache_dir() -> Option<PathBuf> {
 fn nvrtc_version() -> Option<(i32, i32)> {
     static VERSION: OnceLock<Option<(i32, i32)>> = OnceLock::new();
     *VERSION.get_or_init(|| {
-        use cudarc::nvrtc::sys;
+        use crate::cuda::nvrtc::sys;
         // SAFETY: the library is checked before its symbol is loaded; the out-pointers are live
         unsafe {
             if !sys::is_culib_present() {
@@ -624,6 +664,23 @@ impl Engine {
         height: i32,
     ) -> Result<Self, String> {
         let ctx = context()?;
+        // The region cache within a budget: HORIZON_GPU_MEMORY_MB, else half of the GPU memory free
+        // now (the other stages and dimensions take theirs from what is left). A region holds its
+        // densities and its block codes: about 33 MB for 8 x 8 chunks of the overworld.
+        let region_bytes = prog.size * 4 + (r * r) as usize * 256 * height as usize;
+        let budget = match std::env::var("HORIZON_GPU_MEMORY_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+        {
+            Some(mb) => mb << 20,
+            None => ctx.mem_get_info().map_or(usize::MAX, |(free, _)| free / 2),
+        };
+        let capacity = capacity.min((budget / region_bytes.max(1)).max(1));
+        log::info!(
+            "GPU final_density: up to {capacity} regions of {:.0} MB in GPU memory (budget {} MB)",
+            region_bytes as f64 / 1e6,
+            budget.min(usize::MAX >> 1) >> 20
+        );
         let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
         let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
         let module = load_module(&ctx, &prog.src, arch).ctx("module load")?;
@@ -739,9 +796,7 @@ impl Engine {
                 true
             }
             Err(e) => {
-                if !self.broken.swap(true, Relaxed) {
-                    log::error!("GPU final_density disabled, back to the CPU: {e}");
-                }
+                self.failed(&e, (cx.div_euclid(self.r), cz.div_euclid(self.r)));
                 false
             }
         }
@@ -755,15 +810,56 @@ impl Engine {
         let s = &self.stats;
         let (n, reg) = (s.chunks.load(Relaxed), s.regions.load(Relaxed));
         format!(
-            "GPU final_density: {n} chunks, {} of them with aquifers (copy {:.0} us on average), {reg} regions computed ({:.2} ms on average), {} evictions, {} chunks on the CPU (structures, blending), {} aquifer mismatches, {} chunks with structures on the GPU",
+            "GPU final_density: {n} chunks, {} of them with aquifers (copy {:.0} us on average), {reg} regions computed ({:.2} ms on average), {} evictions, {} chunks on the CPU (structures, blending), {} aquifer mismatches, {} chunks with structures on the GPU, {} cache shrinks (out of GPU memory)",
             s.chunks_aq.load(Relaxed),
             s.ns_copy.load(Relaxed) as f64 / 1e3 / n.max(1) as f64,
             s.ns_regions.load(Relaxed) as f64 / 1e6 / reg.max(1) as f64,
             s.evictions.load(Relaxed),
             s.fallbacks.load(Relaxed),
             s.mismatches.load(Relaxed),
-            s.chunks_beard.load(Relaxed)
+            s.chunks_beard.load(Relaxed),
+            s.shrinks.load(Relaxed)
         )
+    }
+
+    /// A chunk's GPU work failed. Out of GPU memory, the region cache halves (down to
+    /// `MIN_REGIONS`) and drops the region, whose next chunks compute it again with more room; only
+    /// this chunk goes to the CPU. Any other error, or a cache already at its floor, turns
+    /// final_density off for the session: with fewer regions the workers would compute the same
+    /// regions over and over, slower than the CPU.
+    fn failed(&self, e: &str, key: (i32, i32)) {
+        const MIN_REGIONS: usize = 8;
+        if e.contains("OUT_OF_MEMORY") {
+            let mut c = self.cache.lock().unwrap();
+            c.lookup.remove(&key);
+            if c.capacity > MIN_REGIONS {
+                let old = c.capacity;
+                c.capacity = (old / 2).max(MIN_REGIONS);
+                while c.lookup.len() > c.capacity {
+                    let Some(oldest) = c
+                        .lookup
+                        .iter()
+                        .min_by_key(|(_, (_, t))| *t)
+                        .map(|(k, _)| *k)
+                    else {
+                        break;
+                    };
+                    // Released when the last worker that reads it is done
+                    c.lookup.remove(&oldest);
+                    self.stats.evictions.fetch_add(1, Relaxed);
+                }
+                let new = c.capacity;
+                drop(c);
+                self.stats.shrinks.fetch_add(1, Relaxed);
+                log::warn!(
+                    "GPU final_density: out of GPU memory, region cache {old} -> {new} regions; this chunk goes to the CPU"
+                );
+                return;
+            }
+        }
+        if !self.broken.swap(true, Relaxed) {
+            log::error!("GPU final_density disabled, back to the CPU: {e}");
+        }
     }
 
     fn inner_chunk(&self, cx: i32, cz: i32, out: &mut [f32]) -> Result<(), String> {
@@ -832,11 +928,9 @@ impl Engine {
             self.stats
                 .ns_regions
                 .fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
-            m.map_err(|e| log::error!("GPU final_density: region {rx} {rz}: {e}"))
-                .ok()
+            m.map_err(|e| format!("region {rx} {rz}: {e}"))
         });
-        d.as_ref()
-            .ok_or_else(|| "region computation failed".to_string())
+        d.as_ref().map_err(|e| e.clone())
     }
 
     /// Block codes of a chunk and its skip_sampling_above_y.
@@ -885,9 +979,7 @@ impl Engine {
                 Some(skip)
             }
             Err(e) => {
-                if !self.broken.swap(true, Relaxed) {
-                    log::error!("GPU final_density disabled, back to the CPU: {e}");
-                }
+                self.failed(&e, (rx, rz));
                 None
             }
         }
@@ -1048,9 +1140,7 @@ impl Engine {
                 Some(skip)
             }
             Err(e) => {
-                if !self.broken.swap(true, Relaxed) {
-                    log::error!("GPU final_density disabled, back to the CPU: {e}");
-                }
+                self.failed(&e, (rx, rz));
                 None
             }
         }
@@ -1107,7 +1197,7 @@ impl Engine {
 
     /// Enqueues on a cave batch's stream the substance of its cells, with the region's aquifer.
     fn caves_substance(&self, region: &Arc<Region>, lx: i32, lz: i32, job: &mut CaveJob) {
-        let (Some(aq), Some(Some(d))) = (&self.aq, region.data.get()) else {
+        let (Some(aq), Some(Ok(d))) = (&self.aq, region.data.get()) else {
             return;
         };
         let Some(cell_grid) = &d.cells else {
@@ -1915,17 +2005,17 @@ struct SurfaceResources {
     cold: CudaSlice<f64>,
     end: CudaSlice<u32>,
     err: CudaSlice<i32>,
-    host: cudarc::driver::PinnedHostSlice<u32>,
-    host_err: cudarc::driver::PinnedHostSlice<i32>,
+    host: crate::cuda::driver::PinnedHostSlice<u32>,
+    host_err: crate::cuda::driver::PinnedHostSlice<i32>,
     /// Compact sections, heightmaps, marks and error (`enable_sections`)
     sec: CudaSlice<u32>,
-    host_sec: cudarc::driver::PinnedHostSlice<u32>,
+    host_sec: crate::cuda::driver::PinnedHostSlice<u32>,
     /// Marks of each column (ksec_heights for ksec_marks)
     nm: CudaSlice<u32>,
 }
 /// Building the compact sections of the fill (`SurfaceGpu::enable_sections`).
 struct SectionsGpu {
-    _module: Arc<cudarc::driver::CudaModule>,
+    _module: Arc<crate::cuda::driver::CudaModule>,
     k_sections: CudaFunction,
     k_heights: CudaFunction,
     k_marks: CudaFunction,
@@ -1953,7 +2043,7 @@ struct SurfaceStats {
 /// A world's surface on the GPU: final states of a chunk after filling and surface.
 pub struct SurfaceGpu {
     ctx: Arc<CudaContext>,
-    _module: Arc<cudarc::driver::CudaModule>,
+    _module: Arc<crate::cuda::driver::CudaModule>,
     k_heads: CudaFunction,
     k_descent: CudaFunction,
     k_blocks: CudaFunction,
@@ -2475,7 +2565,7 @@ struct OreStats {
 /// A chunk's batch is sent at the start of its decoration and read at the ore step.
 pub struct OreGpu {
     ctx: Arc<CudaContext>,
-    _module: Arc<cudarc::driver::CudaModule>,
+    _module: Arc<crate::cuda::driver::CudaModule>,
     k_blobs: CudaFunction,
     pool: Mutex<Vec<OreResources>>,
     stats: OreStats,

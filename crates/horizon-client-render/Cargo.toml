@@ -36,7 +36,7 @@ horizon-shader-api = { path = "../horizon-shader-api" }
 horizon-shaders = { path = "../horizon-shaders" }
 horizon-system = { path = "../horizon-system" }
 horizon-threads = { path = "../horizon-threads" }
-horizon-world = { path = "../horizon-world" }
+horizon-world = { path = "../horizon-world", default-features = false }
 horizon-gpu = { path = "../horizon-gpu" }
 ab_glyph = "0.2.32"
 base64 = "0.22"
@@ -78,6 +78,9 @@ wgpu = { version = "30.0.1", default-features = false, features = ["dx12"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["gles"] }
 
 [features]
+# CUDA for the light on the GPU (horizon-gpu); on by default, forwarded by the game.
+default = ["cuda"]
+cuda = ["horizon-gpu/cuda", "horizon-world/cuda"]
 # Sound output: horizon-client's `audio` feature.
 audio = ["dep:cpal"]
 # Helpers horizon-client's tests build their fixtures with.

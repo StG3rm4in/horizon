@@ -24,7 +24,10 @@ path = "src/main.rs"
 test = false
 
 [features]
-default = ["audio", "controllers", "horizon-extras"]
+default = ["audio", "controllers", "horizon-extras", "cuda"]
+# CUDA for the GPU stages (horizon-gpu). The server build (`--no-default-features`) adds it with
+# `--features cuda`.
+cuda = ["horizon-client/cuda"]
 audio = ["horizon-client/audio"]
 controllers = ["horizon-client/controllers"]
 horizon-extras = ["horizon-client/horizon-extras"]

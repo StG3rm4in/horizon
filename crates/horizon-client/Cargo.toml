@@ -27,7 +27,7 @@ horizon-client-lib = { path = "../horizon-client-lib", default-features = false 
 horizon-assets = { path = "../horizon-assets" }
 horizon-client-core = { path = "../horizon-client-core" }
 horizon-client-input = { path = "../horizon-client-input" }
-horizon-client-render = { path = "../horizon-client-render" }
+horizon-client-render = { path = "../horizon-client-render", default-features = false }
 horizon-command = { path = "../horizon-command" }
 horizon-items = { path = "../horizon-items" }
 horizon-core = { path = "../horizon-core" }
@@ -37,7 +37,7 @@ horizon-optifine = { path = "../horizon-optifine" }
 horizon-threads = { path = "../horizon-threads" }
 horizon-perf-format = { path = "../horizon-perf-format" }
 horizon-hdr = { path = "../horizon-hdr" }
-horizon-world = { path = "../horizon-world" }
+horizon-world = { path = "../horizon-world", default-features = false }
 horizon-protocol = { path = "../horizon-protocol" }
 # server.properties, eula.txt and the user lists, shared with horizon-server.
 horizon-server-files = { path = "../horizon-server-files" }
@@ -129,7 +129,10 @@ wgpu = { version = "30.0.1", default-features = false, features = ["gles"] }
 # Source retention only: not compiled/tested on the fork; incompatible with typed residency.
 # Do not enable (including via --all-features); integration is tracked in arismoko/horizon#3491.
 upstream-parallel-mobs = []
-default = ["audio", "controllers", "horizon-extras"]
+default = ["audio", "controllers", "horizon-extras", "cuda"]
+# CUDA for the GPU stages of world generation and light (horizon-gpu); a build without it never
+# needs CUDA, and every stage runs on the CPU.
+cuda = ["horizon-client-lib/cuda", "horizon-world/cuda", "horizon-client-render/cuda"]
 # Scoped trait-mod installation for a mod's own tests.
 testing = []
 # Sound output. Without it (and `controllers`) the program links neither libasound nor libudev on

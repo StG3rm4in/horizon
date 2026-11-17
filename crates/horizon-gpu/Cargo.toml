@@ -8,8 +8,14 @@ description = "Chunk generation stages on the GPU (CUDA), bit-identical to the C
 
 [dependencies]
 horizon-core = { path = "../horizon-core" }
-cudarc = { version = "0.19", features = ["cuda-version-from-build-system"] }
+# A fixed CUDA version for the bindings: no CUDA toolkit is needed to build, the driver and NVRTC
+# libraries are loaded at run time (cudarc also looks for CUDA 12 and 11 libraries).
+cudarc = { version = "0.19", features = ["cuda-13040"], optional = true }
 log = "0.4"
+
+[features]
+# The CUDA backend. Without it, every GPU stage reports CUDA as absent and the CPU does everything.
+cuda = ["dep:cudarc"]
 
 [lints]
 workspace = true

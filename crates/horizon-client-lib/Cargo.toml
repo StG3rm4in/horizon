@@ -25,7 +25,7 @@ mod_api = { package = "horizon-mod-vocab", path = "../horizon-mod-vocab" }
 horizon-assets = { path = "../horizon-assets" }
 horizon-client-core = { path = "../horizon-client-core" }
 horizon-client-input = { path = "../horizon-client-input" }
-horizon-client-render = { path = "../horizon-client-render" }
+horizon-client-render = { path = "../horizon-client-render", default-features = false }
 horizon-command = { path = "../horizon-command" }
 horizon-items = { path = "../horizon-items" }
 horizon-core = { path = "../horizon-core" }
@@ -40,7 +40,7 @@ horizon-perf-format = { path = "../horizon-perf-format" }
 # once, not for every phase of every tick.
 rayon = "1.10"
 horizon-hdr = { path = "../horizon-hdr" }
-horizon-world = { path = "../horizon-world" }
+horizon-world = { path = "../horizon-world", default-features = false }
 horizon-protocol = { path = "../horizon-protocol" }
 # server.properties, eula.txt and the user lists, shared with horizon-server.
 horizon-server-files = { path = "../horizon-server-files" }
@@ -128,7 +128,9 @@ test-payload-probe = []
 test-publication-scope = []
 # Non-consuming residency journal observation for game fixtures only.
 test-residency-observer = []
-default = ["audio", "controllers"]
+default = ["audio", "controllers", "cuda"]
+# CUDA for the GPU stages of world generation and light (horizon-gpu).
+cuda = ["horizon-world/cuda", "horizon-client-render/cuda"]
 # Dev-only: the ignored tracker-send benchmark uses the executable's allocator.
 tracker-send-bench = []
 # Sound output. Without it (and `controllers`) the program links neither libasound nor libudev on

@@ -11,7 +11,7 @@ horizon-client-core = { path = "../horizon-client-core" }
 horizon-core = { path = "../horizon-core" }
 horizon-items = { path = "../horizon-items" }
 horizon-protocol = { path = "../horizon-protocol" }
-horizon-world = { path = "../horizon-world" }
+horizon-world = { path = "../horizon-world", default-features = false }
 
 [lints]
 workspace = true

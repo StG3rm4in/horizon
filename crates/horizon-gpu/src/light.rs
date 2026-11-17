@@ -9,7 +9,7 @@
 //! stays on the GPU, and the next batches (its 8 neighbours) read it there instead of copying it
 //! again.
 use super::{Context, context, load_module};
-use cudarc::driver::{
+use crate::cuda::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
     PushKernelArg,
 };
@@ -197,7 +197,7 @@ struct CacheSections {
 
 pub struct LightGpu {
     ctx: Arc<CudaContext>,
-    _module: Arc<cudarc::driver::CudaModule>,
+    _module: Arc<crate::cuda::driver::CudaModule>,
     k_states: CudaFunction,
     k_sky: CudaFunction,
     k_fill: CudaFunction,
@@ -395,7 +395,7 @@ impl LightGpu {
             return Err("all batches are in flight".into());
         }
         let st = self.ctx.new_stream().ctx("CUDA stream")?;
-        use cudarc::driver::sys::CUevent_flags::*;
+        use crate::cuda::driver::sys::CUevent_flags::*;
         let end = self
             .ctx
             .new_event(Some(CU_EVENT_BLOCKING_SYNC))

@@ -7,7 +7,7 @@
 //! (`kcv_substance`, in the aquifer module). Everything runs on the batch's stream, off the
 //! worker's critical path; the CPU reads the result when it carves.
 use super::{Context, context, load_module};
-use cudarc::driver::{
+use crate::cuda::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
 use std::any::Any;
@@ -102,7 +102,7 @@ struct CaveStats {
 
 pub struct CaveGpu {
     ctx: Arc<CudaContext>,
-    _module: Arc<cudarc::driver::CudaModule>,
+    _module: Arc<crate::cuda::driver::CudaModule>,
     k_trace: CudaFunction,
     sines: CudaSlice<f32>,
     pool: Mutex<Vec<CaveResources>>,
