@@ -4,7 +4,7 @@
 //! climate column by column, `kbi_search` searches each quart in the climate tree without a
 //! starting point, then `kbi_order` applies, chunk by chunk and in fill order, the previous search
 //! result (`ClimateSearch::last`). The CPU builds each `BiomeChunk` from the region.
-use super::{Context, codegen, context, priority_stream, ptx};
+use super::{Context, codegen, context, load_module, priority_stream};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
     PushKernelArg,
@@ -144,7 +144,7 @@ impl BiomeGpu {
         let ctx = context()?;
         let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
         let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-        let module = ctx.load_module(ptx(&src, arch)?).ctx("biome module")?;
+        let module = load_module(&ctx, &src, arch).ctx("biome module")?;
         let k_climate = module.load_function("kbi_climate").ctx("kbi_climate")?;
         let k_search = module.load_function("kbi_search").ctx("kbi_search")?;
         let k_order = module.load_function("kbi_order").ctx("kbi_order")?;

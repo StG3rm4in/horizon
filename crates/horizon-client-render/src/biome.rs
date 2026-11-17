@@ -531,9 +531,11 @@ impl Biomes {
     }
     /// The name a chunk saves for biome `id`: a placeholder's saved name, else `name`'s.
     pub fn saved_name(&self, id: u16) -> Cow<'_, str> {
-        let slot = usize::from(id).checked_sub(self.list.len());
+        let Some(slot) = usize::from(id).checked_sub(self.list.len()) else {
+            return Cow::Borrowed(self.name(id));
+        };
         let placeholders = self.placeholders.lock().unwrap_or_else(|e| e.into_inner());
-        match slot.and_then(|s| placeholders.get(s)) {
+        match placeholders.get(slot) {
             Some(name) => Cow::Owned(name.clone()),
             None => Cow::Borrowed(self.name(id)),
         }

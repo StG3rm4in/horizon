@@ -542,8 +542,12 @@ where
         );
         // The aquifers too, when their positional factory is a Xoroshiro one.
         // Without aquifers (the Nether, the End), the GPU codes take the global fluid picker.
+        // The GPU's aquifer takes the default fluid for water, as its pressure and lava tests
+        // do: another default fluid (a datapack's) keeps the aquifer on the CPU.
+        let fluid_is_water =
+            registry.default_state("minecraft:water") == Some(settings.default_fluid);
         let gpu_aquifer = match gpu_inputs.aquifer_roots {
-            Some(_) if settings.legacy => None,
+            Some(_) if settings.legacy || !fluid_is_water => None,
             Some(roots) => {
                 let mut random = root.from_hash_of("minecraft:aquifer");
                 let lo = random.next_long() as u64;
@@ -2062,21 +2066,22 @@ where
                 })
                 .map_err(stage("carvers"))
             };
-            let mask = match gpu_mask {
+            // Whether the mask is the GPU's: its substance codes follow that mask's cells
+            let (mask, gpu_traced) = match gpu_mask {
                 Some(gpu) if self.caves_test => {
                     let cpu = cpu_mask(worker)?;
                     if gpu.words() == cpu.words() {
-                        gpu
+                        (gpu, true)
                     } else {
                         if let (Some(cg), Some(job)) = (&self.caves_gpu, caves_job.take()) {
                             cg.note_mismatch(true);
                             cg.finish(job);
                         }
-                        cpu
+                        (cpu, false)
                     }
                 }
-                Some(gpu) => gpu,
-                None => cpu_mask(worker)?,
+                Some(gpu) => (gpu, true),
+                None => (cpu_mask(worker)?, false),
             };
             worker.timings.carvers += lap(&mut clock);
             if !mask.is_empty() {
@@ -2101,8 +2106,9 @@ where
                 let filter = |[x, y, z]: [i32; 3]| blender.carving_filter(x, y, z).unwrap_or(true);
                 let words = mask.words();
                 let cells: usize = words.iter().map(|w| w.count_ones() as usize).sum();
+                // A CPU mask (the GPU's was rejected) has other cells than the GPU's codes
                 let mut codes = match (&self.caves_gpu, caves_job.as_ref()) {
-                    (Some(cg), Some(job)) => cg.codes(job, cells),
+                    (Some(cg), Some(job)) if gpu_traced => cg.codes(job, cells),
                     _ => None,
                 };
                 // The cells' ranks in the mask's bit order, as the GPU stored their codes

@@ -8,7 +8,7 @@
 //! Section cache (`HORIZON_GPU_LIGHT_CACHE`, see LIGHT.md): a section a batch has already sent
 //! stays on the GPU, and the next batches (its 8 neighbours) read it there instead of copying it
 //! again.
-use super::{Context, context, ptx};
+use super::{Context, context, load_module};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
     PushKernelArg,
@@ -304,9 +304,7 @@ impl LightGpu {
         let ctx = context()?;
         let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
         let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-        let module = ctx
-            .load_module(ptx(include_str!("light.cu"), arch)?)
-            .ctx("light module")?;
+        let module = load_module(&ctx, include_str!("light.cu"), arch).ctx("light module")?;
         let f = |n: &str| module.load_function(n).ctx(n);
         let st = ctx.new_stream().ctx("CUDA stream")?;
         let info_d = st.clone_htod(info).ctx("light infos")?;

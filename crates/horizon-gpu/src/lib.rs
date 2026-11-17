@@ -1,19 +1,27 @@
-//! final_density on the GPU (CUDA), bit-identical to Horizon's CPU sampler.
+//! World generation on the GPU (CUDA), bit-identical to Horizon's CPU code: final_density and the
+//! aquifers (this module), the surface rules, ore veins, carvers (`caves`), light (`light`), the
+//! sections' palettes and the multi-noise biomes (`biomes`).
 //!
-//! The GPU computes a region of R x R chunks at once (8 x 8 by default) and keeps it in GPU memory;
-//! each chunk a worker then asks for is copied (393 KB for 16 x 384 x 16) into the `fill_noise`
-//! buffer, which does the rest on the CPU as before (aquifers, blocks, heightmaps).
+//! The GPU computes the final_density of a region of R x R chunks at once (8 x 8 by default) and
+//! keeps it in GPU memory; each chunk a worker then asks for is copied (393 KB for 16 x 384 x 16)
+//! into the `fill_noise` buffer, or, with the aquifers on the GPU, comes back as block codes.
 //!
 //! Enabled by the `HORIZON_GPU_DENSITY` environment variable:
 //! - `1`: compilation in the background, the CPU serves the chunks meanwhile;
 //! - `wait`: compilation before the first chunk (parity tests).
 //!
+//! The other stages have their own variables (`HORIZON_GPU_SURFACE`, `HORIZON_GPU_ORES`,
+//! `HORIZON_GPU_CAVES`, `HORIZON_GPU_LIGHT`, `HORIZON_GPU_SECTIONS`, `HORIZON_GPU_BIOMES`), whose
+//! `test` value (`HORIZON_GPU_SURFACE_TEST` for the surface) compares every chunk with the CPU.
+//!
 //! Settings: `HORIZON_GPU_SYNC` (waiting: block by default, spin, yield, auto),
 //! `HORIZON_GPU_PRIORITY=0` (no priority for the critical path streams), `HORIZON_GPU_REGION` (side
 //! of a region in chunks, 8), `HORIZON_GPU_REGIONS_MAX` (regions kept in GPU memory, 128),
 //! `HORIZON_GPU_CACHE` (directory of the compiled PTX).
-//! At startup, a self-test compares three chunks with the CPU; at the slightest difference or CUDA
-//! error, the GPU is disabled and everything falls back to the CPU.
+//! At startup, a self-test compares the final_density of three chunks with the CPU; at the
+//! slightest difference or CUDA error, final_density and the aquifers stay on the CPU. The
+//! self-test covers final_density only: the other stages are checked by their `test` values and
+//! the parity harness, not at startup.
 mod biomes;
 mod caves;
 mod codegen;
@@ -27,7 +35,8 @@ pub use caves::{
 };
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
+    PushKernelArg,
 };
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 use horizon_core::density::graph::{DensityCompiler, FunctionId};
@@ -59,6 +68,10 @@ fn env_or(name: &str, fallback: i32) -> i32 {
 fn context() -> Result<Arc<CudaContext>, String> {
     static CTX: OnceLock<Result<Arc<CudaContext>, String>> = OnceLock::new();
     CTX.get_or_init(|| {
+        // SAFETY: only tries to open the library; cudarc would panic on a missing one
+        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+            return Err("CUDA driver library not found".into());
+        }
         let ctx = CudaContext::new(0).ctx("CUDA context")?;
         // Waiting for a computation to finish: HORIZON_GPU_SYNC = block (default: the thread
         // sleeps), spin, yield or auto (CUDA heuristic, often spin: the core spins idle while
@@ -179,6 +192,11 @@ impl GpuFinalDensity {
             t.elapsed().as_secs_f64() * 1e3,
             prog.size as f64 * 4e-6
         );
+        if !prog.beard_last {
+            log::info!(
+                "GPU final_density ({name}): the beardifier is not added last, chunks with structures stay on the CPU"
+            );
+        }
         if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP") {
             let _ = std::fs::write(f, &prog.src);
         }
@@ -477,6 +495,8 @@ struct Engine {
     r: i32,
     min_y: i32,
     n_chunk: usize,
+    /// final_density adds the beardifier last (`codegen::beard_added_last`)
+    beard_last: bool,
     cache: Mutex<Cache>,
     pool: Mutex<Vec<Resources>>,
     stats: Stats,
@@ -498,40 +518,100 @@ fn footprint(octets: &[u8]) -> u64 {
     })
 }
 
-/// The program's PTX, from the disk cache if possible (NVRTC takes about 12 s).
-fn ptx(src: &str, arch: &'static str) -> Result<Ptx, String> {
-    let dir = std::env::var_os("HORIZON_GPU_CACHE")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_CACHE_HOME").map(|d| PathBuf::from(d).join("horizon-gpu"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME").map(|d| PathBuf::from(d).join(".cache").join("horizon-gpu"))
-        });
-    let key = footprint(format!("{arch}\n{src}").as_bytes());
-    let file = dir
-        .as_ref()
-        .map(|d| d.join(format!("final_density-{key:016x}.ptx")));
+/// NVRTC's options: no fused multiply-add, no flush to zero, IEEE division and square root.
+const NVRTC_OPTIONS: [&str; 4] = [
+    "--fmad=false",
+    "--ftz=false",
+    "--prec-div=true",
+    "--prec-sqrt=true",
+];
+
+/// The directory of the compiled PTX: `HORIZON_GPU_CACHE`, else `horizon-gpu` in the user's cache
+/// directory (`XDG_CACHE_HOME` or `~/.cache`; `%LOCALAPPDATA%` on Windows).
+fn ptx_cache_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("HORIZON_GPU_CACHE") {
+        return Some(PathBuf::from(d));
+    }
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|d| PathBuf::from(d).join(".cache")))
+    };
+    base.map(|d| d.join("horizon-gpu"))
+}
+
+/// NVRTC's version, part of the PTX cache key; None without its library (cudarc would panic).
+fn nvrtc_version() -> Option<(i32, i32)> {
+    static VERSION: OnceLock<Option<(i32, i32)>> = OnceLock::new();
+    *VERSION.get_or_init(|| {
+        use cudarc::nvrtc::sys;
+        // SAFETY: the library is checked before its symbol is loaded; the out-pointers are live
+        unsafe {
+            if !sys::is_culib_present() {
+                return None;
+            }
+            let (mut major, mut minor) = (0, 0);
+            (sys::nvrtcVersion(&mut major, &mut minor) == sys::nvrtcResult::NVRTC_SUCCESS)
+                .then_some((major, minor))
+        }
+    })
+}
+
+/// The module of `src`, from the PTX disk cache if possible (NVRTC takes about 12 s). The key
+/// covers the source, the architecture, NVRTC's version and its options; a cached PTX the driver
+/// refuses (damaged, or left by another toolchain) is compiled again and replaced.
+fn load_module(
+    ctx: &Arc<CudaContext>,
+    src: &str,
+    arch: &'static str,
+) -> Result<Arc<CudaModule>, String> {
+    let version = nvrtc_version();
+    let dir = ptx_cache_dir();
+    let file = match (version, &dir) {
+        (Some((major, minor)), Some(d)) => {
+            let options = NVRTC_OPTIONS.join(" ");
+            let key = footprint(format!("{arch}\n{major}.{minor}\n{options}\n{src}").as_bytes());
+            Some(d.join(format!("final_density-{key:016x}.ptx")))
+        }
+        _ => None,
+    };
     if let Some(f) = &file
         && let Ok(text) = std::fs::read_to_string(f)
     {
-        return Ok(Ptx::from_src(text));
+        match ctx.load_module(Ptx::from_src(text)) {
+            Ok(module) => return Ok(module),
+            Err(e) => log::warn!(
+                "GPU: cached PTX {} refused ({e:?}), compiling it again",
+                f.display()
+            ),
+        }
+    }
+    if version.is_none() {
+        return Err("NVRTC library not found".into());
     }
     let options = CompileOptions {
         arch: Some(arch),
-        options: vec![
-            "--fmad=false".into(),
-            "--ftz=false".into(),
-            "--prec-div=true".into(),
-            "--prec-sqrt=true".into(),
-        ],
+        options: NVRTC_OPTIONS.iter().map(|&o| o.into()).collect(),
         ..Default::default()
     };
-    let p = compile_ptx_with_opts(src, options).ctx("compilation NVRTC")?;
+    let ptx = compile_ptx_with_opts(src, options).ctx("compilation NVRTC")?;
+    let text = ptx.to_src();
+    let module = ctx.load_module(ptx).ctx("module load")?;
+    // Written whole under a unique temporary name, then renamed: no reader sees half a file
     if let (Some(d), Some(f)) = (&dir, &file) {
-        let _ = std::fs::create_dir_all(d).and_then(|()| std::fs::write(f, p.to_src()));
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let n = SEQUENCE.fetch_add(1, Relaxed);
+        let tmp = f.with_extension(format!("ptx.{}.{n}.tmp", std::process::id()));
+        let written = std::fs::create_dir_all(d)
+            .and_then(|()| std::fs::write(&tmp, &text))
+            .and_then(|()| std::fs::rename(&tmp, f));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
-    Ok(p)
+    Ok(module)
 }
 
 impl Engine {
@@ -546,7 +626,7 @@ impl Engine {
         let ctx = context()?;
         let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
         let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-        let module = ctx.load_module(ptx(&prog.src, arch)?).ctx("module load")?;
+        let module = load_module(&ctx, &prog.src, arch).ctx("module load")?;
         let f = |name: &str| module.load_function(name).ctx(name);
         let mut f_ax = Vec::new();
         for &(k, gr, nb) in &prog.axes {
@@ -564,7 +644,7 @@ impl Engine {
         }
         let aq = match aquifer {
             Some((a, src)) => {
-                let m = ctx.load_module(ptx(&src, arch)?).ctx("aquifer module")?;
+                let m = load_module(&ctx, &src, arch).ctx("aquifer module")?;
                 let g = |name: &str| m.load_function(name).ctx(name);
                 let st = ctx.new_stream().ctx("CUDA stream")?;
                 let kernel = st
@@ -599,6 +679,7 @@ impl Engine {
             r,
             min_y,
             n_chunk: 256 * height as usize,
+            beard_last: prog.beard_last,
             cache: Mutex::new(Cache {
                 lookup: HashMap::new(),
                 clock: 0,
@@ -826,7 +907,8 @@ impl Engine {
             return None;
         }
         let (pieces, junctions, kp, kj, zone) = beard.parts();
-        if !kp.is_empty()
+        if !self.beard_last
+            || !kp.is_empty()
             || !kj.is_empty()
             || self.broken.load(Relaxed)
             || out.len() != self.n_chunk
@@ -1324,7 +1406,7 @@ pub fn evaluate_points(
     let ctx = context()?;
     let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
     let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-    let module = ctx.load_module(ptx(&src, arch)?).ctx("module load")?;
+    let module = load_module(&ctx, &src, arch).ctx("module load")?;
     let st = ctx.new_stream().ctx("CUDA stream")?;
     let flat: Vec<i32> = points.iter().flatten().copied().collect();
     let p = st.clone_htod(&flat).ctx("point upload")?;
@@ -1378,7 +1460,7 @@ pub fn aquifer_blocks(
     let ctx = context()?;
     let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
     let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-    let module = ctx.load_module(ptx(&src, arch)?).ctx("module load")?;
+    let module = load_module(&ctx, &src, arch).ctx("module load")?;
     let st = ctx.new_stream().ctx("CUDA stream")?;
     let (nchx, nchz) = b.chunks;
     let nch = nchx * nchz;
@@ -1491,7 +1573,7 @@ pub fn evaluate_noises(
     let ctx = context()?;
     let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
     let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-    let module = ctx.load_module(ptx(&src, arch)?).ctx("module load")?;
+    let module = load_module(&ctx, &src, arch).ctx("module load")?;
     let st = ctx.new_stream().ctx("CUDA stream")?;
     let flat: Vec<f64> = points.iter().flatten().copied().collect();
     let p = st.clone_htod(&flat).ctx("point upload")?;
@@ -1525,7 +1607,7 @@ pub fn positional_draws(
     let ctx = context()?;
     let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
     let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-    let module = ctx.load_module(ptx(&src, arch)?).ctx("module load")?;
+    let module = load_module(&ctx, &src, arch).ctx("module load")?;
     let st = ctx.new_stream().ctx("CUDA stream")?;
     let flat: Vec<i32> = points.iter().flatten().copied().collect();
     let p = st.clone_htod(&flat).ctx("point upload")?;
@@ -1570,7 +1652,7 @@ pub fn surface_s2_check(
     let ctx = context()?;
     let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
     let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-    let module = ctx.load_module(ptx(&src, arch)?).ctx("module load")?;
+    let module = load_module(&ctx, &src, arch).ctx("module load")?;
     let st = ctx.new_stream().ctx("CUDA stream")?;
     let flat: Vec<i32> = points.iter().flatten().copied().collect();
     let p = st.clone_htod(&flat).ctx("point upload")?;
@@ -1747,7 +1829,7 @@ impl Volume {
         arch: &'static str,
         prog: codegen::Program,
     ) -> Result<Self, String> {
-        let module = ctx.load_module(ptx(&prog.src, arch)?).ctx("vein module")?;
+        let module = load_module(ctx, &prog.src, arch).ctx("vein module")?;
         let f = |name: &str| module.load_function(name).ctx(name);
         let mut f_ax = Vec::new();
         for &(k, gr, nb) in &prog.axes {
@@ -1950,9 +2032,7 @@ impl SurfaceGpu {
         let ctx = context()?;
         let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
         let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-        let module = ctx
-            .load_module(ptx(&prog.src, arch)?)
-            .ctx("surface module")?;
+        let module = load_module(&ctx, &prog.src, arch).ctx("surface module")?;
         let k_heads = module.load_function("ksf_heads").ctx("ksf_heads")?;
         let k_descent = module.load_function("ksf_descent").ctx("ksf_descent")?;
         let k_blocks = module.load_function("ksf_blocks").ctx("ksf_blocks")?;
@@ -1997,9 +2077,7 @@ impl SurfaceGpu {
                         .compute_capability()
                         .ctx("GPU compute capability")?;
                     let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-                    let module = self
-                        .ctx
-                        .load_module(ptx(include_str!("sections.cu"), arch)?)
+                    let module = load_module(&self.ctx, include_str!("sections.cu"), arch)
                         .ctx("section module")?;
                     let st = self.ctx.new_stream().ctx("CUDA stream")?;
                     let flags_d = st.clone_htod(flags).ctx("state flags")?;
@@ -2459,9 +2537,7 @@ impl OreGpu {
         let ctx = context()?;
         let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
         let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-        let module = ctx
-            .load_module(ptx(include_str!("ores.cu"), arch)?)
-            .ctx("ore module")?;
+        let module = load_module(&ctx, include_str!("ores.cu"), arch).ctx("ore module")?;
         let k_blobs = module.load_function("kore_blobs").ctx("kore_blobs")?;
         Ok(Self {
             ctx,

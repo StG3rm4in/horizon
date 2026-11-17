@@ -1462,7 +1462,7 @@ fn write_sections(
         let n = biome_packed.palette.len();
         out.list(if n == 0 { 0 } else { 8 }, n)?;
         for &b in &biome_packed.palette {
-            out.str(&biomes.get(b as u16).name)?;
+            out.str(&biomes.saved_name(b as u16))?;
         }
         out.end()?;
         let packed = section.blocks.pack();
@@ -5623,6 +5623,16 @@ mod tests {
             };
             chunk.set(i % 16, -64 + (i / 256) % 384, (i / 16) % 16, state);
         }
+        // A saved biome this table lacks (a placeholder) keeps its name, next to a known one
+        let missing_name = "missing:direct_writer_biome";
+        let missing = u32::from(biomes.saved_id(missing_name));
+        let forest = u32::from(biomes.id("minecraft:forest"));
+        for (i, section) in chunk.sections.iter_mut().enumerate() {
+            let section = std::sync::Arc::make_mut(section);
+            section
+                .biomes
+                .set(i % 64, if i % 2 == 0 { missing } else { forest });
+        }
         let limits = super::Limits::saved();
         for lit in [false, true] {
             chunk.lit = lit;
@@ -5644,6 +5654,12 @@ mod tests {
                 .expect("limits without a node cap")
                 .unwrap();
                 assert!(tree == direct, "lit {lit}, tables {}", tables.is_some());
+                assert!(
+                    direct
+                        .windows(missing_name.len())
+                        .any(|w| w == missing_name.as_bytes()),
+                    "the placeholder biome keeps its saved name"
+                );
             }
         }
     }

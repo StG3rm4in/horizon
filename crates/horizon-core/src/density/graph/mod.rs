@@ -155,6 +155,12 @@ pub enum GraphNode {
     },
 }
 impl GraphNode {
+    /// GPU (fork StG3rm4in/horizon): the functions this node reads.
+    pub fn children(&self) -> Vec<FunctionId> {
+        let mut node = self.clone();
+        let children: Vec<FunctionId> = node.children_mut().into_iter().map(|c| *c).collect();
+        children
+    }
     fn children_mut(&mut self) -> Vec<&mut FunctionId> {
         match self {
             Self::Spline(spline) => spline.coordinates_mut(),

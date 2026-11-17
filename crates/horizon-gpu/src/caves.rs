@@ -6,7 +6,7 @@
 //! as the chunk's region is on the GPU, computes the substance of each carved cell with the aquifer
 //! (`kcv_substance`, in the aquifer module). Everything runs on the batch's stream, off the
 //! worker's critical path; the CPU reads the result when it carves.
-use super::{Context, context, ptx};
+use super::{Context, context, load_module};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg,
 };
@@ -194,9 +194,7 @@ impl CaveGpu {
         let ctx = context()?;
         let (major, min) = ctx.compute_capability().ctx("GPU compute capability")?;
         let arch: &'static str = Box::leak(format!("sm_{major}{min}").into_boxed_str());
-        let module = ctx
-            .load_module(ptx(include_str!("caves.cu"), arch)?)
-            .ctx("cave module")?;
+        let module = load_module(&ctx, include_str!("caves.cu"), arch).ctx("cave module")?;
         let k_trace = module.load_function("kcv_trace").ctx("kcv_trace")?;
         let st = ctx.new_stream().ctx("CUDA stream")?;
         let sines = st.clone_htod(sine).ctx("sine table")?;
@@ -374,9 +372,14 @@ impl CaveGpu {
     }
     /// The substances of the carved cells of a waited batch, in mask bit order (GPU aquifer codes:
     /// 1 air, 2 fluid, 3 lava, 8 kept block, + 4 scheduled update), or None if the GPU aquifer was
-    /// not launched or the mask has more cells than the copied codes.
+    /// not launched, the trace reported an error, or the mask has more cells than the copied
+    /// codes. The codes follow the GPU's mask: the caller uses them only with that mask.
     pub fn codes<'a>(&self, job: &'a CaveJob, cells: usize) -> Option<&'a [i8]> {
         if !job.expected || !job.ok || job.codes == 0 {
+            return None;
+        }
+        let s = job.res.as_ref()?.h_output.as_slice().ok()?;
+        if s[job.nw + job.nc] != 0 {
             return None;
         }
         if cells > job.codes {

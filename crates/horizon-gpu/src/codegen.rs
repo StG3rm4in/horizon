@@ -12,7 +12,7 @@ use horizon_core::density::{
 use horizon_core::noise::{Noise, PerlinNoise};
 #[allow(unused_imports)]
 use horizon_core::random::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
@@ -1275,6 +1275,53 @@ pub(crate) struct Program {
     /// Axis table kernels: (index, grid, number of threads).
     pub axes: Vec<(usize, usize, usize)>,
     pub lines: usize,
+    /// Whether the root adds the beardifier last ([`beard_added_last`]): the GPU evaluates the
+    /// beardifier as 0, then adds the structures' beard to the result.
+    pub beard_last: bool,
+}
+
+/// Whether `root` is `add(x, beardifier)`, in either order and through references and caches,
+/// with no beardifier in `x`: vanilla's final_density. The GPU evaluates the beardifier as 0 and
+/// adds the structures' beard to the result, which is exact only for that shape; a datapack that
+/// puts the beardifier elsewhere keeps its chunks with structures on the CPU.
+pub(crate) fn beard_added_last(c: &DensityCompiler, root: FunctionId) -> bool {
+    let g = c.graph();
+    let peel = |mut id: FunctionId| loop {
+        match g.node(id) {
+            Some(GraphNode::Reference { input, .. } | GraphNode::Cache(input)) => id = *input,
+            _ => return id,
+        }
+    };
+    let is_beard = |id| {
+        matches!(
+            g.node(peel(id)),
+            Some(GraphNode::WorldField(WorldField::Beardifier))
+        )
+    };
+    // A bound sampler (no definition) may read anything: counted as a beardifier
+    let reads_beard = |id: FunctionId| {
+        let (mut todo, mut seen) = (vec![id], HashSet::new());
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match g.node(id) {
+                None | Some(GraphNode::WorldField(WorldField::Beardifier)) => return true,
+                Some(node) => todo.extend(node.children()),
+            }
+        }
+        false
+    };
+    match g.node(peel(root)) {
+        Some(GraphNode::Binary {
+            kind: GraphBinary::Add,
+            left,
+            right,
+        }) => {
+            (is_beard(*right) && !reads_beard(*left)) || (is_beard(*left) && !reads_beard(*right))
+        }
+        _ => false,
+    }
 }
 
 /// Generates the CUDA of `root` for a block grid of `sizes`.
@@ -1360,6 +1407,7 @@ pub(crate) fn generate(
         edges: g.edges.iter().map(|b| b.len()).collect(),
         axes,
         lines,
+        beard_last: beard_added_last(c, root),
     })
 }
 
