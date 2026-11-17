@@ -71,8 +71,8 @@ A measurement on fresh servers, CPU and GPU, with `tools/gpu_worldgen.py pregen 
 | three passes | 1 out of 2,601 | 0 |
 
 The few mismatches, and those of the block entities (loot seeds, counters) and of the scheduled
-ticks, already existed: `/pregen` runs the server ticks during generation, and the scheduled fluids
-flow more or less depending on how long the chunks stay loaded.
+ticks, already existed on the CPU. They are fluid states at chunk borders; freezing the server's
+ticks during `/pregen` does not remove them (BENCHMARKS.md, 17/11).
 
 ## Correction of 15/11
 

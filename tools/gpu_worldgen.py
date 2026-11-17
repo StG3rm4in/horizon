@@ -7,7 +7,7 @@
     python3 tools/gpu_worldgen.py compare-worlds WORLD_A WORLD_B -100 -100 100 100
 
 `probe` dumps chunks with `world_probe chunk_dump` (the probe of tools/test_chunk_generation_parity.py) on
-nine zones of seed 12345 in the three dimensions and compares every dump with a reference: by default the
+ten zones of seed 12345 in the three dimensions (one of them a frozen ocean with icebergs) and compares every dump with a reference: by default the
 same build on the CPU, which is enough for a change that leaves the CPU path alone; otherwise dumps made by
 another build (`--refs DIR`; `--refs-probe` makes them, for example with a probe of pure upstream). The
 overworld runs on the CPU (against foreign references), with everything on the GPU and in the GPU test modes;
@@ -61,13 +61,17 @@ STAGES = ["HORIZON_GPU_DENSITY", "HORIZON_GPU_SURFACE", "HORIZON_GPU_SURFACE_TES
           "HORIZON_GPU_CAVES", "HORIZON_GPU_LIGHT", "HORIZON_GPU_SECTIONS", "HORIZON_GPU_BIOMES"]
 PROBE_GPU = {"HORIZON_GPU_DENSITY": "wait", "HORIZON_GPU_SURFACE": "1", "HORIZON_GPU_ORES": "1",
              "HORIZON_GPU_CAVES": "1", "HORIZON_GPU_SECTIONS": "1", "HORIZON_GPU_BIOMES": "1"}
-PROBE_TEST = dict(PROBE_GPU, HORIZON_GPU_ORES="test", HORIZON_GPU_CAVES="test",
-                  HORIZON_GPU_SECTIONS="test", HORIZON_GPU_BIOMES="test")
+# The test modes: every stage compared with the CPU inside the probe, the surface too (its test mode
+# computes the GPU surface and compares it, block by block, with the CPU's)
+PROBE_TEST = {"HORIZON_GPU_DENSITY": "wait", "HORIZON_GPU_SURFACE_TEST": "1", "HORIZON_GPU_ORES": "test",
+              "HORIZON_GPU_CAVES": "test", "HORIZON_GPU_SECTIONS": "test", "HORIZON_GPU_BIOMES": "test"}
 SERVER_GPU = {"HORIZON_GPU_DENSITY": "1", "HORIZON_GPU_SURFACE": "1", "HORIZON_GPU_ORES": "1",
               "HORIZON_GPU_CAVES": "1", "HORIZON_GPU_LIGHT": "1", "HORIZON_GPU_SECTIONS": "1",
               "HORIZON_GPU_BIOMES": "1"}
+# The last overworld zone is a deep frozen ocean with icebergs (the surface's frozen ocean extension)
 ZONES = [("overworld", "0,0,15,15"), ("overworld", "-1250,940,-1235,955"),
          ("overworld", "-320,-295,-305,-280"), ("overworld", "-3008,2492,-2993,2507"),
+         ("overworld", "-439387,440045,-439381,440051"),
          ("the_nether", "0,0,15,15"), ("the_nether", "-300,180,-285,195"),
          ("the_end", "0,0,7,7"), ("the_end", "1000,-1200,1015,-1185"), ("the_end", "-2600,300,-2585,315")]
 NOTICES = re.compile(r"disabled|not added last|without CUDA|NVRTC library|driver library|refused|panicked|^Error",
@@ -142,7 +146,7 @@ def gpu_problems(err, mode):
 
 
 def probe(args, built=None):
-    """The nine zones against the references; returns (ok, report lines)."""
+    """The ten zones against the references; returns (ok, report lines)."""
     res = resources(args)
     p = Path(args.probe) if args.probe else (built or build_probe())
     work = Path(args.work) if args.work else ROOT / ".local" / "gpu-probe"
@@ -297,7 +301,7 @@ def verify(args):
     built = None if args.probe else build_probe()
     ok, lines = probe(args, built)
     verdict &= ok
-    sections.append(("probe: 9 zones, 3 dimensions", ok, lines))
+    sections.append(("probe: 10 zones, 3 dimensions", ok, lines))
     ok, lines = parity()
     verdict &= ok
     sections.append(("vanilla parity, everything on the GPU", ok, lines))
@@ -406,6 +410,9 @@ def pregen_pass(args, binary, env, dim, folder):
             time.sleep(1)
         else:
             raise RuntimeError("the server did not answer in 5 minutes")
+        if args.freeze:
+            # /tick freeze: no block, fluid or entity ticks while the chunks generate
+            server(binary, folder, "cmd", "tick freeze")
         pid = game_pid(folder)
         log = folder / "logs" / "latest.log"
         for x, z in args.zones:
@@ -528,7 +535,7 @@ def pregen(args):
 def nbt(b, i, t):
     """An NBT payload of type t at i: (value, next index). Compounds become dicts, lists lists."""
     if t == 1:
-        return b[i], i + 1
+        return struct.unpack_from(">b", b, i)[0], i + 1
     if t == 2:
         return struct.unpack_from(">h", b, i)[0], i + 2
     if t == 3:
@@ -638,10 +645,60 @@ def region_chunks(path):
     return out
 
 
-def sections(body):
+def chunk_sections(body):
     root, _ = nbt(body, 3 + struct.unpack_from(">H", body, 1)[0], body[0])
-    return ([repr(s.get("block_states")) for s in root.get("sections", [])],
-            [repr(s.get("biomes")) for s in root.get("sections", [])])
+    return root.get("sections", [])
+
+
+def sections(body):
+    s = chunk_sections(body)
+    return [repr(x.get("block_states")) for x in s], [repr(x.get("biomes")) for x in s]
+
+
+def state_name(entry):
+    """A palette entry: a state string, or a compound with Name and Properties. A list that mixes the
+    two (allowed since 1.21.5) wraps its plain values in compounds with an empty key."""
+    if isinstance(entry, dict) and set(entry) == {""}:
+        entry = entry[""]
+    if isinstance(entry, str):
+        return entry
+    # 26.x writes `id` and `properties`; older saves `Name` and `Properties`
+    props = entry.get("properties") or entry.get("Properties") or {}
+    name = entry.get("id") or entry.get("Name") or "?"
+    return name + ("[" + ",".join(f"{k}={v}" for k, v in sorted(props.items())) + "]" if props else "")
+
+
+def section_blocks(section):
+    """The 4,096 block states of a section, index (y * 16 + z) * 16 + x."""
+    states = section.get("block_states") or {}
+    palette = [state_name(p) for p in states.get("palette", [])]
+    if len(palette) <= 1:
+        return [palette[0] if palette else "?"] * 4096
+    data = states.get("data", b"")
+    longs = struct.unpack(f">{len(data) // 8}Q", data)
+    bits = max(4, (len(palette) - 1).bit_length())
+    per, mask = 64 // bits, (1 << bits) - 1
+    out = []
+    for i in range(4096):
+        v = longs[i // per] >> (i % per) * bits & mask
+        out.append(palette[v] if v < len(palette) else "?")
+    return out
+
+
+def block_differences(body_a, body_b, cx, cz):
+    """The blocks that differ between two saves of a chunk: [(x, y, z, state a, state b)]."""
+    sa = {s.get("Y"): s for s in chunk_sections(body_a)}
+    sb = {s.get("Y"): s for s in chunk_sections(body_b)}
+    out = []
+    for y in sorted(set(sa) | set(sb)):
+        a = section_blocks(sa[y]) if y in sa else ["(none)"] * 4096
+        b = section_blocks(sb[y]) if y in sb else ["(none)"] * 4096
+        if a == b:
+            continue
+        for i in range(4096):
+            if a[i] != b[i]:
+                out.append((cx * 16 + (i & 15), y * 16 + (i >> 8), cz * 16 + (i >> 4 & 15), a[i], b[i]))
+    return out
 
 
 def region_folder(path, dim):
@@ -658,6 +715,8 @@ def compare_worlds(args):
     a, b = region_folder(args.a, args.dim), region_folder(args.b, args.dim)
     total = blocks = biomes = skipped = 0
     examples = []
+    changes = {}
+    detailed = []
     for name in sorted({p.name for p in a.glob("r.*.mca")} & {p.name for p in b.glob("r.*.mca")}):
         _, rx, rz, _ = name.split(".")
         rx, rz = int(rx), int(rz)
@@ -677,9 +736,26 @@ def compare_worlds(args):
                 blocks += 1
                 if len(examples) < 10:
                     examples.append((cx, cz))
+                if args.details:
+                    diffs = block_differences(ca[k], cb[k], cx, cz)
+                    for *_, sa, sb in diffs:
+                        changes[(sa, sb)] = changes.get((sa, sb), 0) + 1
+                    if len(detailed) < args.details:
+                        if not diffs:
+                            # Same blocks, palettes in another order
+                            detailed.append(f"   chunk {cx} {cz}: same blocks, palette order differs")
+                        else:
+                            ys = [d[1] for d in diffs]
+                            detailed.append(f"   chunk {cx} {cz}: {len(diffs)} blocks, y {min(ys)}..{max(ys)}; "
+                                            + "; ".join(f"{x} {y} {z} {a} -> {b}" for x, y, z, a, b in diffs[:3]))
             biomes += ma != mb
     print(f"{total} chunks compared ({args.dim}): {blocks} with different blocks, {biomes} with different biomes"
           + (f", {skipped} not read" if skipped else "") + (f"; first: {examples}" if examples else ""))
+    if args.details and changes:
+        print("   block changes (first world -> second), most frequent first:")
+        for (sa, sb), n in sorted(changes.items(), key=lambda kv: -kv[1])[:15]:
+            print(f"   {n:7d}  {sa} -> {sb}")
+        print("\n".join(detailed))
     return 0 if blocks == biomes == 0 else 1
 
 
@@ -698,7 +774,7 @@ def main():
         p.add_argument("--jobs", type=int, default=5, help="probe runs at a time (the probe is single-threaded)")
         p.add_argument("--work", help="where the dumps go (default .local/gpu-probe)")
 
-    p = sub.add_parser("probe", help="the 9 zones against references")
+    p = sub.add_parser("probe", help="the 10 zones against references")
     probe_args(p)
     p = sub.add_parser("verify", help="lint, probe, parity and tests, with a verdict")
     probe_args(p)
@@ -718,6 +794,8 @@ def main():
     p.add_argument("--timeout", type=int, default=1800, help="seconds allowed for one zone")
     p.add_argument("--work", help="where the servers are made (default .local/gpu-bench)")
     p.add_argument("--keep", action="store_true", help="keep the worlds (for compare-worlds)")
+    p.add_argument("--freeze", action="store_true",
+                   help="/tick freeze before /pregen: no block, fluid or entity ticks during it")
     p.add_argument("--json", help="write every pass as JSON")
     p = sub.add_parser("compare-worlds", help="blocks and biomes of two saved worlds, chunk by chunk")
     p.add_argument("a")
@@ -725,6 +803,8 @@ def main():
     for name in ("x0", "z0", "x1", "z1"):
         p.add_argument(name, type=int, help="chunk coordinates of the compared area")
     p.add_argument("--dim", default="overworld")
+    p.add_argument("--details", type=int, default=0, metavar="N",
+                   help="the block changes, and the first blocks of the first N differing chunks")
     args = ap.parse_args()
     if args.command == "pregen":
         args.zones = [tuple(int(v) for v in z.split(",")) for z in args.zones.split(";")]

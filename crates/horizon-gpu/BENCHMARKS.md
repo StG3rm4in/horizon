@@ -7,12 +7,13 @@ them again: the tool, the machine they come from, and what each number means.
 
 `tools/gpu_worldgen.py` (run it with `--help`):
 
-- `probe` dumps the chunks of nine zones of seed 12345 (four in the overworld, two in the Nether, three in
-  the End) with `world_probe chunk_dump` and compares them with references: by default the same build on
-  the CPU, enough for a change that leaves the CPU path alone; `--refs DIR` takes dumps of another build,
-  and `--refs-probe` makes them (for example with a probe built from pure upstream). The overworld runs
-  with everything on the GPU and in the GPU test modes, which compare every chunk with the CPU inside the
-  probe; the Nether and the End with everything on the GPU. A GPU run that shows no GPU work fails: a
+- `probe` dumps the chunks of ten zones of seed 12345 (five in the overworld, one of them a deep frozen
+  ocean with icebergs, two in the Nether, three in the End) with `world_probe chunk_dump` and compares them
+  with references: by default the same build on the CPU, enough for a change that leaves the CPU path
+  alone; `--refs DIR` takes dumps of another build, and `--refs-probe` makes them (for example with a
+  probe built from pure upstream). The overworld runs with everything on the GPU and in the GPU test
+  modes, which compare every chunk with the CPU inside the probe, the surface included; the Nether and the
+  End with everything on the GPU. A GPU run that shows no GPU work fails: a
   stage that fell back to the CPU would compare equal and prove nothing.
 - `verify` runs rustfmt and clippy `-D warnings` (`--lint`: the upstream CI's two commands, and
   horizon-gpu without CUDA), then `probe`, the vanilla parity of `tools/test_chunk_generation_parity.py`
@@ -23,7 +24,7 @@ them again: the tool, the machine they come from, and what each number means.
   settings (`--variants`: `cpu`, `gpu` or any set of variables), per dimension, alternating their order on
   every repeat, and reports chunks a second, CPU time per chunk, cores busy, GPU use and GPU memory.
 - `compare-worlds` compares the blocks and biomes two saved worlds hold, chunk by chunk (`pregen --keep`
-  keeps the worlds of a run).
+  keeps the worlds of a run; `--freeze` freezes the ticks during it); `--details` lists the block changes.
 
 The load with players goes through upstream's `tools/server_bench.py`, with the GPU variables set in its
 environment (`HORIZON_GPU_DENSITY=1` and the others below); `--bots-via` runs the bots on another machine,
@@ -77,19 +78,38 @@ The two repeats differ by about 1 %. With the GPU, the cores busy go from about 
 
 ## Reproducibility of /pregen
 
-The same run kept its worlds (`--keep`), and `compare-worlds` compared them zone by zone. Chunks whose
-blocks differ, out of 40,401 per zone; the biomes are the same everywhere:
+`pregen --keep` keeps the worlds of a run, and `compare-worlds --details` compares them block by block
+(17/11, the two overworld zones of the table above). Chunks whose blocks differ, out of 40,401 per zone;
+the biomes are the same everywhere:
 
-| Worlds compared | Overworld, zone 1 | Overworld, zone 2 | Nether | End |
-|---|---|---|---|---|
-| GPU, two passes | 8 | 16 | not compared | not compared |
-| CPU, two passes | 9 | 8 | not compared | not compared |
-| CPU against GPU | 11 | 12 | 0 | 0 |
+| Worlds compared | Zone 1 | Zone 2 |
+|---|---|---|
+| CPU, two passes | 9 | 8 |
+| GPU, two passes | 8 | 16 |
+| CPU, two passes, ticks frozen (`--freeze`) | 8 | 13 |
+| GPU, two passes, ticks frozen | 3 | 14 |
+| CPU against GPU, ticks frozen, before the iceberg fix | 10 | 6 |
+| CPU against GPU, ticks frozen, after it | 12 | 9 |
 
-Two passes with the same settings differ as much as the CPU and the GPU do, and only in the overworld: the
-differences come from what changes from one run to the next, not from the GPU. Probably the order in which
-neighbouring chunks are decorated across their borders, and the server's ticks during `/pregen`, which let
-fluids flow (PREGEN.md); telling the two apart is still to do.
+In the Nether and the End, the CPU and the GPU gave the same worlds (0 chunks of 40,401).
+
+What differs from one run to the next, on the CPU as on the GPU, is the state of fluids: a water level
+(`water` against `water[level=1]`), lava against obsidian where it meets water, a few water blocks against
+air; once, the age of a cave vine. The chunks often come in pairs across a border. Freezing the ticks
+during `/pregen` does not remove them, so they do not come from the server's ticks but from the fluids
+settled when a chunk is finished (post-processing), which depends on which neighbours are finished by
+then. Whether vanilla shows the same was not measured.
+
+The comparison of CPU and GPU worlds also found the one difference that came from the GPU: in deep frozen
+oceans, packed ice against water or air under icebergs (40 blocks in one chunk of zone 2, 20 in two
+chunks of zone 1), the same in every pass. The GPU surface builds the iceberg before the rule of its
+column and vanilla after it; SURFACE.md tells the fix. The probe has a frozen ocean zone since, and its
+test mode checks the surface too.
+
+**What `/pregen` guarantees.** The terrain, the surface, the carvers, the features and the biomes do not
+depend on the run nor on the CPU or GPU path: the same seed gives the same blocks, except for fluid states
+(and once a cave vine's age) at a few chunk borders (3 to 16 chunks out of 40,401 here, at most 0.04 %),
+on the CPU as on the GPU.
 
 ## What the numbers mean
 
