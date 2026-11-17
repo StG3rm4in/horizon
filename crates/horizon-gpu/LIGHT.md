@@ -2,7 +2,7 @@
 
 ## What it costs
 
-`/pregen` profile of 15/11 (density, surface, ores and caves on the GPU, `/tmp/sous_lumiere.py`):
+`/pregen` profile of 15/11 (density, surface, ores and caves on the GPU):
 light accounts for **21% of the CPU**.
 
 | Item | Share of the CPU |
@@ -61,7 +61,7 @@ and mismatches.
 
 ## Checks
 
-- Test mode (`/tmp/lu1.sh`, server built in parity-target): zone 900000/−920000 (radius 400) then
+- Test mode (server built in parity-target): zone 900000/−920000 (radius 400) then
   1100000/−1120000 (radius 1,200): **16,384 chunks lit by the GPU and compared with `light_chunk`,
   0 mismatches**, 0 errors. In test mode, the thread recomputes each chunk on the CPU: it becomes the
   bottleneck, the 32 batches are taken and part of the chunks are lit directly on the CPU
@@ -71,7 +71,7 @@ and mismatches.
 
 ## Measurements
 
-`/pregen` benches (`/tmp/ab11.sh`, release, radius 1,600 blocks, fresh zones; density, surface, ores
+`/pregen` benches (release, radius 1,600 blocks, fresh zones; density, surface, ores
 and caves on the GPU in both variants):
 
 | Zone | Without GPU light | With | CPU per chunk |
@@ -151,7 +151,7 @@ describes them like the previous fill.
 
 ### Measurements
 
-Bench `/tmp/ab25.sh` (release, everything on the GPU, lz4; same binary, `HORIZON_GPU_LIGHT_CACHE=0` in
+Bench (release, everything on the GPU, lz4; same binary, `HORIZON_GPU_LIGHT_CACHE=0` in
 the gpub copy against the cache in the gpu copy; fresh zones):
 
 | Zone | Throughput without → with | CPU per chunk |

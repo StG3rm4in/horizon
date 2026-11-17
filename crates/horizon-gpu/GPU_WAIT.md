@@ -3,7 +3,7 @@
 ## What it costs
 
 `/pregen` profile of 15/11 with everything on the GPU (density, aquifers, beardifier, surface, ores,
-caves, light; `/tmp/sous_gpu.py`): the "GPU wait and driver" step weighs **12.7% of the CPU**, of
+caves, light): the "GPU wait and driver" step weighs **12.7% of the CPU**, of
 which 8.9% in libcuda and cudarc. By caller:
 
 | Caller | Share of the CPU |
@@ -20,7 +20,7 @@ tracking.
 
 ## What was tried
 
-`/pregen` benches (`/tmp/ab12.sh` and `/tmp/ab13.sh`, release, radius 1,600 blocks, fresh zones,
+`/pregen` benches (release, radius 1,600 blocks, fresh zones,
 everything on the GPU):
 
 | Variant | 1200000/−1220000 | −1230000/1240000 | 1250000/−1270000 |
@@ -52,7 +52,7 @@ was saturated (calls of 0.9 ms instead of 0.5), no longer slows anything down:
 - `OreGpu::wait` reads the readback buffer once; `rows` no longer calls the driver for every blob.
   Ore probe in test mode: identical, 0 mismatches.
 
-Confirmation with the new default, without a variable (`/tmp/at2.sh`, fresh zones):
+Confirmation with the new default, without a variable (fresh zones):
 
 | Variant | 1400000/−1420000 | −1430000/1440000 |
 |---|---|---|
@@ -69,7 +69,7 @@ the 10600K only has 6 physical cores. See THROUGHPUT.md.
 
 ## Calls and copies around the GPU (15/11, evening)
 
-Profile in lz4, with direct NBT writing (`/tmp/sous_gpu2.py`: per horizon-gpu function and per kind
+Profile in lz4, with direct NBT writing (per horizon-gpu function and per kind
 of leaf). The "GPU wait and driver" item also contains the CPU work of the horizon-gpu crate, not
 only the driver calls:
 
@@ -102,7 +102,7 @@ Checks:
   (radius 800, zone 4150000/−4170000): **more than 16,384 chunks, 0 mismatches**;
 - probe identical on 4 zones all on the GPU, and vanilla parity at 0 differences on 785 chunks.
 
-Bench `/tmp/ab24.sh` (previous binaries in `target/avant-gpu/`, gpub copy; lz4):
+Bench (previous binaries in `target/avant-gpu/`, gpub copy; lz4):
 
 | Zone | Throughput before → after | CPU per chunk |
 |---|---|---|

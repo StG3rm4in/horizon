@@ -3,7 +3,7 @@
 ## What it costs
 
 `/pregen` profile of 15/11 (density, surface and ores on the GPU, 1,143 chunks/s with the profiling
-binaries, `/tmp/sous_grottes.py`): caves account for **12.4% of the CPU**.
+binaries): caves account for **12.4% of the CPU**.
 
 | Item | Share of the CPU |
 |---|---|
@@ -74,7 +74,7 @@ upload and wait times, the fallbacks and the mismatches.
 
 - Unit test `tests/carver_plan.rs`: for vanilla's caves, Nether caves and canyons, 120 seeds and 85
   targets each, `plan` then `execute` carve the same cells as `carve`.
-- `chunk_dump` probe (`/tmp/gr1.sh`), 3 zones of 256 chunks (0,0; −1250,940; 750,−1270): output
+- `chunk_dump` probe, 3 zones of 256 chunks (0,0; −1250,940; 750,−1270): output
   byte-identical to the CPU with the GPU mask alone in test mode, everything on the GPU in test mode,
   and everything on the GPU. 0 mask mismatches, 0 substance mismatches, 0 fallbacks. 80 to 120
   elements and 850 to 1,700 carved cells per chunk on average (10,903 at most).
@@ -88,11 +88,11 @@ upload and wait times, the fallbacks and the mismatches.
 ## Measurements
 
 **Version 1**: one plan per origin (289 lookups per chunk), three GPU buffers per batch.
-- `/pregen` benches (`/tmp/ab10.sh`, radius 1,600 blocks, density + surface + ores on the GPU in both
+- `/pregen` benches (radius 1,600 blocks, density + surface + ores on the GPU in both
   variants):
   - zone 600000/−620000: 1,010 → 1,040 chunks/s (+3.0%), CPU 10.09 → 9.72 ms per chunk;
   - zone −630000/640000: 1,036 → 1,095 chunks/s (+5.7%), CPU 8.92 → 8.38 ms per chunk.
-- Profile (zone 700000/−720000, 1,096 chunks/s with the profiling binaries, `/tmp/sous_grottes2.py`):
+- Profile (zone 700000/−720000, 1,096 chunks/s with the profiling binaries):
   the caves go from 12.4% to about 4.9% of the CPU.
   - preparing the upload (`submit_caves`): 1.77%, of which 0.9% for lookups in the plan caches (289
     per chunk, under a lock when the worker's cache runs dry) and 0.4% of CUDA driver;

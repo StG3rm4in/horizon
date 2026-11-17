@@ -16,9 +16,9 @@ Horizon writes the regions like vanilla:
 `HORIZON_ZLIB_LEVEL` (0 to 9, read once, `compression.rs`) changes this level for the benches. Any
 reader reads a deflate stream back, whatever its level.
 
-Bench `/tmp/ab21.sh "copy variant x z" ...` (release, everything on the GPU, radius 1,600 blocks,
+Bench (release, everything on the GPU, radius 1,600 blocks,
 40,401 chunks per zone, fresh zones). Each variant goes once through each copy (Latin square). The
-size is that of the zone's `region/`, `entities/` and `poi/` files (`/tmp/taille_zone.py`):
+size is that of the zone's `region/`, `entities/` and `poi/` files:
 
 | Zone | deflate 6 (default) | deflate 1 | lz4 |
 |---|---|---|---|
@@ -59,15 +59,15 @@ Checked by:
   `defaults_are_vanilla`;
 - a real server: same zone (radius 400), 26.1 MiB at level 6, 32.7 MiB at level 1 (+25%).
 
-Since 15/11, the bench copies (`/data/horizon-ab/{gpu,gpub,cpu}`) write in **lz4**
+Since 15/11, the bench copies of the test world (`gpu`, `gpub`, `cpu`) write in **lz4**
 (`region-file-compression = "lz4"` in the `[properties]` of their server.toml). The measurements that
 follow therefore no longer compare directly with the previous ones, made in deflate 6.
-`/tmp/ab21.sh`, which changed server.properties directly, no longer has any effect: the server
-rewrites it from server.toml.
+The first version of this bench changed server.properties directly, which no longer has any
+effect: the server rewrites it from server.toml.
 
 ## Encoding
 
-Profile (`/tmp/profil_b1.sh`, zone 3600000/−3620000, deflate 6, `/tmp/sous_filtre.py`): saving weighs
+Profile (zone 3600000/−3620000, deflate 6): saving weighs
 27% of the CPU in total, compression included.
 
 - `encode_saved` (the chunk as an NBT tree): 12.9%, of which
@@ -98,8 +98,8 @@ Checks:
   `from_values`, `from_mapped` and after a write;
 - `HORIZON_PACK_TEST=1` computes each `pack` both ways and compares. `/pregen` in test mode
   (radius 800, zone 3650000/−3670000): **more than 131,072 containers, 0 mismatches**;
-- the bench regions, compared between the old and the new binary (`/tmp/cmp_blocs.py` and
-  `/tmp/nbt_diff.py`, which lists the paths of the tags that differ): 15 chunks out of 40,401 with
+- the bench regions, compared between the old and the new binary (`tools/gpu_worldgen.py compare-worlds`, and a
+  comparison listing the paths of the tags that differ): 15 chunks out of 40,401 with
   different blocks. That is the known noise from one run to the next: fluids, plant age, berries,
   vines, ticks that run during `/pregen`. The whole NBT differs for ~5% of the chunks, but through
   fields that already change from one run to the next:
@@ -109,7 +109,7 @@ Checks:
 
   No section with identical blocks is written differently.
 
-Bench `/tmp/ab22.sh` (release, everything on the GPU, deflate 6; previous binaries in
+Bench (release, everything on the GPU, deflate 6; previous binaries in
 `target/avant-pack/`, gpub copy; the new ones in the gpu copy; fresh zones):
 
 | Zone | Throughput before → after | CPU per chunk |
@@ -159,7 +159,7 @@ Checks:
 - `/pregen` in test mode (radius 800, zone 4000000/−4020000): **more than 8,192 chunks, 0 byte
   mismatches**.
 
-Bench `/tmp/ab23.sh` (release, everything on the GPU, lz4; same binary, `HORIZON_NBT=tree` in the gpub
+Bench (release, everything on the GPU, lz4; same binary, `HORIZON_NBT=tree` in the gpub
 copy against direct writing in the gpu copy; fresh zones):
 
 | Zone | Throughput tree → direct | CPU per chunk |

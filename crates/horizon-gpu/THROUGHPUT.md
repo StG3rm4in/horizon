@@ -6,7 +6,7 @@ memory stick at 3,600 MT/s.
 
 ## During a `/pregen`
 
-Script `/tmp/pg1.sh x z` (analysis `/tmp/pg1_analyse.py`). Profiling binaries, fresh zone
+Profiling binaries, fresh zone
 2900000/−2920000, 1,450 chunks/s.
 
 CPU per thread, in cores:
@@ -51,7 +51,7 @@ Trace (`HORIZON_PREGEN_TRACE=1`):
 
 ## By number of workers
 
-Script `/tmp/ab19.sh "copy workers x z" ...` (release, radius 1,600 blocks, fresh zones).
+Benches: release, radius 1,600 blocks, fresh zones.
 `HORIZON_WORKER_THREADS=N` gives N − 1 workers. Each number goes once through each copy:
 
 | Zone | 5 workers | 11 (default) | 15 workers |
@@ -102,11 +102,11 @@ For zlib, Horizon already reads `region-file-compression` from server.properties
 ## Measured again in lz4 (15/11, evening)
 
 With the regions in lz4 (bench copies), the palettes without repacking (SAVING.md), the optimized
-snow and ores (DECORATIONS.md). Script `/tmp/lim1.sh`: profile, per-thread diagnosis, workers bench.
-`/tmp/pg1.sh` now runs perf stat with `LC_ALL=C`, otherwise the locale's decimal comma breaks the
+snow and ores (DECORATIONS.md). Method: a profile, a per-thread diagnosis and a bench by number of workers.
+perf stat now runs with `LC_ALL=C`, otherwise the locale's decimal comma breaks the
 reading of the counters.
 
-By number of workers (`/tmp/ab19.sh`, release, fresh zones):
+By number of workers (release, fresh zones):
 
 | Zone | 5 workers | 11 (default) | 15 workers |
 |---|---|---|---|
@@ -132,7 +132,7 @@ During a `/pregen` (profiling binaries, zone 3900000/−3920000, 1,768 chunks/s)
 15 workers only add 2%. The main thread (0.67 core) is not a bottleneck; neither are the compression
 and the region writing.
 
-Profile (`/tmp/profil_b1.sh`, zone 3850000/−3870000, 1,861 chunks/s with the profiling binaries):
+Profile (zone 3850000/−3870000, 1,861 chunks/s with the profiling binaries):
 
 | Item | Share of the CPU |
 |---|---|
@@ -148,17 +148,17 @@ Profile (`/tmp/profil_b1.sh`, zone 3850000/−3870000, 1,861 chunks/s with the p
 | Compression (lz4) | 2.3% |
 
 - The most expensive function in self time is `_mi_page_malloc_zero` (4.6%), mimalloc's allocation
-  path. `/tmp/appelants_alloc.py` shows it is scattered; the biggest caller is the save's NBT tree
+  path. Its callers show it is scattered; the biggest caller is the save's NBT tree
   (`JavaString::from` strings, compounds), about 1.5%.
-- The CUDA driver (`/tmp/sous_gpu.py`) weighs 5.2%: the surface launches (`enqueue`) 1.4%, and the
+- The CUDA driver weighs 5.2%: the surface launches (`enqueue`) 1.4%, and the
   light, cave and ore uploads 2.1%.
 
 
 ## Dual channel (16/11)
 
 The server now has two 16 GB sticks, one per channel, at 3,600 MT/s (XMP), and new thermal paste.
-Same code as the light cache bench (`/tmp/ab25.sh`, 1,999 to 2,070 chunks/s and 4.01 to 4.20 ms of
-CPU per chunk with 11 workers in single channel). Script `/tmp/ab19.sh`, release, lz4, radius 1,600
+Same code as the light cache bench (1,999 to 2,070 chunks/s and 4.01 to 4.20 ms of
+CPU per chunk with 11 workers in single channel). Benches: release, lz4, radius 1,600
 blocks, fresh zones; each setting goes once through each copy:
 
 | Zone | `HORIZON_WORKER_THREADS=5` (4 workers) | default (11 workers) | 15 (14 workers) |
@@ -180,8 +180,8 @@ blocks, fresh zones; each setting goes once through each copy:
 ## After merging upstream main (16/11)
 
 The merge of upstream main at 54717b2965 (436 commits, the mod API merge among them) leaves the
-throughput where it was. `/tmp/ab26.sh` against the binaries from before the merge (kept in
-`~/bancs/avant-merge/bin/`, next to a copy of the resources they were prepared with), copies
+throughput where it was. The A/B bench against the binaries from before the merge (kept next to
+a copy of the resources they were prepared with), copies
 alternated:
 
 | Zone | CPU per chunk before → after | Throughput before → after |
@@ -202,9 +202,9 @@ horizon-client -p horizon-server`.
 ## The scheduling thread (16/11)
 
 The thread that schedules the chunks (the server's main thread) took 10.7% of the CPU under
-`/pregen` (call-graph profile after the merge, `~/bancs/perfg-merge.data`): `Game::update_world`
+`/pregen` (call-graph profile after the merge): `Game::update_world`
 8.6%, of it `Streaming::complete_commit` 5.1% (`DecorationOrder::blocked` 2.0%, `rank` 0.9%), the
-plan updates 2.5%; the server tick itself 2.1%. Counted with uprobes (`/tmp/calls1.sh`, bpftrace on
+plan updates 2.5%; the server tick itself 2.1%. Counted with uprobes (bpftrace on
 `update_world` and `complete_commit`), it ran **3,300 passes a second**, about 250 us of CPU each,
 for 0.85 of a core: `pump_chunks` waits for one job result (at most 5 ms) and runs `update_world`,
 which rescans every proto chunk the streamer holds, for each result.
@@ -214,7 +214,7 @@ results that come back in between wait in the channel, and `Streaming::update` t
 decoration order does not depend on when a pass runs (`DecorationOrder::blocked` holds a chunk back
 while a lower-ranked one within two of it is pending, in flight included).
 
-`/tmp/ab26.sh` with the variants `gapN` (the same bench build, `HORIZON_PUMP_GAP_US=N`), two fresh
+The A/B bench with the variants `gapN` (the same bench build, `HORIZON_PUMP_GAP_US=N`), two fresh
 zones, the three copies:
 
 | Gap | CPU per chunk, 5950000/−5970000 | −5980000/5990000 | Throughput |
@@ -230,8 +230,8 @@ workers do not take the core it leaves (the process uses about 7.4 of the 12 log
 ## What the workers wait for (16/11)
 
 With the scheduling thread at 0.45 of a core, the 11 chunk workers were busy 58% of the time each
-and the machine's logical CPUs 65%. Their time off the CPU over 10 s of `/pregen` (`/tmp/pg1.sh`,
-offcputime on the bench build), 37.9 s in all:
+and the machine's logical CPUs 65%. Their time off the CPU over 10 s of `/pregen` (offcputime
+on the bench build), 37.9 s in all:
 
 | What | Time |
 |---|---|
@@ -250,8 +250,8 @@ threads overlap the waits: with `HORIZON_WORKER_THREADS=18` (17 chunk workers), 
 server's `[engine] worker_threads` sets the variable (docs/hosting.md).
 
 **Computing the density regions ahead: no gain, not kept.** A thread computed the eight neighbours
-of each region a worker first asked for, so that workers would find them ready (patch kept in
-`~/bancs/avant/prefetch/prefetch.diff`; exact: probe identical, parity 0). Against the same build
+of each region a worker first asked for, so that workers would find them ready (exact: probe
+identical, parity 0). Against the same build
 with `HORIZON_GPU_PREFETCH=0`: 2,213 → 2,225 and 2,605 → 2,572 chunks/s, within the noise, for up to
 2 GB more GPU memory. A region is 3 ms of GPU work for 64 chunks; each chunk then waits about 1 ms
 on its own stream (its surface and its readback), which the regions computed ahead made longer
@@ -270,7 +270,7 @@ beardifier (about 6% of the chunks have one, and would redo theirs once their st
 known).
 
 Waits overlapped inside a job are what more workers give for free, so the worker count bounds what
-such an overlap could bring (`/tmp/ab19.sh`, two fresh zones, `HORIZON_PUMP_GAP_US=1000`):
+such an overlap could bring (two fresh zones, `HORIZON_PUMP_GAP_US=1000`):
 
 | Chunk workers | 6250000/−6270000 | −6280000/6290000 | CPU per chunk |
 |---|---|---|---|

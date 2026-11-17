@@ -83,7 +83,7 @@ blocks, possible folding per biome) do not change the result: the GPU evaluates 
     `y = MY`); `__device__` tables with a constant initializer (temperatures as bits).
   - Result: **0 mismatches over 3,668 chunks, 346 M blocks compared, of which 60.5 M changed by the
     surface**, and 0 conditions that cannot be evaluated. Samples: 5 zones of 64 chunks, then
-    25 + 36 + 32 small scattered zones (script `/tmp/s3_zones2.sh N STEP DX DZ OUTPUT` on the server).
+    25 + 36 + 32 small scattered zones.
     40 biomes at the surface, including badlands (terracotta bands), snowy_slopes, grove, meadow,
     ice_spikes, swamp, desert, stony_shore, windswept_gravelly_hills, dripstone_caves, sulfur_caves.
     Not seen yet: the peaks (jagged/frozen/stony_peaks), mangrove_swamp, mushroom_fields, cherry_grove,
@@ -129,8 +129,8 @@ blocks, possible folding per biome) do not change the result: the GPU evaluates 
   - Checks: `chunk_dump` probe byte-identical on 3 zones (land, frozen oceans, eroded badlands, 59
     chunks with structures); **vanilla parity at 0 differences on 785 chunks**, with 3,479 chunks
     surfaced by the GPU, 0 fallbacks.
-  - `/pregen`, radius 1,600 blocks, fresh zones 230000/−250000 and −260000/270000 (script
-    `/tmp/ab6.sh`, the gpus variant runs in the `gpub` copy):
+  - `/pregen`, radius 1,600 blocks, fresh zones 230000/−250000 and −260000/270000 (the gpus
+    variant runs in the `gpub` copy):
 
     | Variant | Zone 1 | Zone 2 | CPU per chunk |
     |---|---|---|---|
@@ -152,7 +152,7 @@ blocks, possible folding per biome) do not change the result: the GPU evaluates 
     (comparison mode) keeps its own stream.
   - **Blocking wait** (`HORIZON_GPU_SYNC=block`): less CPU but calls of 0.87-0.92 ms instead of
     0.51-0.53 ms, lower throughput (969 / 999 against 1,001 / 1,019 chunks/s): active waiting is kept.
-  - `/pregen` (`gpu` and `gpub` copies, scripts `/tmp/ab7.sh` and `/tmp/ab8.sh`, gain of the surface on
+  - `/pregen` (`gpu` and `gpub` copies, gain of the surface on
     the GPU over the GPU without surface, fresh zones at each pass):
 
     | Step | Zones | GPU without surface | GPU + surface | Gain |

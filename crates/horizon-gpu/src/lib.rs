@@ -31,6 +31,9 @@
 //! server build with `--no-default-features`, unless it adds `--features cuda`), `cuda_off.rs`
 //! stands in for cudarc and every stage reports CUDA as absent.
 //!
+//! Checking and measuring: `tools/gpu_worldgen.py` (probe, verify, pregen, compare-worlds), see
+//! BENCHMARKS.md in this crate.
+//!
 //! At startup, a self-test compares the final_density of three chunks with the CPU; at the
 //! slightest difference or CUDA error, final_density and the aquifers stay on the CPU. The
 //! self-test covers final_density only: the other stages are checked by their `test` values and

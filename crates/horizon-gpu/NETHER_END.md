@@ -61,7 +61,7 @@ the CPU writes the GPU's final states instead).
 
 ## Measurements
 
-Bench `/tmp/ab26.sh` with `DIM` (`/pregen` through `execute in`), release, radius 1,600 blocks;
+Bench with `DIM` (`/pregen` through `execute in`), release, radius 1,600 blocks;
 binaries from before in `target/avant-nether/` (the overworld fully on the GPU, the other
 dimensions on the CPU); the copies alternate:
 

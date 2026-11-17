@@ -79,7 +79,7 @@ The noise is in f64, which the 3080 computes slowly: in version 1, the climate e
 quart was the cost. With regions of 16 × 16, a region takes 2.0 ms: less per chunk, but a longer wait
 for the first chunk asked for; 8 stays the default.
 
-`/tmp/ab18.sh` benches (release, radius 1,600 blocks, fresh zones, everything else on the GPU,
+Benches (release, radius 1,600 blocks, fresh zones, everything else on the GPU,
 sections included):
 
 | Zone | CPU biomes | GPU biomes | CPU per chunk |

@@ -2,7 +2,7 @@
 
 ## What it costs
 
-`/pregen` profile of 15/11, everything on the GPU (`/tmp/sous_etats.py`): `fill_noise_states`, which
+`/pregen` profile of 15/11, everything on the GPU: `fill_noise_states`, which
 writes the GPU's final states (fill then surface) into the `TerrainChunk`, weighs **9.1% of the
 CPU**: `fill_solid_run` 4.9%, the loop itself 2.7% (of which 0.85% for rereading the 98,304 states
 looking for bit 30), `set_block_raw` 0.7%, the heightmaps 0.5%. For this, the GPU sent back the
@@ -61,7 +61,7 @@ mismatches.
 
 ## Checks
 
-- `chunk_dump` probe (`/tmp/sec1.sh`), 3 zones of 256 chunks (0,0; −1250,940; eroded badlands
+- `chunk_dump` probe, 3 zones of 256 chunks (0,0; −1250,940; eroded badlands
   −320,−295): byte-identical to the CPU in test mode and with the sections; 0 mismatches and
   0 fallbacks over 1,200 chunks in test mode.
 - Vanilla parity: **0 differences on 785 chunks** with the sections; overworld in test mode:
@@ -75,7 +75,7 @@ call 140 µs longer (537 → 676 µs, probe without contention). With one block 
 the marks reread only in the columns that have some, and coalesced reads in `ksec_sections`, the
 overhead drops to 48 µs (498 → 546 µs).
 
-`/pregen` benches (`/tmp/ab16.sh`, release, radius 1,600 blocks, fresh zones, everything on the GPU):
+`/pregen` benches (release, radius 1,600 blocks, fresh zones, everything on the GPU):
 
 | Zone | Without sections | With | CPU per chunk |
 |---|---|---|---|

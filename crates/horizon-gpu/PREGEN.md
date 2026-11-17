@@ -45,7 +45,7 @@ Trace (server built in parity-target, same fresh zone 1550000/−1570000):
 | column after column | 1,260 chunks/s | 28 to 39% | 5.5 | 18 |
 | three passes | 1,380 chunks/s (+9.5%) | 4 to 8% | 6 to 12 | 29 to 30 |
 
-Release benches (`/tmp/ab14.sh`, radius 1,600 blocks, fresh zones, everything on the GPU):
+Release benches (radius 1,600 blocks, fresh zones, everything on the GPU):
 
 | Zone | Column after column | Three passes | Busy cores |
 |---|---|---|---|
@@ -54,12 +54,15 @@ Release benches (`/tmp/ab14.sh`, radius 1,600 blocks, fresh zones, everything on
 | 1650000/−1670000 | 1,303 chunks/s | 1,344 (+3.2%) | 8.7 → 9.3 |
 
 The CPU time per chunk rises by 4 to 6%: more cores work at the same time on a machine with a single
-memory stick. More workers (`HORIZON_WORKER_THREADS=14` or `16`, `/tmp/ab15.sh`) bring nothing clear
+memory stick. More workers (`HORIZON_WORKER_THREADS=14` or `16`) bring nothing clear
 (−2.6 to +2.7%).
 
 ## Reproducibility
 
-`/tmp/cmp_regions.py` and `/tmp/cmp_blocs.py` compare the chunks two worlds saved. Same zone of
+A measurement on fresh servers, CPU and GPU, with `tools/gpu_worldgen.py pregen --keep` and
+`compare-worlds`, is in BENCHMARKS.md (17/11). The first comparison, below, came before it.
+
+`tools/gpu_worldgen.py compare-worlds` compares the chunks two worlds saved. Same zone of
 51 × 51 chunks, generated twice (12 then 5 workers):
 
 | Order | Chunks with different blocks | With different biomes |

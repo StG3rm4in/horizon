@@ -12,7 +12,7 @@ Decorations (`Decoration::decorate`, generator_decoration.rs) take **34 to 35% o
 `HORIZON_FEATURE_TIMES=1` measures the time of each placed feature, of the structures (per structure),
 of the GPU ore prediction and of the rest of `decorate`. The ranking is written to latest.log every
 10,000 chunks (`FeatureTimes`, generator_decoration.rs). It is wall time, measured while the other
-workers run. Script `/tmp/ft1.sh "x z" ...` (profiling binaries, gpu copy, radius 1,600 blocks).
+workers run. Measured with the profiling binaries (gpu copy, radius 1,600 blocks).
 
 By family, as a share of the decoration time:
 
@@ -50,8 +50,8 @@ The monument costs 25 to 29 ms per chunk that has one, but these chunks are rare
 
 ## Inside the features (perf profile)
 
-Profiles `/tmp/profil_b1.sh` (zones 2800000/−2820000 and 3250000/−3270000), analysed by
-`/tmp/sous_deco.py` and `/tmp/sous_filtre.py` (functions in inclusive time and in self time under a
+Profiles (zones 2800000/−2820000 and 3250000/−3270000), analysed per
+function (functions in inclusive time and in self time under a
 given frame). Shares of the total CPU:
 
 - **Ores, ~10%**:
@@ -93,7 +93,7 @@ stay exact, and are checked by the probe, the vanilla parity and the ore test mo
 
 ## What was done (15/11)
 
-Originals in `/tmp/deco-avant/` on the server.
+The previous code was kept on the test machine for these comparisons.
 
 1. **Snow and ice.** `BiomeTemperature::uncached` (biome_temperature.rs) computes the temperature
    without a cache. `World::biome_should_freeze` and `biome_should_snow` (generator_decoration.rs) use
@@ -121,9 +121,9 @@ Checks:
   and a frozen_river zone), on the CPU path as on the all-GPU path;
 - vanilla parity at 0 differences on 785 chunks, everything on the GPU as on the CPU.
 
-Measurements. Time per feature (`/tmp/ft1.sh`, same zones as above, gpub copy): the decoration goes
+Measurements. Time per feature (same zones as above, gpub copy): the decoration goes
 from 2,963 to 2,921 µs per chunk and from 2,535 to 2,376 µs (geode still included). Release bench
-`/tmp/ab20.sh` (previous binaries in `target/avant-deco/`, gpub copy, against the new ones, gpu copy,
+(previous binaries in `target/avant-deco/`, gpub copy, against the new ones, gpu copy,
 without the geode):
 
 | Zone | Throughput before → after | CPU per chunk |
@@ -139,7 +139,7 @@ noise between zones.
 
 ## Ore cells by row and by state (16/11, dual channel)
 
-Profile before (`/tmp/profil_b1.sh`, zone 4750000/−4770000, `/tmp/sous_deco.py`): the ores weigh
+Profile before (zone 4750000/−4770000): the ores weigh
 11.5% of the CPU, 7.4% for writing the cells the GPU computed (`OrePlan::place`; per cell, a dynamic
 call to the target test, `set_slot`, and two property lookups for the non-air count) and 4.6% for
 the prediction.
@@ -164,7 +164,7 @@ Checks:
 - probe byte-identical on 4 zones, all on the GPU and with `HORIZON_GPU_ORES=test` (0 mismatches);
   vanilla parity at 0 differences on 785 chunks.
 
-Bench `/tmp/ab26.sh` (release, lz4; binaries from before in `target/avant-ores/`; the copies
+Bench (release, lz4; binaries from before in `target/avant-ores/`; the copies
 alternate between the variants):
 
 | Zone | CPU per chunk before → after | Throughput before → after |
@@ -202,7 +202,7 @@ serves the sculk spread and every multiface block (glow lichen, sculk veins, vin
 Checks: 507 horizon-world tests; probe byte-identical on 4 zones; vanilla parity at 0 differences on
 785 chunks.
 
-Bench `/tmp/ab26.sh` (release, lz4; binaries from before, with the ore change, in
+Bench (release, lz4; binaries from before, with the ore change, in
 `target/avant-sculk/`; the copies alternate):
 
 | Zone | CPU per chunk before → after | Throughput before → after |
@@ -218,10 +218,10 @@ From −1.3% to −5.7% of CPU per chunk depending on how much deep dark and lic
 
 The composition of the decorations changes a lot from one zone to the next: sculk weighed 1.4% of
 the CPU in one profile and 9.9% in another, trees 10.6% and 4.2%. To choose the next target on an
-average, `/tmp/ft1.sh` (`HORIZON_FEATURE_TIMES=1`, profiling binaries, everything on the GPU)
+average, with `HORIZON_FEATURE_TIMES=1` (profiling binaries, everything on the GPU)
 measured six fresh zones of 40,401 chunks spread over the map (5200000/−5220000, −5230000/5240000,
 5250000/5270000, −5280000/−5290000, 5300000/−5320000, −5330000/5340000), averaged by
-`/tmp/ft_avg.py` with each zone weighted the same.
+with each zone weighted the same.
 
 The decoration takes 1,525 to 2,450 µs per chunk, **1,890 on average**:
 
@@ -251,11 +251,11 @@ roughly: ores below 14%, sculk 6%, trees 6%, geode 3%.
 ## Shared decoration infrastructure (16/11)
 
 Features (trees, sculk, geodes, monster rooms, placement modifiers, block predicates) all read
-blocks through `TerrainRegion::block`. A profile with call graphs (`/tmp/profil_b1.sh 5400000
+blocks through `TerrainRegion::block`. A profile with call graphs (zone 5400000
 -5420000`) put the decoration code that belongs to no feature at 17% of the CPU, but spread out: the
 callers of the block reads are scattered over every feature. The profiling binaries (no LTO, 16
 codegen units) inline less than the release build, so the targets were taken from a flat profile of
-the release binaries themselves (`/tmp/profil_rel.sh copy x z`, `perf record -F 999` without call
+the release binaries themselves (`perf record -F 999` without call
 graph, zone 5450000/−5470000):
 
 - **Block reads, 12.1% of the CPU** in three functions that release never inlined:
@@ -286,8 +286,8 @@ differences on 785 chunks.
 
 In the release profile afterwards (zone 5560000/−5570000), the block reads weigh 7.6% (`block_at`)
 instead of 12.1%, and `state_face_sturdy` 0.08% instead of 1.4%. What is left of the read is mostly
-its loads (section, storage word, palette), which miss the cache. The bench `/tmp/ab26.sh`
-(`HS_AVANT` = `target/avant-infra/`, copies alternated) measures less than the profile suggests:
+its loads (section, storage word, palette), which miss the cache. The A/B bench
+(previous binaries in `target/avant-infra/`, copies alternated) measures less than the profile suggests:
 
 | Zone | CPU per chunk before → after | Throughput before → after |
 |---|---|---|

@@ -1,0 +1,50 @@
+name: gpu-worldgen
+
+# The checks of the gpu-worldgen branch on GitHub's own runners. They have no NVIDIA GPU and no game files,
+# so this runs what needs neither: rustfmt, clippy -D warnings (the whole workspace with the CUDA backend
+# compiled, which needs no CUDA toolkit; the server build and horizon-gpu without it) and the unit tests of
+# the crates that need no prepared resources. The probe in the three dimensions, the vanilla parity and the
+# GPU runs go through `python3 tools/gpu_worldgen.py verify` on a machine with an NVIDIA GPU and the game
+# files (crates/horizon-gpu/BENCHMARKS.md).
+
+on:
+  push:
+    branches: [gpu-worldgen]
+  pull_request:
+    branches: [gpu-worldgen]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-worldgen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    # Upstream runs its own CI; this one is for the fork
+    if: github.repository != 'horizon-rust/horizon'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Room for the build
+        # The runner's preinstalled SDKs take space the workspace's build needs
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy, the workspace (CUDA backend compiled)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: clippy, the server build without CUDA
+        run: cargo clippy -p horizon-client --all-targets --locked --no-default-features -- -D warnings
+      - name: clippy, horizon-gpu without CUDA
+        run: cargo clippy -p horizon-gpu --all-targets --locked -- -D warnings
+      - name: unit tests (no GPU, no game files)
+        run: cargo test --locked -p horizon-gpu -p horizon-core --lib

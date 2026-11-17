@@ -43,7 +43,7 @@ values.
 
 ## Measurements
 
-First version (reading the cells one by one for the first appearances), benches `/tmp/ab17.sh`
+First version (reading the cells one by one for the first appearances), benches
 (release, radius 1,600 blocks, fresh zones, everything on the GPU, sections included):
 
 | Zone | Through the values | Direct | CPU per chunk |

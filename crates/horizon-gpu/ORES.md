@@ -74,10 +74,10 @@ The caches the prediction fills early do not change the answers:
 ## Measurements
 
 **Version 1**: cells applied one by one by `place_cell`, batch uploaded in 3 copies, read back in 2.
-- `/pregen` benches (`/tmp/ab9.sh`, radius 1,600 blocks):
+- `/pregen` benches (radius 1,600 blocks):
   - zone 410000/−430000: 981 → 986 chunks/s, CPU 10.49 → 10.59 ms per chunk;
   - zone −440000/450000: 1,018 → 1,043 chunks/s, CPU 9.10 → 8.93 ms per chunk.
-- Profile (`/tmp/sous_ore3.py`): the ores go from 10.5% to 9.1% of the CPU.
+- Profile: the ores go from 10.5% to 9.1% of the CPU.
   - planned step 6: 5.7%, of which about 5% of per-cell work (write zone, read, rule memo, write);
   - prediction: 2.2%, of which 0.6% for the upload to the GPU and 0.5% for the sphere draws;
   - ores left on the CPU: 1.15%.
