@@ -105,6 +105,17 @@ blocks, possible folding per biome) do not change the result: the GPU evaluates 
     extensions** (4,595 from pillars over 13,640 eroded badlands columns, 344,000 from icebergs over
     frozen_ocean and deep_frozen_ocean), plus wooded_badlands; the snowy slopes zone stays at
     0 mismatches. `HORIZON_GPU_SURFACE_SKIP_EXT=1` still skips these columns if needed.
+  - **Correction (17/11/2026)**: "both only depend on the fill codes" was wrong for the iceberg.
+    Vanilla runs it after the rule of its column, and where the rule leaves water or air in place of
+    the default block, the iceberg reads that block, may fill it, and draws one more random number:
+    the rest of its column shifts. Found by `tools/gpu_worldgen.py pregen` and `compare-worlds`
+    (BENCHMARKS.md): packed ice and water swapped on 40 blocks of one deep frozen ocean chunk of seed
+    12345 (chunk −439384 440048), and 20 blocks of packed ice against air in two chunks near
+    437490 −438805; the 1,468 chunks above had no such column. `ksf_heads` now keeps the top of each
+    iceberg's descent (`COLI` slot 9), and `ksf_blocks` raises error bit 2 where the rule leaves air or
+    a fluid inside it: the chunk then takes the CPU's surface (1 chunk out of 64 around the first
+    one). The surface test mode no longer compares the chunks it sends to the CPU, and the probe of
+    `tools/gpu_worldgen.py` covers the zone with the surface in test mode.
 
 - **S5, integration (15/11/2026)**: `HORIZON_GPU_SURFACE=1` (with `HORIZON_GPU_DENSITY`).
   - `SurfaceGpu::chunk_states` returns the final state of each block (fill then surface) on 32 bits:

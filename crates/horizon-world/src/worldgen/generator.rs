@@ -2884,7 +2884,10 @@ where
         let (mut mismatches, mut blocks, mut ignored, mut changes, mut ext) =
             (0u64, 0u64, 0u64, 0u64, 0u64);
         let mut example = None;
-        for lz in 0..16usize {
+        // A chunk the GPU sends to the CPU (`error`: a condition it cannot evaluate, an iceberg under a
+        // rule) keeps the CPU's surface: counted, not compared
+        let rows = if error { 0 } else { 16usize };
+        for lz in 0..rows {
             for lx in 0..16usize {
                 let lc = lx + lz * 16;
                 let col = &codes[lc * h..(lc + 1) * h];

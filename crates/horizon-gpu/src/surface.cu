@@ -154,9 +154,10 @@ __device__ int sf_pillar(const signed char *col, int x, int z, int otop) {
 }
 // MaterialExtensions::frozen_ocean_with_melt, after the descent: writes packed ice and snow into
 // `output` (state + 1), returns the highest y written (SF_NOTHING if none). b: biome of the column
-// (at its first free y).
+// (at its first free y). `top`: the first y of its descent (down to `minimum`) when it has one, for the
+// check of the rule's results (ksf_blocks).
 __device__ int sf_iceberg(const signed char *col, unsigned *output, int x, int z, int otop, int minimum, int b,
-                          unsigned long long RLO, unsigned long long RHI, int *error) {
+                          unsigned long long RLO, unsigned long long RHI, int *error, int *top) {
   double dx = (double)x, dz = (double)z;
   double amp = sf_jmin_d(fabs((double)IC_S(dx, 0.0, dz) * 8.25), (double)__fmul_rn(IC_P(dx * 1.28, 0.0, dz * 1.28), 15.0f));
   if (amp <= 1.8) return SF_NOTHING;
@@ -177,6 +178,7 @@ __device__ int sf_iceberg(const signed char *col, unsigned *output, int x, int z
   int n = 0, plus = SF_NOTHING;
   int start_y = (int)((unsigned)ihigh + 1u);
   if (otop > start_y) start_y = otop;
+  *top = start_y;
   for (int y = start_y; y >= minimum; --y) {
     int k = sf_code(col, y);
     // The draws follow Horizon's short circuits

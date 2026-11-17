@@ -1980,9 +1980,13 @@ extern "C" __global__ void ksf_heads(const signed char *CODES, const unsigned sh
   int depth = (int)(((double){pt_surf}((double)x, 0.0, (double)z) * 2.75 + 3.0) + {depth_double} * 0.25);
   double secondary = (double){pt_sec}((double)x, 0.0, (double)z);
   int minimum = (int)((unsigned)floor_sat((double)floorf(PL[lc])) + (unsigned)depth - 8u);
-  // The pillar before the descent of its column, the iceberg after. They only depend on the codes (the
-  // iceberg only writes into air and water, never over a block of the rule) and raise the first free y.
+  // The pillar before the descent of its column, the iceberg after. They depend on the codes and raise
+  // the first free y. The iceberg writes only into air and water, never over a block of the rule, but it
+  // reads its column after the rule in vanilla: ksf_blocks sends a chunk whose rule leaves air or a fluid
+  // in an iceberg's descent to the CPU.
   int plo = 1, phi = 0, ptop = otop, ftop = otop;
+  // The top of the iceberg's descent (sf_iceberg), none below the world
+  int ice_top = -2147483647 - 1;
 #ifdef SF_EXT
   int bcol;
   {{
@@ -2001,12 +2005,13 @@ extern "C" __global__ void ksf_heads(const signed char *CODES, const unsigned sh
     }}
   }}
   if (bcol >= 0 && (bcol == SF_FROZEN0 || bcol == SF_FROZEN1)) {{
-    int plus = sf_iceberg(col, ICE + (long)lc * SF_H, x, z, otop, minimum, bcol, {rlo}ull, {rhi}ull, &error);
+    int plus = sf_iceberg(col, ICE + (long)lc * SF_H, x, z, otop, minimum, bcol, {rlo}ull, {rhi}ull, &error, &ice_top);
     if (plus != SF_NOTHING && plus + 1 > ftop) ftop = plus + 1;
   }}
 #endif
   int *ci = COLI + 10 * lc;
   ci[0] = otop; ci[1] = ptop; ci[2] = ftop; ci[3] = depth; ci[4] = minimum; ci[5] = plo; ci[6] = phi;
+  ci[9] = ice_top;
   COLD[lc] = secondary;
   if (error) atomicOr(ERR, 1);
 }}
@@ -2094,6 +2099,9 @@ extern "C" __global__ void ksf_blocks(const signed char *CODES, const unsigned s
     int r = R_{root}(c);
     if (r >= 0) o = sf_fluid(r) ? (r | 0x40000000) : r;
     if (c.error) atomicOr(ERR, 1);
+    // The iceberg (heads) read this block as the default block; vanilla runs it after the rule, so a
+    // rule that leaves air or a fluid inside its descent changes the iceberg: the CPU does this chunk.
+    if (r >= 0 && y >= ci[4] && y <= ci[9] && (r == SF_E_AIR || sf_fluid(r))) atomicOr(ERR, 2);
   }}
   int k = CODES[i];
   int e = o >= 0 ? o : ((k & 3) == 0 ? SF_E_DEFAULT : ((k & 3) == 1 ? SF_E_AIR : ((k & 3) == 2 ? SF_E_FLUID : SF_E_LAVA)));
