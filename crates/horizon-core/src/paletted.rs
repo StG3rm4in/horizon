@@ -105,8 +105,82 @@ impl std::error::Error for PaletteError {}
 enum Palette {
     Single(u32),
     /// Linear and hash-map palettes alike: ids in insertion order.
-    List(Vec<u32>),
+    List(Ids),
     Global,
+}
+/// The ids of a list palette, in the container itself up to [`INLINE_IDS`] of them (every block
+/// palette of 4 bits or fewer, every biome palette). A read then finds them on the container's own
+/// cache lines: in an allocation of their own they were one more cache miss per block read, about
+/// 2 ms of the server tick at 100 players.
+#[derive(Clone)]
+enum Ids {
+    Inline(u8, [u32; INLINE_IDS]),
+    Heap(Vec<u32>),
+}
+const INLINE_IDS: usize = 16;
+impl Ids {
+    fn new() -> Self {
+        Self::Inline(0, [0; INLINE_IDS])
+    }
+    #[inline]
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Self::Inline(len, ids) => &ids[..usize::from(*len)],
+            Self::Heap(ids) => ids,
+        }
+    }
+    fn push(&mut self, id: u32) {
+        match self {
+            Self::Inline(len, ids) if usize::from(*len) < INLINE_IDS => {
+                ids[usize::from(*len)] = id;
+                *len += 1;
+            }
+            Self::Inline(_, ids) => {
+                let mut heap = Vec::with_capacity(2 * INLINE_IDS);
+                heap.extend_from_slice(ids);
+                heap.push(id);
+                *self = Self::Heap(heap);
+            }
+            Self::Heap(ids) => ids.push(id),
+        }
+    }
+    /// Heap bytes held: none inline.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Inline(..) => 0,
+            Self::Heap(ids) => ids.capacity() * 4,
+        }
+    }
+}
+impl std::ops::Deref for Ids {
+    type Target = [u32];
+    #[inline]
+    fn deref(&self) -> &[u32] {
+        self.as_slice()
+    }
+}
+impl From<Vec<u32>> for Ids {
+    fn from(ids: Vec<u32>) -> Self {
+        if ids.len() <= INLINE_IDS {
+            let mut inline = [0; INLINE_IDS];
+            inline[..ids.len()].copy_from_slice(&ids);
+            Self::Inline(ids.len() as u8, inline)
+        } else {
+            Self::Heap(ids)
+        }
+    }
+}
+/// The same ids, inline or not.
+impl PartialEq for Ids {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+impl Eq for Ids {}
+impl std::fmt::Debug for Ids {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_slice().fmt(f)
+    }
 }
 /// Words of `bits`-wide values: `entries.div_ceil(64 / bits)`.
 pub fn storage_len(bits: u8, entries: usize) -> usize {
@@ -323,7 +397,7 @@ impl PalettedContainer {
     }
     pub fn palette(&self) -> Option<&[u32]> {
         match &self.palette {
-            Palette::List(list) => Some(list),
+            Palette::List(list) => Some(list.as_slice()),
             _ => None,
         }
     }
@@ -492,7 +566,7 @@ impl PalettedContainer {
         let entries = strategy.entries();
         let mut palette = match config {
             Config::Single => Palette::Single(last),
-            Config::List(_) => Palette::List(Vec::new()),
+            Config::List(_) => Palette::List(Ids::new()),
             Config::Global => Palette::Global,
         };
         let mut words = vec![0u64; storage_len(storage_bits, entries)];
@@ -645,7 +719,7 @@ impl PalettedContainer {
                 packed: true,
                 bits,
                 words: remap_words(src_bits, src_words, bits, entries, id),
-                palette: Palette::List(palette),
+                palette: Palette::List(palette.into()),
             },
             Config::Global => {
                 let bits = strategy.global_bits;
@@ -672,7 +746,7 @@ impl PalettedContainer {
                 packed: false,
                 bits,
                 words: pack_words(bits, ids.len(), ids.iter().copied()),
-                palette: Palette::List(palette),
+                palette: Palette::List(palette.into()),
             },
             Config::Global => {
                 let bits = strategy.global_bits;
@@ -719,7 +793,7 @@ impl PalettedContainer {
                     strategy,
                     packed: false,
                     bits,
-                    palette: Palette::List(palette),
+                    palette: Palette::List(palette.into()),
                     words,
                 };
                 container.check_indices()?;
@@ -791,7 +865,7 @@ impl PalettedContainer {
     pub fn to_wire(&self) -> (u8, Vec<u32>, &[u64]) {
         let palette = match &self.palette {
             Palette::Single(value) => vec![*value],
-            Palette::List(list) => list.clone(),
+            Palette::List(list) => list.to_vec(),
             Palette::Global => Vec::new(),
         };
         (self.bits, palette, &self.words)
@@ -819,7 +893,7 @@ impl PalettedContainer {
             && let Palette::List(list) = &self.palette
         {
             let fast = Packed {
-                palette: list.clone(),
+                palette: list.to_vec(),
                 bits: self.bits,
                 data: Some(self.words.clone()),
             };
@@ -909,7 +983,7 @@ impl PalettedContainer {
                 packed: false,
                 bits,
                 words: data.to_vec(),
-                palette: Palette::List(palette),
+                palette: Palette::List(palette.into()),
             };
             container.check_indices()?;
             return Ok(container);
@@ -981,7 +1055,7 @@ impl PalettedContainer {
     pub fn heap_bytes(&self) -> usize {
         self.words.capacity() * 8
             + match &self.palette {
-                Palette::List(list) => list.capacity() * 4,
+                Palette::List(list) => list.heap_bytes(),
                 _ => 0,
             }
     }
@@ -1009,6 +1083,21 @@ impl PartialEq for PalettedContainer {
 
 #[cfg(test)]
 mod tests {
+    /// A list palette's ids grow past what the container holds inline in order, and the same ids
+    /// are equal inline or not.
+    #[test]
+    fn list_ids_spill_from_inline_in_order() {
+        use super::{INLINE_IDS, Ids};
+        let mut ids = Ids::new();
+        for n in 1..=40u32 {
+            ids.push(n * 7);
+            let expected: Vec<u32> = (1..=n).map(|i| i * 7).collect();
+            assert_eq!(ids.as_slice(), &expected[..]);
+            assert_eq!(matches!(ids, Ids::Inline(..)), n as usize <= INLINE_IDS);
+            assert_eq!(ids, Ids::Heap(expected.clone()));
+            assert_eq!(Ids::from(expected), ids);
+        }
+    }
     /// `pack`'s shortcut for a container `from_values` or `from_mapped` built gives what packing
     /// it in full gives; a write takes the shortcut away.
     #[test]
@@ -1308,7 +1397,7 @@ mod tests {
                 packed: false,
                 strategy,
                 bits,
-                palette: Palette::List((0..len as u32).collect()),
+                palette: Palette::List((0..len as u32).collect::<Vec<_>>().into()),
                 words: words.to_vec(),
             };
             match (container.check_indices(), scan(strategy, bits, len, words)) {
@@ -1422,7 +1511,7 @@ mod tests {
                     packed: false,
                     strategy,
                     bits,
-                    palette: Palette::List(palette),
+                    palette: Palette::List(palette.into()),
                     words: data.to_vec(),
                 },
                 _ => PalettedContainer::build(strategy, palette, &ids),
