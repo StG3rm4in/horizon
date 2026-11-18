@@ -2269,7 +2269,7 @@ impl SurfaceGpu {
         }
         let n = 256 * self.height as usize;
         let st = priority_stream(&self.ctx)?;
-        Ok(SurfaceResources {
+        let res = SurfaceResources {
             pl: st.alloc_zeros::<f32>(256).ctx("preliminary surface")?,
             cd: st.alloc_zeros::<i8>(n).ctx("codes")?,
             bd: st.alloc_zeros::<u16>(self.biome_count()).ctx("biomes")?,
@@ -2291,7 +2291,13 @@ impl SurfaceGpu {
             }
             .ctx("host buffer")?,
             st,
-        })
+        };
+        // The buffers are allocated and zeroed on their own stream, but `chunk_blocks_surface` fills
+        // and reads them on the stream of the chunk's codes, which does not wait for this one (event
+        // tracking is off): the zeroing could land after the upload of the biomes and of the
+        // preliminary surface, and the chunk got biome 0 (badlands) and a surface at y 0.
+        res.st.synchronize().ctx("surface buffers")?;
+        Ok(res)
     }
     /// The chunk's final states (fill then surface, extensions included) in fill_noise order: the
     /// state on 30 bits, bit 31 when the fill schedules a fluid update (code + 4 on water or lava),
