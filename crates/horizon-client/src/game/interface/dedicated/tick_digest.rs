@@ -7,7 +7,8 @@
 //! `HORIZON_TICK_DIGEST_FULL` ticks (default 20, 0 for never), the blocks and light of every loaded
 //! section. Two runs of one fixture must write the same lines: the first line that differs names the
 //! tick and the part. `HORIZON_TICK_DIGEST_DETAIL=FROM-TO` also writes the rows behind the hashes of
-//! those ticks to `FILE.detail`, to find what differs.
+//! those ticks to `FILE.detail`, to find what differs (on full ticks, a row per section with the hash
+//! of its blocks and of its light).
 //!
 //! The fixture (`HORIZON_TICK_FIXTURE_TICKS=N`): the server runs N ticks back to back, then stops.
 //! Before each tick it runs the console commands of `HORIZON_TICK_FIXTURE_COMMANDS` (lines
@@ -523,6 +524,18 @@ impl Game<'_> {
                         *l = section.light.get(i);
                     }
                     part.add((key, s, &blocks[..], &light[..]));
+                    if detailed {
+                        let (mut b, mut l) = (DefaultHasher::new(), DefaultHasher::new());
+                        blocks[..].hash(&mut b);
+                        light[..].hash(&mut l);
+                        rows.push(format!(
+                            "f {} {} {s} {:016x} {:016x}",
+                            key.0,
+                            key.1,
+                            b.finish(),
+                            l.finish()
+                        ));
+                    }
                 }
                 part.add(chunk.block_entities.len());
             }

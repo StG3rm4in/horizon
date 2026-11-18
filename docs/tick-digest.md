@@ -25,7 +25,7 @@ variables (the tool sets them):
 |---|---|
 | `HORIZON_TICK_DIGEST=FILE` | one line per tick, and a line `0` for the state before the first tick |
 | `HORIZON_TICK_DIGEST_FULL=N` | the blocks and light of every loaded section every N ticks (default 20, 0 never) |
-| `HORIZON_TICK_DIGEST_DETAIL=FROM-TO` | the rows behind the hashes of those ticks, in `FILE.detail` |
+| `HORIZON_TICK_DIGEST_DETAIL=FROM-TO` | the rows behind the hashes of those ticks, in `FILE.detail` (on full ticks, one per section: its blocks' and its light's hash) |
 | `HORIZON_TICK_FIXTURE_TICKS=N` | the fixture mode: N ticks back to back, then the server stops |
 | `HORIZON_TICK_FIXTURE_COMMANDS=FILE` | console commands run before given ticks (lines `TICK COMMAND`) |
 | `HORIZON_TICK_FIXTURE_PLAYERS=N` | simulated players, one every `HORIZON_TICK_FIXTURE_JOIN_EVERY` ticks (default 10) |
@@ -75,11 +75,10 @@ they never answer keep-alives (a channel sender has none).
 
 ## Generation
 
-`--gpu` generates with every GPU stage; the default is the CPU. With the GPU, two runs of one fixture
-can differ before the first tick: blocks and light (the full hash) and the scheduled fluid ticks of a
-few chunks, and the light results come back in another order. GPU generation is not yet the same from
-one run to the next, which is a generation question, not a tick one; until it is, check the tick on CPU
-generation, or on a world generated once and copied for each run.
+The default is the CPU. `--gpu` generates with every GPU stage, the density kernels compiled before the
+first chunk (`HORIZON_GPU_DENSITY=wait`; with `1`, the chunks generated while they compile take the
+CPU). A light job on the GPU counts as running until its result is sent, so the fixture mode waits for
+it as for a worker's job. A fixture gives the same digest with the GPU as with the CPU, tick for tick.
 
 ## Measured on 18/11/2026
 
@@ -96,3 +95,14 @@ generation, or on a world generated once and copied for each run.
 What it took to get there, in the order the digest showed it: the startup's spawn search took chunk
 results as they came; `/forceload add` loads each chunk at once, taking the first result to finish;
 the take of a plan update while jobs still ran; and superseded light results.
+
+With the GPU (later the same day): the light jobs on the GPU were not counted as running, so their
+results came in other batches; then 3 runs in 24 still differed in content, one chunk at a time, and
+the rows per section showed a chunk with the surface of badlands (biome 0), terracotta down to y -16,
+around it the trees it no longer had. A new set of surface buffers is zeroed on its own CUDA stream
+while the surface fills it on the stream of the chunk's codes, and event tracking is off: the zeroing
+could land after the upload of the biomes and of the preliminary surface. That happens while the
+buffer pool fills, at the start of a server, and the chunk is saved so. Fixed in
+`SurfaceGpu::resource` (horizon-gpu), which waits for its stream: 72 one-tick runs identical to each
+other and to the CPU's, and 400 ticks with 20 players, 4 GPU runs identical to each other and to a
+CPU run at every tick.

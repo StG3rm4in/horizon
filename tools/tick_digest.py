@@ -76,6 +76,10 @@ def run(bin_dir, out, ticks, commands, seed, gpu, full, players=0, join_every=10
         env.pop(f"HORIZON_GPU_{stage}", None)
         if gpu:
             env[f"HORIZON_GPU_{stage}"] = "1"
+    if gpu:
+        # The density kernels compiled before the first chunk: with `1` the chunks generated while
+        # they compile take the CPU, as many as the timing gives.
+        env["HORIZON_GPU_DENSITY"] = "wait"
     if detail:
         env["HORIZON_TICK_DIGEST_DETAIL"] = detail
     # Generous: the startup's generation, then the ticks (a player's flight adds chunk work).
@@ -138,7 +142,7 @@ def detail_diff(a, b, limit=20):
     ra = Path(str(a) + ".detail").read_text().splitlines()
     rb = Path(str(b) + ".detail").read_text().splitlines()
     shown = 0
-    for kind in "wsepcma":
+    for kind in "wsepcmaf":
         xa = [r for r in ra if r.startswith(kind + " ")]
         xb = [r for r in rb if r.startswith(kind + " ")]
         if xa == xb:
@@ -165,8 +169,7 @@ def main():
         p.add_argument("--commands", help="fixture commands file (lines TICK COMMAND)")
         p.add_argument("--seed", default="12345")
         p.add_argument("--gpu", action="store_true",
-                       help="generate with every GPU stage (default: the CPU; GPU generation is not yet the"
-                            " same from one run to the next)")
+                       help="generate with every GPU stage (default: the CPU)")
         p.add_argument("--full", type=int, default=20, help="full block and light hash every N ticks")
         p.add_argument("--players", type=int, default=0, help="simulated players (horizon-bots mixed)")
         p.add_argument("--join-every", type=int, default=10, help="ticks between two players joining")

@@ -971,6 +971,9 @@ struct WorkerLocal<W> {
 struct GpuLighting {
     gpu: std::sync::OnceLock<Option<Arc<horizon_gpu::LightGpu>>>,
     send: Mutex<std::sync::mpsc::Sender<PendingLight>>,
+    /// A job on the GPU counts as running (`Shared::active`) from its submission until its result
+    /// is sent, as it would on a worker: the fixture mode's wait for quiescence waits for it too.
+    shared: Arc<Shared>,
 }
 struct PendingLight {
     x: i32,
@@ -996,6 +999,7 @@ impl GpuLighting {
             _ => return None,
         };
         let (send, recv) = std::sync::mpsc::channel::<PendingLight>();
+        let streamer = shared.clone();
         std::thread::Builder::new()
             .name("horizon-gpu-light".into())
             .spawn(move || {
@@ -1026,12 +1030,17 @@ impl GpuLighting {
                     shared
                         .done
                         .send(Done::Lit(p.x, p.z, lights.unwrap(), p.seq));
+                    // Sent: no longer running (counted in `submit`).
+                    shared
+                        .active
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             })
             .ok()?;
         Some(Arc::new(Self {
             gpu: std::sync::OnceLock::new(),
             send: Mutex::new(send),
+            shared: streamer,
         }))
     }
     /// Send a light job to the GPU; the region comes back when the GPU does not take it.
@@ -1080,7 +1089,14 @@ impl GpuLighting {
             job,
             gpu: gpu.clone(),
         };
+        // Counted before the worker that submits it stops counting its own job.
+        self.shared
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.send.lock().unwrap().send(pending).map_err(|e| {
+            self.shared
+                .active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             let p = e.0;
             p.gpu.finish(p.job);
             p.region
