@@ -235,7 +235,7 @@ impl Game<'_> {
         let shared = host.hub.lan.shared.clone();
         let next = fixture.ran + 1;
         while fixture.players.len() < fixture.player_count
-            && next >= 1 + fixture.players.len() as u64 * fixture.join_every
+            && next > fixture.players.len() as u64 * fixture.join_every
         {
             let index = fixture.players.len();
             let name = format!("fixture{index}");
