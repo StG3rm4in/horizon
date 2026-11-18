@@ -104,19 +104,26 @@ fn choose(
     {
         return Some(conn);
     }
+    // The nearest targetable player, else the nearest one that is not a spectator: both in one
+    // walk of the guests (every mob does this every tick), each keeping its first nearest as a
+    // walk of its own would.
     let d = |v: &PlayerView| at.distance_squared(v.position);
-    let nearest = |ok: &dyn Fn(&PlayerView) -> bool| {
-        let mut best = host.filter(|v| ok(v)).map(|v| (None, d(v)));
-        for (conn, v) in guests.iter().filter(|(_, v)| ok(v)) {
-            if best.is_none_or(|(_, b)| d(v) < b) {
-                best = Some((Some(*conn), d(v)));
-            }
+    let present = |v: &PlayerView| v.alive && !v.spectator;
+    let mut target = host.filter(|v| targetable(v)).map(|v| (None, d(v)));
+    let mut nearest = host.filter(|v| present(v)).map(|v| (None, d(v)));
+    for (conn, v) in guests {
+        if !present(v) {
+            continue;
         }
-        best
-    };
-    nearest(&targetable)
-        .or_else(|| nearest(&|v: &PlayerView| v.alive && !v.spectator))
-        .and_then(|(conn, _)| conn)
+        let distance = d(v);
+        if !v.creative && target.is_none_or(|(_, b)| distance < b) {
+            target = Some((Some(*conn), distance));
+        }
+        if nearest.is_none_or(|(_, b)| distance < b) {
+            nearest = Some((Some(*conn), distance));
+        }
+    }
+    target.or(nearest).and_then(|(conn, _)| conn)
 }
 
 /// The events of a mob's tick that act on the player it sees.

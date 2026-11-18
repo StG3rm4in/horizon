@@ -333,48 +333,79 @@ thread_local! {
     /// of for every turn (players x turns a tick). A guest's entry is refreshed
     /// when its turn ends ([`refresh_building_player`]), so the turns after it
     /// see it where it went (a pearl, a death, spectator mode).
-    static BUILDING_CACHE: std::cell::RefCell<Option<HubBodies>> =
+    static BUILDING_CACHE: std::cell::RefCell<Option<BuildingCache>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// The cached bodies, with the stamp of the guest row each was built from
+/// (`GuestList::stamp`) and the list's layout when they were built.
+struct BuildingCache {
+    bodies: HubBodies,
+    stamps: Vec<u64>,
+    layout: u64,
 }
 
 /// The hub's current bodies, across dimensions. A borrowed ancestor's
 /// live body takes precedence over this saved state until its turn returns.
 fn building_players(host: &LanHost) -> HubBodies {
-    let guests: Vec<_> = host.hub.guests.simulation_iter().collect();
+    let guests = &host.hub.guests;
     let kept = BUILDING_CACHE.with(|c| {
         c.borrow()
             .as_ref()
-            .filter(|list| {
-                list.len() == guests.len()
-                    && list
-                        .iter()
-                        .zip(&guests)
-                        .all(|(p, g)| p.get().conn == Some(g.conn))
+            .filter(|cache| {
+                // The same layout: the same guests in the same order, so the same connections
+                // as when the cache was built (a refresh never changes a body's connection).
+                cache.layout == guests.layout()
+                    || cache.bodies.len() == guests.simulation_len()
+                        && cache
+                            .bodies
+                            .iter()
+                            .zip(guests.simulation_iter())
+                            .all(|(p, g)| p.get().conn == Some(g.conn))
             })
-            .cloned()
+            .map(|cache| cache.bodies.clone())
     });
-    kept.unwrap_or_else(|| shared(guests.into_iter().map(building_player)))
+    kept.unwrap_or_else(|| shared(guests.simulation_iter().map(building_player)))
 }
 
 /// Builds the hub's bodies once for the turns to come (`Some`), or drops them.
 pub(super) fn building_cache(host: Option<&LanHost>) {
-    let bodies = host.map(|host| shared(host.hub.guests.simulation_iter().map(building_player)));
-    BUILDING_CACHE.with(|c| *c.borrow_mut() = bodies);
+    let cache = host.map(|host| {
+        let guests = &host.hub.guests;
+        BuildingCache {
+            bodies: shared(guests.simulation_iter().map(building_player)),
+            stamps: guests
+                .simulation_indexed_iter()
+                .map(|(index, _)| guests.stamp(index))
+                .collect(),
+            layout: guests.layout(),
+        }
+    });
+    BUILDING_CACHE.with(|c| *c.borrow_mut() = cache);
 }
 
 /// The cached bodies as they are now in the hub, after `conn`'s turn (or its
 /// death step). Every entry, not only the actor's: a turn can move, kill or
 /// change another guest too (`/tp`, an attack, an explosion), and the turns
 /// after it must see that guest where it is now, as a list built afresh would.
-/// Copies into the shared cells, no allocation.
+/// Copies into the shared cells, no allocation; only the bodies whose guest row
+/// changed since they were built (its stamp), usually the actor's alone.
 fn refresh_building_player(host: &LanHost, _conn: u32) {
+    let guests = &host.hub.guests;
     BUILDING_CACHE.with(|c| {
-        if let Some(list) = c.borrow().as_ref()
-            && list.len() == host.hub.guests.simulation_iter().count()
+        if let Some(cache) = c.borrow_mut().as_mut()
+            && cache.bodies.len() == guests.simulation_len()
         {
-            for (p, g) in list.iter().zip(host.hub.guests.simulation_iter()) {
-                if p.get().conn == Some(g.conn) {
+            let BuildingCache { bodies, stamps, .. } = cache;
+            for ((p, stamp), (index, g)) in bodies
+                .iter()
+                .zip(stamps.iter_mut())
+                .zip(guests.simulation_indexed_iter())
+            {
+                // The row this body was built from, unchanged: building it again gives it.
+                if p.get().conn == Some(g.conn) && *stamp != guests.stamp(index) {
                     p.set(building_player(g));
+                    *stamp = guests.stamp(index);
                 }
             }
         }
