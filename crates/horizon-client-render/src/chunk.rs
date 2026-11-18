@@ -452,7 +452,29 @@ impl Light {
         match self {
             Self::Full(a) => a.clone(),
             Self::Uniform(v) => Box::new([*v; 4096]),
-            _ => Box::new(std::array::from_fn(|i| self.get(i))),
+            _ => {
+                let mut a = Box::new([0; 4096]);
+                self.write_to(&mut a);
+                a
+            }
+        }
+    }
+    /// The packed light of every block, in index order, into `out` (`get` for each).
+    pub fn write_to(&self, out: &mut [u8; 4096]) {
+        match self {
+            Self::Uniform(v) => out.fill(*v),
+            Self::Full(a) => out.copy_from_slice(&a[..]),
+            // (two blocks per layer byte, the even one in the low nibble)
+            Self::Sky(layer, block) => {
+                for (pair, &b) in out.as_chunks_mut::<2>().0.iter_mut().zip(layer.iter()) {
+                    *pair = [(b & 15) << 4 | block, (b & 0xF0) | block];
+                }
+            }
+            Self::Block(layer, sky) => {
+                for (pair, &b) in out.as_chunks_mut::<2>().0.iter_mut().zip(layer.iter()) {
+                    *pair = [sky << 4 | (b & 15), sky << 4 | b >> 4];
+                }
+            }
         }
     }
     /// Whether any block's packed light has a bit of `mask` set.
@@ -1092,6 +1114,26 @@ pub struct ChunkExtras {
 
 #[cfg(test)]
 mod tests {
+    /// `write_to` and `to_array` give `get` of every cell, in every form.
+    #[test]
+    fn unpacked_light_is_get_of_every_cell() {
+        let lights = [
+            super::Light::Uniform(0x9c),
+            super::Light::Sky(Box::new(std::array::from_fn(|i| (i * 37 % 251) as u8)), 7),
+            super::Light::Block(Box::new(std::array::from_fn(|i| (i * 53 % 241) as u8)), 11),
+            super::Light::Full(Box::new(std::array::from_fn(|i| (i * 29 % 256) as u8))),
+        ];
+        for light in &lights {
+            let mut out = [0; 4096];
+            light.write_to(&mut out);
+            let array = light.to_array();
+            for i in 0..4096 {
+                assert_eq!(out[i], light.get(i), "{i}");
+                assert_eq!(array[i], light.get(i), "{i}");
+            }
+        }
+    }
+
     #[test]
     fn a_worlds_extra_levels_keep_their_shape_and_type() {
         let shape = super::LevelShape::new(-128, 448, 448, true, false).unwrap();

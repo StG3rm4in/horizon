@@ -949,25 +949,27 @@ pub fn apply_lighting(chunk: &mut Chunk, lights: Vec<Light>) {
 pub fn apply_relighting(chunk: &mut Chunk, lights: Vec<Light>, changed: &mut LightChanges) {
     changed.keyed(chunk.layout());
     for (sy, (section, light)) in chunk.sections.iter_mut().zip(lights).enumerate() {
-        let old = &section.light;
-        let classes = match (old, &light) {
-            (Light::Uniform(a), Light::Uniform(b)) if a == b => continue,
-            // (most sections of a chunk relit for a neighbour's edit keep their light: one comparison of the whole)
-            (Light::Full(a), Light::Full(b)) => LightChanges::classes_differing(a, b),
-            _ => {
-                let mut classes = 0;
-                for i in 0..4096 {
-                    if old.get(i) != light.get(i) {
-                        let (x, y, z) = (i as i32 & 15, (i >> 8) as i32, (i >> 4) as i32 & 15);
-                        classes |= 1 << LightChanges::class(x, y, z);
-                    }
-                }
-                classes
-            }
-        };
+        let classes = light_classes_differing(&section.light, &light);
         if classes != 0 {
             changed.add((chunk.x, sy as i32, chunk.z), classes);
             Arc::make_mut(section).light = light;
+        }
+    }
+}
+
+/// The classes ([`LightChanges::class`]) of the cells whose packed light differs.
+fn light_classes_differing(old: &Light, new: &Light) -> u32 {
+    match (old, new) {
+        (Light::Uniform(a), Light::Uniform(b)) if a == b => 0,
+        // (most sections of a chunk relit for a neighbour's edit keep their light: one comparison of the whole)
+        (Light::Full(a), Light::Full(b)) => LightChanges::classes_differing(a, b),
+        // Other forms unpacked first, so that a row of 16 alike is one comparison too: through
+        // `Light::get` a cell at a time, this was most of the relit columns' cost on the tick.
+        _ => {
+            let (mut a, mut b) = ([0; 4096], [0; 4096]);
+            old.write_to(&mut a);
+            new.write_to(&mut b);
+            LightChanges::classes_differing(&a, &b)
         }
     }
 }
@@ -1204,7 +1206,9 @@ impl<'w> Region<'w> {
             let Some(light) = slot.light else {
                 continue;
             };
-            if (0..4096).all(|i| slot.section.light(i) == light[i]) {
+            let mut before = [0; 4096];
+            slot.section.light.write_to(&mut before);
+            if before == *light {
                 continue;
             }
             // Drop the clone first so the world's section isn't copied.
@@ -2202,6 +2206,60 @@ pub(crate) mod tests {
         for (section, light) in world[&(0, 0)].sections.iter().zip(fresh) {
             for i in 0..4096 {
                 assert_eq!(section.light(i), light.get(i));
+            }
+        }
+    }
+
+    /// Whatever the forms of the two lights, the classes of the changed cells are those a
+    /// comparison cell by cell finds.
+    #[test]
+    fn light_classes_differing_matches_the_cells() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Each array in its packed form and as a full one: uniform, sky varying, block varying, both.
+        let mut arrays = Vec::new();
+        for kind in 0..4 {
+            let (sky, block) = (next() as u8 & 15, next() as u8 & 15);
+            let base: [u8; 4096] = std::array::from_fn(|_| {
+                let r = next();
+                let s = if kind & 1 != 0 { r as u8 & 15 } else { sky };
+                let b = if kind & 2 != 0 {
+                    (r >> 8) as u8 & 15
+                } else {
+                    block
+                };
+                s << 4 | b
+            });
+            arrays.push(base);
+            // The same with a few cells changed, at faces and inside.
+            for changes in [1, 3, 40] {
+                let mut a = base;
+                for _ in 0..changes {
+                    let i = next() as usize % 4096;
+                    a[i] = next() as u8;
+                }
+                arrays.push(a);
+            }
+        }
+        let lights: Vec<Light> = arrays
+            .iter()
+            .flat_map(|a| [Light::from_slice(a), Light::Full(Box::new(*a))])
+            .collect();
+        for old in &lights {
+            for new in &lights {
+                let mut expected = 0;
+                for i in 0..4096 {
+                    if old.get(i) != new.get(i) {
+                        let (x, y, z) = (i as i32 & 15, (i >> 8) as i32, (i >> 4) as i32 & 15);
+                        expected |= 1 << LightChanges::class(x, y, z);
+                    }
+                }
+                assert_eq!(super::light_classes_differing(old, new), expected);
             }
         }
     }
