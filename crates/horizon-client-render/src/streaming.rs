@@ -326,6 +326,23 @@ pub enum Done {
     /// A proto chunk back from `Job::LightView`, with its view.
     LightView(i32, i32, Proto, Option<Chunk>),
 }
+impl Done {
+    /// The fixture mode's order of a batch of results: by kind, then column.
+    fn order_key(&self) -> (u8, i32, i32, i64) {
+        match self {
+            Self::Generated(chunk) => (0, chunk.x, chunk.z, 0),
+            Self::Proto(x, z, ..) => (1, *x, *z, 0),
+            Self::Decorated(x, z, ..) => (2, *x, *z, 0),
+            Self::Lit(x, z, _, seq) => (3, *x, *z, *seq as i64),
+            Self::Meshed(x, y, z, _, seq) => (4, *x, *z, (i64::from(*y) << 40) ^ *seq as i64),
+            Self::Saved(protos) => {
+                let first = protos.iter().map(|(key, _)| *key).min().unwrap_or((0, 0));
+                (5, first.0, first.1, protos.len() as i64)
+            }
+            Self::LightView(x, z, ..) => (6, *x, *z, 0),
+        }
+    }
+}
 struct Queued {
     priority: i64,
     /// The column the job is for and what it adds to the column's distance
@@ -365,6 +382,42 @@ struct Shared {
     /// cleared buffers avoids racing the renderer for the process heap.
     meshes: Mutex<MeshPool>,
     aborted: std::sync::atomic::AtomicBool,
+    /// Jobs taken from the queue whose result is not in the mailbox yet (`Streaming::quiescent`).
+    active: std::sync::atomic::AtomicUsize,
+}
+impl Shared {
+    /// The next job, counted running until its `ActiveJob` drops (after its result is sent).
+    fn pop_job(&self) -> Option<Queued> {
+        let mut queue = self.queue.lock().unwrap();
+        let job = queue.pop();
+        if job.is_some() {
+            self.active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        job
+    }
+}
+struct ActiveJob<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for ActiveJob<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The exactness harness's fixture mode (`tick_digest.rs` of the dedicated server): chunk results are
+/// applied in a fixed order instead of the order they finished in.
+static DETERMINISTIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_deterministic(on: bool) {
+    DETERMINISTIC.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn deterministic() -> bool {
+    DETERMINISTIC.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// In the fixture mode, every result applied (`Done::order_key`), a `(255, 0, 0, 0)` row starting each
+/// update: what the digest compares to find where two runs' chunk work parted.
+static APPLIED: std::sync::Mutex<Vec<(u8, i32, i32, i64)>> = std::sync::Mutex::new(Vec::new());
+pub fn take_applied() -> Vec<(u8, i32, i32, i64)> {
+    std::mem::take(&mut *APPLIED.lock().unwrap())
 }
 #[derive(Default)]
 struct MeshPool {
@@ -441,6 +494,16 @@ impl Mailbox {
             Err(TryLockError::WouldBlock) => None,
             Err(TryLockError::Poisoned(e)) => panic!("{e}"),
         }
+    }
+    /// Every finished job, waiting for a worker that is sending, sorted by `Done::order_key`: the
+    /// fixture mode's take.
+    fn take_sorted(&self) -> VecDeque<Done> {
+        let mut done: Vec<Done> = std::mem::take(&mut *self.done.lock().unwrap()).into();
+        done.sort_by_key(Done::order_key);
+        done.into()
+    }
+    fn is_empty(&self) -> bool {
+        self.done.lock().unwrap().is_empty()
     }
     /// Every finished job, or none while a worker is sending.
     fn take(&self) -> VecDeque<Done> {
@@ -1058,9 +1121,11 @@ impl<G: ChunkGenerator> Source for Jobs<G> {
         })
     }
     fn run(&self, worker: usize) -> bool {
-        let Some(job) = self.shared.queue.lock().unwrap().pop() else {
+        let Some(job) = self.shared.pop_job() else {
             return false;
         };
+        // Running until its result is sent, at the end of this function.
+        let _active = ActiveJob(&self.shared.active);
         if self
             .shared
             .aborted
@@ -1283,6 +1348,7 @@ impl Streaming {
             done: Mailbox::default(),
             meshes: Mutex::new(MeshPool::default()),
             aborted: std::sync::atomic::AtomicBool::new(false),
+            active: std::sync::atomic::AtomicUsize::new(0),
         });
         let light_tables = context.light.clone();
         let saves: Arc<dyn Saves> = generator.clone();
@@ -1827,6 +1893,24 @@ impl Streaming {
                 .keys()
                 .any(|section| !self.compile_started.contains_key(section))
     }
+    /// No job queued and none running: every result is in the mailbox (the fixture mode's wait).
+    pub fn quiescent(&self) -> bool {
+        self.shared.queue.lock().unwrap().is_empty()
+            && self.shared.active.load(std::sync::atomic::Ordering::SeqCst) == 0
+    }
+    pub fn wait_quiescent(&self) {
+        while !self.quiescent() {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+    /// Finished jobs whose results the next update applies.
+    pub fn results_waiting(&self) -> bool {
+        !self.shared.done.is_empty()
+    }
+    /// Chunks on their way (queued, running, or finished and not applied yet).
+    pub fn in_flight(&self) -> bool {
+        self.chunks_in_flight() || self.pending() != 0
+    }
     fn chunks_in_flight(&self) -> bool {
         !(self.generating.is_empty()
             && self.decorating == 0
@@ -1926,7 +2010,14 @@ impl Streaming {
         self.relight_edits(world);
         hz_laps.lap("st_relight_edits");
         let deferred = std::mem::take(&mut self.deferred).into_iter();
-        let received = self.shared.done.take();
+        let received = if deterministic() {
+            // Every job finished, so that what is taken never depends on worker timing.
+            self.wait_quiescent();
+            APPLIED.lock().unwrap().push((255, 0, 0, 0));
+            self.shared.done.take_sorted()
+        } else {
+            self.shared.done.take()
+        };
         self.resume_plan_update(
             world,
             PlanResume {
@@ -1947,6 +2038,11 @@ impl Streaming {
             .next()
             .or_else(|| resume.received.pop_front())
         {
+            // A light result is logged once it is known current: whether a superseded one ran
+            // before it was replaced depends on timing, and it changes nothing.
+            if deterministic() && !matches!(done, Done::Lit(..)) {
+                APPLIED.lock().unwrap().push(done.order_key());
+            }
             match done {
                 Done::Proto(x, z, proto, decorated) => {
                     self.generation_scan.exhausted = false;
@@ -1972,6 +2068,9 @@ impl Streaming {
                 Done::Lit(x, z, sections, seq) => {
                     if self.lighting.get(&(x, z)) != Some(&seq) {
                         continue;
+                    }
+                    if deterministic() {
+                        APPLIED.lock().unwrap().push((3, x, z, seq as i64));
                     }
                     self.lighting.remove(&(x, z));
                     let snapshot = self.light_snapshots.remove(&(x, z)).unwrap_or(u64::MAX);
@@ -2966,6 +3065,12 @@ impl Streaming {
     /// Wait up to `timeout` for a worker to finish a job; the next `update`
     /// takes it. A server pumps generation with this between its ticks.
     pub fn wait(&mut self, timeout: std::time::Duration) {
+        // The fixture mode: every job finishes and the next update applies the results in its fixed
+        // order, instead of the first one to finish going first.
+        if deterministic() {
+            self.wait_quiescent();
+            return;
+        }
         if let Some(done) = self.shared.done.recv_timeout(timeout) {
             self.deferred.push(done);
         }

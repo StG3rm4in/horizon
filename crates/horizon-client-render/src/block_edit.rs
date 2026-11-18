@@ -131,6 +131,9 @@ impl World {
                         }
                         vals[at] = r.state;
                         changed[s] = true;
+                        if let Some(writes) = &mut self.digest_writes {
+                            writes.push(((r.x, yy, r.z), r.state));
+                        }
                         any += 1;
                         if tracked_memo.get(old, &mut tracked)
                             || tracked_memo.get(r.state, &mut tracked)

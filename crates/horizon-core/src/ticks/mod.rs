@@ -421,6 +421,36 @@ pub struct LevelTicks {
     collecting: bool,
 }
 impl LevelTicks {
+    /// Every scheduled tick, queued or still saved with its chunk, sorted, for the exactness harness's
+    /// digest: (trigger tick, or minus the delay minus one for a saved one; priority; sub-tick order,
+    /// -1 for a saved one; type; position).
+    pub fn digest_rows(&self) -> Vec<(i64, i8, i64, u32, [i32; 3])> {
+        let row = |t: &ScheduledTick| {
+            (
+                t.trigger_tick,
+                t.priority as i8,
+                t.sub_tick_order,
+                t.kind.0,
+                [t.pos.x, t.pos.y, t.pos.z],
+            )
+        };
+        let mut rows = Vec::new();
+        for ticks in self.chunks.values() {
+            rows.extend(ticks.queue.values.iter().map(row));
+            for t in ticks.pending.iter().flatten() {
+                rows.push((
+                    -i64::from(t.delay) - 1,
+                    t.priority as i8,
+                    -1,
+                    t.kind.0,
+                    [t.pos.x, t.pos.y, t.pos.z],
+                ));
+            }
+        }
+        rows.extend(self.to_run.iter().chain(&self.already_run).map(row));
+        rows.sort_unstable();
+        rows
+    }
     pub fn add_chunk(&mut self, pos: ChunkPos, ticks: ChunkTicks) -> Result<(), TickError> {
         let key = pos.pack();
         if self.chunks.contains_key(&key) {

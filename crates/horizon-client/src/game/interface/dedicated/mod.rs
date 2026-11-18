@@ -46,6 +46,7 @@ pub(super) mod events;
 mod management;
 pub(super) mod report;
 mod status;
+mod tick_digest;
 mod transfer;
 
 /// What the tick loop tells `ServerWatchdog`: when the tick in progress was
@@ -1476,6 +1477,12 @@ impl Game<'_> {
         let _stop_watchdog = StopWatchdog(watchdog.clone());
         let mut braked = Instant::now();
         let mut overload_warned: Option<Instant> = None;
+        // The exactness harness (tick_digest.rs): a digest of every tick, a fixture run.
+        let mut digest = tick_digest::TickDigest::from_env()?;
+        if digest.is_some() {
+            self.world.digest_writes = Some(Vec::new());
+        }
+        let mut fixture = tick_digest::Fixture::from_env()?;
         // `/stop`, or a stop signal (the shutdown hook's `halt`): either way the players and levels are
         // saved below, after the wait `[transfer]` may make (transfer.rs).
         while !self.stop_now(&state) {
@@ -1491,10 +1498,24 @@ impl Game<'_> {
                     self.console_line(&mut state, &line);
                 }
                 self.poll_server_control(&mut state);
+                if let Some(fixture) = &mut fixture {
+                    for command in fixture.due() {
+                        self.console_line(&mut state, &command);
+                    }
+                    self.fixture_players(fixture);
+                }
             }));
             if let Err(payload) = prelude {
                 crashed = Some(panic_message(payload.as_ref()));
                 break;
+            }
+            if fixture.is_some() {
+                self.fixture_settle();
+            }
+            if let Some(digest) = digest.as_mut()
+                && !digest.started
+            {
+                self.write_tick_digest(digest, true)?;
             }
             let players = self.lan.as_ref().map_or(0, |h| h.hub.online_count());
             // Vanilla reads pauseWhenEmptySeconds on every tick, so management changes take effect
@@ -1562,6 +1583,15 @@ impl Game<'_> {
                     break;
                 }
             }
+            if let Some(digest) = digest.as_mut() {
+                self.write_tick_digest(digest, false)?;
+            }
+            if let Some(fixture) = fixture.as_mut() {
+                fixture.ran += 1;
+                if fixture.ran >= fixture.ticks {
+                    self.console_line(&mut state, "stop");
+                }
+            }
             if state.report.as_ref().is_some_and(report::Recording::done) {
                 self.finish_perf_capture(&mut state, StopReason::Normal);
             }
@@ -1592,7 +1622,8 @@ impl Game<'_> {
             );
             self.poll_server_memory_snapshot(&mut state);
             // The far ring's brake, once a second on the average tick.
-            if braked.elapsed() >= Duration::from_secs(1)
+            if fixture.is_none()
+                && braked.elapsed() >= Duration::from_secs(1)
                 && let Some(host) = self.lan.as_mut()
                 && let Some(far) = host.hub.far.as_mut()
             {
@@ -1603,7 +1634,9 @@ impl Game<'_> {
             state.ticked(Instant::now());
             // MinecraftServer.runServer: a server more than a second's ticks
             // behind skips them and says so, at most every 15 seconds.
-            if let Some(behind) = self.wait_for_next_server_tick(&mut next, paused)
+            // A fixture runs its ticks back to back, with no chunk work between them.
+            if fixture.is_none()
+                && let Some(behind) = self.wait_for_next_server_tick(&mut next, paused)
                 && overload_warned.is_none_or(|at| at.elapsed() >= OVERLOAD_WARNING_INTERVAL)
             {
                 overload_warned = Some(Instant::now());
@@ -1633,7 +1666,13 @@ impl Game<'_> {
         let deadline = Instant::now() + Duration::from_secs(600);
         if self.is_dedicated_server() {
             if self.level.spawn.is_none() {
+                // A fixture run (tick_digest.rs) searches in rounds that wait for every job, so that
+                // the chunks loaded when the first tick starts never depend on worker timing.
+                let fixture = tick_digest::fixture_requested();
                 let [x, y, z] = loop {
+                    if fixture {
+                        self.streaming.wait_quiescent();
+                    }
                     self.update_world();
                     if let Some(pos) = self.find_world_spawn()? {
                         break pos;
@@ -1641,7 +1680,9 @@ impl Game<'_> {
                     if Instant::now() > deadline {
                         return Err("the spawn area did not load".into());
                     }
-                    std::thread::sleep(Duration::from_millis(2));
+                    if !fixture {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
                 };
                 self.level.spawn = Some([f64::from(x), f64::from(y), f64::from(z)]);
                 self.level.world_spawn.get_or_insert([x, y, z]);
