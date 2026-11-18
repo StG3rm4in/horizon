@@ -215,10 +215,19 @@ pub fn command_with_transfers(
         windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
             | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
     );
-    // `[engine] low_memory`: mimalloc then keeps transparent huge pages off. Mostly empty huge pages cost
-    // 60 MB idle and 190 MB at 20 players, and save ~1 % of tick time (docs/hosting.md).
-    if low_memory {
-        command.env("MIMALLOC_ALLOW_THP", "0");
+    // `[engine] low_memory` chooses the game's allocator settings (docs/hosting.md). Off, mimalloc's own:
+    // freed memory kept a second before it goes back to the OS, and transparent huge pages on its arenas,
+    // for a tick ~7 % faster at 100 players and ~0.7 GB more. On, the game client's (configure_allocator):
+    // freed memory back at once, no huge pages. A variable set in our own environment stays.
+    let (thp, purge) = if low_memory {
+        ("0", "0")
+    } else {
+        ("1", "1000")
+    };
+    for (key, value) in [("MIMALLOC_ALLOW_THP", thp), ("MIMALLOC_PURGE_DELAY", purge)] {
+        if std::env::var_os(key).is_none() {
+            command.env(key, value);
+        }
     }
     Ok(command)
 }
@@ -335,17 +344,30 @@ mod tests {
     }
 
     #[test]
-    fn low_memory_turns_huge_pages_off_for_the_game() {
-        let thp = |low_memory| {
+    fn low_memory_chooses_the_game_allocator_settings() {
+        let env = |low_memory, key: &str| {
             let dir = std::env::temp_dir();
             let command = command(Path::new("horizon-client"), &dir, &dir, low_memory).unwrap();
             command
                 .get_envs()
-                .find(|(k, _)| *k == "MIMALLOC_ALLOW_THP")
+                .find(|(k, _)| *k == key)
                 .and_then(|(_, v)| v.map(|v| v.to_owned()))
         };
-        assert_eq!(thp(true).as_deref(), Some(std::ffi::OsStr::new("0")));
-        assert_eq!(thp(false), None);
+        // A variable set around the test stays, as an operator's would: the command then sets none.
+        let expected = |key: &str, value: &str| {
+            std::env::var_os(key)
+                .is_none()
+                .then(|| std::ffi::OsString::from(value))
+        };
+        for (low_memory, thp, purge) in [(true, "0", "0"), (false, "1", "1000")] {
+            for (key, value) in [("MIMALLOC_ALLOW_THP", thp), ("MIMALLOC_PURGE_DELAY", purge)] {
+                assert_eq!(
+                    env(low_memory, key),
+                    expected(key, value),
+                    "{key}, low_memory {low_memory}"
+                );
+            }
+        }
     }
 
     #[test]

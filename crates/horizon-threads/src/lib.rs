@@ -590,18 +590,27 @@ const ALLOW_THP: libmimalloc_sys::mi_option_t = 43;
 /// give them too), and a 2 MiB huge page stays resident whole while one
 /// 64 KiB mimalloc page in it is used: in a world at render distance 12 the
 /// game held 200 MiB more that way, at the same load time and frame rate.
+///
+/// Either setting stays mimalloc's when its variable is in the environment
+/// (`MIMALLOC_PURGE_DELAY`, `MIMALLOC_ALLOW_THP`): mimalloc read it at startup.
+/// `horizon-server` sets both for the game it runs, to mimalloc's own values
+/// unless `[engine] low_memory` (horizon-server-launch, docs/hosting.md).
 pub fn configure_allocator() {
-    // SAFETY: sets one integer option, which mimalloc reads at each purge.
-    unsafe {
-        libmimalloc_sys::mi_option_set(PURGE_DELAY, 0);
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+        // SAFETY: sets one integer option, which mimalloc reads at each purge.
+        unsafe {
+            libmimalloc_sys::mi_option_set(PURGE_DELAY, 0);
+        }
     }
     #[cfg(target_os = "linux")]
-    // SAFETY: an integer option mimalloc reads at each new mapping, and a prctl
-    // that only sets this process's flag; the kernel reads it on each page fault,
-    // so the arenas mapped before `main` take small pages from now on too.
-    unsafe {
-        libmimalloc_sys::mi_option_set(ALLOW_THP, 0);
-        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    if std::env::var_os("MIMALLOC_ALLOW_THP").is_none() {
+        // SAFETY: an integer option mimalloc reads at each new mapping, and a prctl
+        // that only sets this process's flag; the kernel reads it on each page fault,
+        // so the arenas mapped before `main` take small pages from now on too.
+        unsafe {
+            libmimalloc_sys::mi_option_set(ALLOW_THP, 0);
+            libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
+        }
     }
 }
 
@@ -924,23 +933,28 @@ mod tests {
     }
 
     /// The option set is the purge delay: mimalloc v3's default for it is
-    /// 1000 ms, and it is 0 once configured.
+    /// 1000 ms, and it is 0 once configured, unless the environment sets it.
     #[test]
     fn configuring_the_allocator_purges_at_once() {
         // SAFETY: reads and sets one integer option.
         let get = || unsafe { libmimalloc_sys::mi_option_get(super::PURGE_DELAY) };
-        if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
-            assert_eq!(get(), 1000);
+        let set = std::env::var_os("MIMALLOC_PURGE_DELAY").is_some();
+        let before = get();
+        if !set {
+            assert_eq!(before, 1000);
         }
         super::configure_allocator();
-        assert_eq!(get(), 0);
+        assert_eq!(get(), if set { before } else { 0 });
     }
 
     /// Configured, the process takes no transparent huge pages, whatever the
-    /// system's setting.
+    /// system's setting, unless the environment allows them.
     #[cfg(target_os = "linux")]
     #[test]
     fn configuring_the_allocator_turns_transparent_huge_pages_off() {
+        if std::env::var_os("MIMALLOC_ALLOW_THP").is_some() {
+            return;
+        }
         super::configure_allocator();
         // SAFETY: reads this process's flag.
         assert_eq!(

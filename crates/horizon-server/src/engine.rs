@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn low_memory_turns_huge_pages_off_for_the_game() {
+    fn low_memory_chooses_the_game_allocator_settings() {
         let thp = |low_memory| {
             let dir = std::env::temp_dir();
             let command = command(
@@ -342,8 +342,11 @@ mod tests {
                 .find(|(k, _)| *k == "MIMALLOC_ALLOW_THP")
                 .and_then(|(_, v)| v.map(|v| v.to_owned()))
         };
-        assert_eq!(thp(true).as_deref(), Some(std::ffi::OsStr::new("0")));
-        assert_eq!(thp(false), None);
+        // The launcher's settings (horizon-server-launch), unless one set around the test stays.
+        if std::env::var_os("MIMALLOC_ALLOW_THP").is_none() {
+            assert_eq!(thp(true).as_deref(), Some(std::ffi::OsStr::new("0")));
+            assert_eq!(thp(false).as_deref(), Some(std::ffi::OsStr::new("1")));
+        }
     }
 
     #[test]

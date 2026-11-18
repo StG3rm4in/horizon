@@ -184,7 +184,7 @@ hardcore = false
 path = ""                    # the game program; empty: the one beside horizon-server
 resources = ""               # the prepared game files; empty: resources/ here, else the usual places
 restart_on_crash = true
-low_memory = false           # true: less memory, slightly slower ticks (see below)
+low_memory = false           # true: less memory, ~7 % slower ticks (see below)
 parallel_tick = false        # true: the tick shares its work among helper threads (see below)
 worker_threads = 0           # the game's worker threads; 0: as many as the machine has (see below)
 
@@ -802,21 +802,27 @@ For more than 50 active players, give it more cores.
 
 ### Less memory: `low_memory`
 
-Off by default. On Linux, the game's allocator (mimalloc) backs its memory with transparent huge pages
-(2 MB each) where the system allows them. Many of those pages are only partly used, so the server holds
-more memory than it needs, but the tick runs a little faster. Under `[engine]`, `low_memory = true` starts
-the game with huge pages off. Measured on a 4-core EPYC VPS with 20 bots playing (2026-11-01):
+Off by default. The game's allocator (mimalloc) then keeps the memory it frees for a second before giving
+it back to the system, and on Linux backs its memory with transparent huge pages (2 MB each) where the
+system allows them. The server holds more memory, part of it in pages it doesn't use, but its tick runs
+faster: fewer page faults and fewer address translations. Under `[engine]`, `low_memory = true` starts the
+game with the game client's settings instead: freed memory goes back at once, no huge pages. Measured on a
+6-core Linux server (Core i5-10600K) with 100 bots playing, three to six runs each (2026-11-18):
 
 | | Default | `low_memory = true` |
 |---|---|---|
-| Memory, idle after start | ~300 MB | ~245 MB (−60 MB) |
-| Memory, 20 players | ~1180 MB | ~980 MB (−190 MB) |
-| Average tick, 20 players | 27.1 ms | 27.5 ms (+1.2 %) |
-| Start | 2.1 s | 2.2 s |
+| Memory, 100 players (peak) | ~2.8 GB | ~2.1 GB (−0.7 GB) |
+| Average tick, 100 players | 83.7 ms | 89.7 ms (+7 %) |
+| Tick, 99th percentile | 106–110 ms | 117–119 ms |
+
+Huge pages give 2.4 ms of that gap for 0.4 GB. Keeping freed memory a second gives the other 3.7 ms for
+0.25 GB: it saves about 700,000 page faults a minute.
 
 Turn it on when memory is what you're short of, for example on a small VPS. It applies at the next start.
-A game started without `horizon-server` (`horizon-client --dedicated`, a container of your own) gets the same
-effect from the environment variable `MIMALLOC_ALLOW_THP=0`. On macOS and Windows it changes nothing.
+A game started without `horizon-server` (`horizon-client --dedicated`, a container of your own) runs with the
+`low_memory = true` settings; `MIMALLOC_ALLOW_THP=1 MIMALLOC_PURGE_DELAY=1000` in its environment give it the
+default ones. Either variable set in `horizon-server`'s own environment wins over `low_memory`. On macOS and
+Windows only the delay applies, and it was not measured there.
 
 ### Worker threads: `worker_threads`
 
