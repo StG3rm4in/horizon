@@ -846,11 +846,13 @@ fn vanilla_mobs_at<L: NaturalLevel>(
     let structures = l.structures_at(x, y, z, &|id| {
         (monster && id == "minecraft:fortress") || overrides.get(id, category.name()).is_some()
     });
+    // The structures first: both sides are plain reads, and the list is almost always empty,
+    // which spares the read of the block below.
     if category == Category::Monster
-        && name_at(l, x, y - 1, z) == "minecraft:nether_bricks"
         && structures
             .iter()
             .any(|s| s.id == "minecraft:fortress" && s.in_bounds)
+        && name_at(l, x, y - 1, z) == "minecraft:nether_bricks"
     {
         return fortress_enemies();
     }
@@ -1162,9 +1164,15 @@ impl SpawnState {
     }
     /// `canSpawnForCategoryLocal` (`LocalMobCapCalculator.canSpawn`).
     pub fn can_spawn_local(&mut self, category: Category, cx: i32, cz: i32) -> bool {
+        let near = self.players_near(cx, cz);
+        self.can_spawn_local_near(category, near)
+    }
+    /// [`Self::can_spawn_local`] for the players `near` holds (the chunk's
+    /// [`Self::players_near`], which never changes once made): a chunk's
+    /// categories share one lookup.
+    fn can_spawn_local_near(&self, category: Category, near: std::ops::Range<usize>) -> bool {
         // A player with nothing counted yet can spawn while the cap is above
         // zero, as vanilla's always are.
-        let near = self.players_near(cx, cz);
         let max = category.max(&self.limits);
         self.near_list[near]
             .iter()
@@ -1305,8 +1313,14 @@ pub fn spawn_for_chunk<L: NaturalLevel, R: RandomSource>(
     spawn: &mut dyn FnMut(&L, &SpawnRequest, &mut R) -> Option<Spawned>,
     trace: &mut dyn FnMut(Event<'_>),
 ) {
+    // The chunk's nearby players, looked up once for every category: the
+    // range stays the chunk's while spawns add other chunks' ranges, and the
+    // counts are still read at each category.
+    let near = (!categories.is_empty()).then(|| state.players_near(chunk.0, chunk.1));
     for &category in categories {
-        let local = state.can_spawn_local(category, chunk.0, chunk.1);
+        let local = near
+            .clone()
+            .is_some_and(|near| state.can_spawn_local_near(category, near));
         trace(Event::Local(category, local));
         if local {
             spawn_category_for_chunk(l, random, state, category, chunk, spawn, trace);
