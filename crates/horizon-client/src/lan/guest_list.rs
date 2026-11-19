@@ -2,6 +2,43 @@
 use super::guest::Guest;
 use crate::fast_hash::FxHashMap;
 use std::ops::Deref;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Layout stamps are unique across lists, so a reader never takes one list's stamp for another's.
+static LAYOUTS: AtomicU64 = AtomicU64::new(1);
+
+/// What a reader that keeps a copy of the simulation rows needs to know, without scanning them:
+/// when the set or order of the rows changed, and which rows were written since it last looked.
+struct Written {
+    layout: u64,
+    rows: Vec<usize>,
+    seen: Vec<bool>,
+}
+impl Default for Written {
+    fn default() -> Self {
+        Self {
+            layout: LAYOUTS.fetch_add(1, Ordering::Relaxed),
+            rows: Vec::new(),
+            seen: Vec::new(),
+        }
+    }
+}
+impl Written {
+    fn mark(&mut self, row: usize) {
+        if self.seen.len() <= row {
+            self.seen.resize(row + 1, false);
+        }
+        if !std::mem::replace(&mut self.seen[row], true) {
+            self.rows.push(row);
+        }
+    }
+    fn reset(&mut self) {
+        self.layout = LAYOUTS.fetch_add(1, Ordering::Relaxed);
+        self.rows.clear();
+        self.seen.clear();
+    }
+}
 
 /// Collection-owned mutation keeps identity and material-body indexes current.
 /// Ordinary state writes compare only the indexed fields; membership or key
@@ -16,17 +53,45 @@ pub struct GuestList {
         crate::join_seq::residency::Journal,
         fn(&str) -> mod_api::DimensionKey,
     )>,
-    /// A stamp per row (`stamp`), renewed by every borrow that can change the row.
-    stamps: Vec<u64>,
-    /// Renewed with every row's stamp when the rows, their order or their indexed keys change.
-    layout: u64,
-}
-/// Stamps are unique in the process: an equal stamp is one row in one state, whichever list.
-static NEXT_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-fn fresh_stamp() -> u64 {
-    NEXT_STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    written: Mutex<Written>,
 }
 impl GuestList {
+    fn written(&mut self) -> &mut Written {
+        self.written
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// A stamp that changes whenever the simulation rows are added, removed, reordered or
+    /// switch kind: a copy of them taken at one stamp stays row for row valid until it changes.
+    pub fn layout(&self) -> u64 {
+        self.written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .layout
+    }
+    /// Hands `f` each simulation row (its place among them, and the guest) written through
+    /// this list since the last call, once each. The writes that can change a row's position,
+    /// pose, mode, dimension or liveness are `update*` and `motion_mut`; the other `*_mut`
+    /// borrows reach only fields apart from those, and a change of the rows' set or order
+    /// changes `layout` instead.
+    pub fn drain_written(&self, mut f: impl FnMut(usize, &Guest)) {
+        let rows = {
+            let mut w = self
+                .written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let w = &mut *w;
+            for &row in &w.rows {
+                w.seen[row] = false;
+            }
+            std::mem::take(&mut w.rows)
+        };
+        for row in rows {
+            if let Ok(place) = self.simulation.binary_search(&row) {
+                f(place, &self.rows[row]);
+            }
+        }
+    }
     /// Bind actual player records, including non-network fake actors. Readiness
     /// and material simulation participation do not decide identity existence.
     pub fn bind_residency(
@@ -40,7 +105,6 @@ impl GuestList {
         }
     }
     fn bind_guest(&mut self, index: usize) -> bool {
-        self.touch(index);
         let Some((journal, dimension)) = &self.residency else {
             return false;
         };
@@ -75,7 +139,7 @@ impl GuestList {
     /// again, including when the callback unwinds. Ordinary state writes do
     /// not scan the collection or rebuild its indexes.
     pub fn update<T>(&mut self, index: usize, update: impl FnOnce(&mut Guest) -> T) -> T {
-        self.touch(index);
+        self.written().mark(index);
         let before = index_fields(&self.rows[index]);
         let registration = self.rows[index].attachments.registration();
         let dimension = self
@@ -133,10 +197,6 @@ impl GuestList {
         (dimension, views): (&str, &'a mut [Vec<super::Body>]),
     ) -> Vec<super::entity::Viewer<'a>> {
         use super::viewed_levels::entities::tracks_view;
-        // Every row is lent below.
-        for stamp in &mut self.stamps {
-            *stamp = fresh_stamp();
-        }
         let viewing = !views.is_empty();
         let (mut outputs, mut views) = (outputs.into_iter(), views.iter_mut());
         let mut viewers = Vec::new();
@@ -188,14 +248,12 @@ impl GuestList {
         &mut self,
         index: usize,
     ) -> Option<&mut std::collections::VecDeque<super::guest::InboxItem>> {
-        self.touch(index);
         Some(&mut self.rows.get_mut(index)?.inbox)
     }
 
     /// Borrow saved data without exposing indexed identity fields.
     pub fn saved_data_mut(&mut self, conn: u32) -> Option<&mut Option<horizon_core::nbt::Tag>> {
         let index = self.connection_index(conn)?;
-        self.touch(index);
         Some(&mut self.rows[index].saved)
     }
 
@@ -205,7 +263,6 @@ impl GuestList {
         conn: u32,
     ) -> Option<&mut horizon_mod_runtime::attachments::ResidentAttachments> {
         let index = self.connection_index(conn)?;
-        self.touch(index);
         Some(&mut self.rows[index].attachments)
     }
 
@@ -214,7 +271,6 @@ impl GuestList {
         &mut self,
         index: usize,
     ) -> Option<&mut [Option<crate::items::ItemStack>]> {
-        self.touch(index);
         Some(&mut self.rows.get_mut(index)?.ender_items)
     }
 
@@ -223,7 +279,6 @@ impl GuestList {
         &mut self,
         index: usize,
     ) -> Option<&mut [Option<crate::items::ItemStack>]> {
-        self.touch(index);
         Some(&mut self.rows.get_mut(index)?.craft_grid)
     }
 
@@ -232,14 +287,13 @@ impl GuestList {
         &mut self,
         index: usize,
     ) -> Option<&mut [Option<crate::items::ItemStack>]> {
-        self.touch(index);
         Some(&mut self.rows.get_mut(index)?.native_menu)
     }
 
     /// Borrow a body without exposing the guest's indexed fields or row replacement.
     pub fn motion_mut(&mut self, conn: u32) -> Option<&mut crate::motion::PlayerMotion> {
         let index = self.connection_index(conn)?;
-        self.touch(index);
+        self.written().mark(index);
         self.rows[index].motion.as_deref_mut()
     }
 
@@ -248,7 +302,6 @@ impl GuestList {
         &mut self,
         index: usize,
     ) -> Option<super::hub::advancements::AdvancementState<'_>> {
-        self.touch(index);
         let guest = self.rows.get_mut(index)?;
         Some(super::hub::advancements::AdvancementState {
             progress: &mut guest.advancements,
@@ -280,24 +333,6 @@ impl GuestList {
             .iter()
             .map(|&index| (index, &self.rows[index]))
     }
-    pub fn simulation_len(&self) -> usize {
-        self.simulation.len()
-    }
-    /// The row's stamp: equal to one read earlier at this index, the row has not changed since
-    /// (every mutable borrow of a row renews it). Lets a reader keep what it derived from a row.
-    pub fn stamp(&self, index: usize) -> u64 {
-        self.stamps[index]
-    }
-    /// Equal to one read earlier, the same rows in the same order with the same indexed keys
-    /// (connection, identity, simulation).
-    pub fn layout(&self) -> u64 {
-        self.layout
-    }
-    fn touch(&mut self, index: usize) {
-        if let Some(stamp) = self.stamps.get_mut(index) {
-            *stamp = fresh_stamp();
-        }
-    }
     pub fn as_slice(&self) -> &[Guest] {
         &self.rows
     }
@@ -311,8 +346,7 @@ impl GuestList {
             self.simulation.push(index);
         }
         self.rows.push(guest);
-        self.stamps.push(fresh_stamp());
-        self.layout = fresh_stamp();
+        self.written().reset();
         if !self.bind_guest(index) {
             self.rows[index].residency.put_back();
         }
@@ -367,14 +401,14 @@ impl GuestList {
         self.simulation.clear();
         self.connections.clear();
         self.identities.clear();
-        self.stamps.clear();
-        self.layout = fresh_stamp();
+        self.written().reset();
     }
     pub fn reverse(&mut self) {
         self.rows.reverse();
         self.reindex();
     }
     fn reindex(&mut self) {
+        self.written().reset();
         self.simulation.clear();
         self.connections.clear();
         self.identities.clear();
@@ -387,9 +421,6 @@ impl GuestList {
                 .entry((guest.uuid, guest.entity_id as u32))
                 .or_insert(index);
         }
-        self.stamps.clear();
-        self.stamps.extend(self.rows.iter().map(|_| fresh_stamp()));
-        self.layout = fresh_stamp();
     }
 }
 impl Drop for GuestList {

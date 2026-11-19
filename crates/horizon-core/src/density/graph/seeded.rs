@@ -25,6 +25,9 @@ impl SeededContext {
     pub(super) fn end_island_sampler(&self) -> EndIslandSampler {
         EndIslandSampler::new(self.seed)
     }
+    pub(super) fn seed(&self) -> i64 {
+        self.seed
+    }
     pub(super) fn end_islands(&self) -> Arc<dyn DensitySampler> {
         Arc::new(EndIslandSampler::new(self.seed))
     }

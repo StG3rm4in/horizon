@@ -328,88 +328,97 @@ fn building_player(g: &horizon_client::lan::guest::Guest) -> BuildingPlayer {
     }
 }
 
+use horizon_client::lan::guest_list::GuestList;
+
 thread_local! {
     /// The hub's bodies for the turns of one `tick_guests`, built once instead
-    /// of for every turn (players x turns a tick). A guest's entry is refreshed
-    /// when its turn ends ([`refresh_building_player`]), so the turns after it
-    /// see it where it went (a pearl, a death, spectator mode).
-    static BUILDING_CACHE: std::cell::RefCell<Option<BuildingCache>> =
+    /// of for every turn (players x turns a tick), with the guest list's layout
+    /// they were built for. A guest's entry is refreshed when its turn ends
+    /// ([`refresh_building_player`]), so the turns after it see it where it went
+    /// (a pearl, a death, spectator mode).
+    static BUILDING_CACHE: std::cell::RefCell<Option<(u64, HubBodies)>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// The cached bodies, with the stamp of the guest row each was built from
-/// (`GuestList::stamp`) and the list's layout when they were built.
-struct BuildingCache {
-    bodies: HubBodies,
-    stamps: Vec<u64>,
-    layout: u64,
+/// The bodies of the simulation guests as they are now.
+pub(super) fn built_bodies(guests: &GuestList) -> (u64, HubBodies) {
+    guests.drain_written(|_, _| {});
+    (
+        guests.layout(),
+        shared(guests.simulation_iter().map(building_player)),
+    )
+}
+
+/// The cached bodies, if they were built for these guests as they are laid out, else bodies
+/// built afresh from the guests.
+pub(super) fn bodies_of(
+    guests: &GuestList,
+    cache: Option<&(u64, HubBodies)>,
+) -> HubBodies {
+    match cache {
+        Some((built_for, bodies)) if *built_for == guests.layout() => bodies.clone(),
+        _ => shared(guests.simulation_iter().map(building_player)),
+    }
+}
+
+/// Copies every guest written since the last time into the cached bodies (none when the guests
+/// were laid out differently since: [`bodies_of`] builds afresh then).
+pub(super) fn refresh_bodies(guests: &GuestList, (built_for, bodies): &(u64, HubBodies)) {
+    if *built_for == guests.layout() {
+        guests.drain_written(|place, g| bodies[place].set(building_player(g)));
+    }
 }
 
 /// The hub's current bodies, across dimensions. A borrowed ancestor's
 /// live body takes precedence over this saved state until its turn returns.
 fn building_players(host: &LanHost) -> HubBodies {
-    let guests = &host.hub.guests;
-    let kept = BUILDING_CACHE.with(|c| {
-        c.borrow()
-            .as_ref()
-            .filter(|cache| {
-                // The same layout: the same guests in the same order, so the same connections
-                // as when the cache was built (a refresh never changes a body's connection).
-                cache.layout == guests.layout()
-                    || cache.bodies.len() == guests.simulation_len()
-                        && cache
-                            .bodies
-                            .iter()
-                            .zip(guests.simulation_iter())
-                            .all(|(p, g)| p.get().conn == Some(g.conn))
-            })
-            .map(|cache| cache.bodies.clone())
-    });
-    kept.unwrap_or_else(|| shared(guests.simulation_iter().map(building_player)))
+    BUILDING_CACHE.with(|c| bodies_of(&host.hub.guests, c.borrow().as_ref()))
 }
 
 /// Builds the hub's bodies once for the turns to come (`Some`), or drops them.
 pub(super) fn building_cache(host: Option<&LanHost>) {
-    let cache = host.map(|host| {
-        let guests = &host.hub.guests;
-        BuildingCache {
-            bodies: shared(guests.simulation_iter().map(building_player)),
-            stamps: guests
-                .simulation_indexed_iter()
-                .map(|(index, _)| guests.stamp(index))
-                .collect(),
-            layout: guests.layout(),
-        }
-    });
-    BUILDING_CACHE.with(|c| *c.borrow_mut() = cache);
+    let bodies = host.map(|host| built_bodies(&host.hub.guests));
+    BUILDING_CACHE.with(|c| *c.borrow_mut() = bodies);
 }
 
 /// The cached bodies as they are now in the hub, after `conn`'s turn (or its
-/// death step). Every entry, not only the actor's: a turn can move, kill or
-/// change another guest too (`/tp`, an attack, an explosion), and the turns
-/// after it must see that guest where it is now, as a list built afresh would.
-/// Copies into the shared cells, no allocation; only the bodies whose guest row
-/// changed since they were built (its stamp), usually the actor's alone.
+/// death step): every guest written since the last refresh, not only the
+/// actor, as a turn can move, kill or change another guest too (`/tp`, an
+/// attack, an explosion), and the turns after it must see that guest where
+/// it is now, as a list built afresh would. The guest list notes each write
+/// (`drain_written`), so the work follows the guests that changed,
+/// not their number. Copies into the shared cells, no allocation.
 fn refresh_building_player(host: &LanHost, _conn: u32) {
-    let guests = &host.hub.guests;
     BUILDING_CACHE.with(|c| {
-        if let Some(cache) = c.borrow_mut().as_mut()
-            && cache.bodies.len() == guests.simulation_len()
-        {
-            let BuildingCache { bodies, stamps, .. } = cache;
-            for ((p, stamp), (index, g)) in bodies
-                .iter()
-                .zip(stamps.iter_mut())
-                .zip(guests.simulation_indexed_iter())
-            {
-                // The row this body was built from, unchanged: building it again gives it.
-                if p.get().conn == Some(g.conn) && *stamp != guests.stamp(index) {
-                    p.set(building_player(g));
-                    *stamp = guests.stamp(index);
-                }
+        if let Some(cache) = c.borrow().as_ref() {
+            #[cfg(test)]
+            if REFRESH_EVERY_GUEST.get() {
+                return refresh_every_guest(&host.hub.guests, cache);
             }
+            refresh_bodies(&host.hub.guests, cache);
         }
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test only: refresh every guest's body after each turn, as the code did before the guest
+    /// list noted its writes. The tests that compare the two run a scenario under each.
+    static REFRESH_EVERY_GUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test only: the refresh of every body, whatever was written.
+#[cfg(test)]
+fn refresh_every_guest(
+    guests: &GuestList,
+    (built_for, bodies): &(u64, HubBodies),
+) {
+    if *built_for == guests.layout() {
+        for (cell, g) in bodies.iter().zip(guests.simulation_iter()) {
+            cell.set(building_player(g));
+        }
+        guests.drain_written(|_, _| {});
+    }
 }
 
 /// Kept at LAN action scope to preserve its derived internals point identity.
