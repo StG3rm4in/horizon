@@ -2,6 +2,7 @@
 //! the chunks' spawn attempts, which only read, run in lanes against the caps as the pass found
 //! them, and the server thread then commits what they proposed in the pass's chunk order.
 use super::*;
+use crate::game::creatures::local_difficulty_in;
 use crate::game::creatures::prep;
 use horizon_client::mobs::{
     finalize::{self, FinalizeLevel},

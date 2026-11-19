@@ -52,6 +52,10 @@ path = "examples/probe/main.rs"
 # build this crate alone, run them. The game forwards it as its own `cuda` feature.
 default = ["cuda"]
 cuda = ["horizon-gpu/cuda"]
+# ObjectOpenMap's table behind a mutex instead of Rc<RefCell<_>>, so that a mob (whose attributes hold
+# these maps) is Send: the parallel tick hands mobs between threads (horizon-client's feature
+# upstream-parallel-mobs turns it on). Off, nothing changes.
+send-attributes = []
 
 [lints]
 workspace = true

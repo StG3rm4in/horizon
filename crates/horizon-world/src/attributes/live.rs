@@ -279,11 +279,21 @@ impl<G: FnMut() -> i32> AttributeAccess<Key, Handle> for Data<G> {
         self.edit(map, h, |a, o| a.add_permanent(modifier, o))
     }
 }
+/// `Send` with the feature `send-attributes` (a mob, whose attributes hold an allocator, moves
+/// between the parallel tick's threads); no bound otherwise.
+#[cfg(feature = "send-attributes")]
+pub trait MaybeSend: Send {}
+#[cfg(feature = "send-attributes")]
+impl<T: Send> MaybeSend for T {}
+#[cfg(not(feature = "send-attributes"))]
+pub trait MaybeSend {}
+#[cfg(not(feature = "send-attributes"))]
+impl<T> MaybeSend for T {}
 /// An identity allocator that can be copied with its state, so the attributes holding it can be.
-pub trait Identities: FnMut() -> i32 {
+pub trait Identities: FnMut() -> i32 + MaybeSend {
     fn clone_box(&self) -> Box<dyn Identities>;
 }
-impl<F: FnMut() -> i32 + Clone + 'static> Identities for F {
+impl<F: FnMut() -> i32 + Clone + MaybeSend + 'static> Identities for F {
     fn clone_box(&self) -> Box<dyn Identities> {
         Box::new(self.clone())
     }

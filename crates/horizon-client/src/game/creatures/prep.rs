@@ -1,14 +1,21 @@
 //! What the mob loop (`tick_creature_entities`) prepares for every mob before it runs, on the tick's
 //! helper threads while the parallel tick is on (`horizon_client::parallel`): each answer reads only
 //! that mob, the blocks and the players, so the helpers give what one thread gives.
+#[cfg(feature = "upstream-parallel-mob-islands")]
 use super::super::{Game, natural_spawning::NearestPlayers};
-use horizon_client::mobs::{Mob, MobWorld, Seen};
+use horizon_client::mobs::MobWorld;
+#[cfg(feature = "upstream-parallel-mob-islands")]
+use horizon_client::mobs::{Mob, Seen};
+#[cfg(feature = "upstream-parallel-mob-islands")]
 use horizon_client::parallel::par_map;
+#[cfg(feature = "upstream-parallel-mob-islands")]
 use horizon_core::geometry::Vec3;
 
 /// From this many mobs a preparation goes to the helper threads.
+#[cfg(feature = "upstream-parallel-mob-islands")]
 const MIN_MOBS: usize = 256;
 
+#[cfg(feature = "upstream-parallel-mob-islands")]
 impl Game<'_> {
     /// `LivingEntity.isPushable` reads onClimbable live; a mob's cached one is only refreshed by its
     /// own push step, so one that has not ticked yet (the first tick after a load, a fresh spawn) or
@@ -36,6 +43,7 @@ impl Game<'_> {
 
 /// The nearest player each mob's despawn check reads (`Mob.checkDespawn`), found for every mob before
 /// the loop. A mob that moved before its turn is asked again where it stands.
+#[cfg(feature = "upstream-parallel-mob-islands")]
 pub(super) struct MobsNearest<'p> {
     players: &'p NearestPlayers<'p>,
     /// Each mob's position as the loop started and its nearest player there; empty while the
@@ -43,6 +51,7 @@ pub(super) struct MobsNearest<'p> {
     found: Vec<(Vec3, Option<Vec3>)>,
 }
 
+#[cfg(feature = "upstream-parallel-mob-islands")]
 impl<'p> MobsNearest<'p> {
     /// `wanted`: whether the loop asks (not with one player, whose position answers).
     pub(super) fn new(players: &'p NearestPlayers<'p>, mobs: &[Mob], wanted: bool) -> Self {
@@ -74,7 +83,8 @@ impl<'p> MobsNearest<'p> {
 /// helper thread builds its own world from: native mod effects (the phases on helpers don't run
 /// them) and the UUID lookup.
 pub(crate) fn hookless<'w>(base: &MobWorld<'w>) -> impl Fn() -> MobWorld<'w> + Sync + use<'w> {
-    // Every field but the two hooks, named, so that a field added to `MobWorld` is decided here.
+    // Every field named, so that a field added to `MobWorld` is decided here: the hooks into the
+    // game and the per-mob views (`player_selection`, `live_mobs`, `section_writer`) stay behind.
     let MobWorld {
         mob_maps,
         world,
@@ -121,6 +131,19 @@ pub(crate) fn hookless<'w>(base: &MobWorld<'w>) -> impl Fn() -> MobWorld<'w> + S
         who_lookup: _,
         foreign: _,
         border,
+        professions,
+        loop_context,
+        attributes,
+        player_selection: _,
+        player_identity,
+        passenger_objects,
+        live_mobs: _,
+        mob_hooks: _,
+        goal_host: _,
+        asks_animal_tame,
+        asks_living_destroy_block,
+        asks_baby_spawn,
+        section_writer: _,
     } = base.clone();
     move || MobWorld {
         mob_maps,
@@ -168,10 +191,23 @@ pub(crate) fn hookless<'w>(base: &MobWorld<'w>) -> impl Fn() -> MobWorld<'w> + S
         who_lookup: None,
         foreign: None,
         border,
+        professions,
+        loop_context,
+        attributes,
+        player_selection: None,
+        player_identity,
+        passenger_objects,
+        live_mobs: None,
+        mob_hooks: None,
+        goal_host: None,
+        asks_animal_tame,
+        asks_living_destroy_block,
+        asks_baby_spawn,
+        section_writer: None,
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "upstream-parallel-mob-islands"))]
 mod tests {
     use super::super::super::natural_spawning::LevelPlayer;
     use super::*;

@@ -10427,11 +10427,11 @@ mod death_loot_context_tests;
 #[cfg(test)]
 mod breeding_heart_tests;
 
-#[cfg(feature = "upstream-parallel-mobs")]
+#[cfg(feature = "upstream-parallel-mob-islands")]
 #[path = "../../creatures/mob_group.rs"]
 mod mob_group;
 
-#[cfg(feature = "upstream-parallel-mobs")]
+#[cfg(feature = "upstream-parallel-mob-islands")]
 #[path = "../../creatures/mob_islands.rs"]
 mod mob_islands;
 

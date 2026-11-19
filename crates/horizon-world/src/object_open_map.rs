@@ -1,9 +1,67 @@
 //! Default fastutil object map with live indexed entries and native traversal.
 use crate::object_open_set::{CursorError, ObjectKey};
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use shared::Shared;
+use std::{cell::Cell, rc::Rc};
+
+/// The table an `ObjectOpenMap` shares with its `for_each` across a rehash. `Rc<RefCell<_>>` by
+/// default; behind a mutex with the feature `send-attributes`, so that a mob, whose attributes hold
+/// these maps, can move to one of the parallel tick's helper threads and back. One owner touches a
+/// table at a time, so the lock never waits; a second borrow while one is held panics, as a
+/// conflicting `RefCell` borrow does, instead of deadlocking.
+#[cfg(not(feature = "send-attributes"))]
+mod shared {
+    use std::{
+        cell::{Ref, RefCell, RefMut},
+        rc::Rc,
+    };
+    pub(super) struct Shared<T>(Rc<RefCell<T>>);
+    impl<T> Shared<T> {
+        pub(super) fn new(value: T) -> Self {
+            Self(Rc::new(RefCell::new(value)))
+        }
+        pub(super) fn borrow(&self) -> Ref<'_, T> {
+            self.0.borrow()
+        }
+        pub(super) fn borrow_mut(&self) -> RefMut<'_, T> {
+            self.0.borrow_mut()
+        }
+    }
+    impl<T> Clone for Shared<T> {
+        fn clone(&self) -> Self {
+            Self(Rc::clone(&self.0))
+        }
+    }
+}
+#[cfg(feature = "send-attributes")]
+mod shared {
+    use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+    pub(super) struct Shared<T>(Arc<Mutex<T>>);
+    impl<T> Shared<T> {
+        pub(super) fn new(value: T) -> Self {
+            Self(Arc::new(Mutex::new(value)))
+        }
+        pub(super) fn borrow(&self) -> MutexGuard<'_, T> {
+            self.lock()
+        }
+        pub(super) fn borrow_mut(&self) -> MutexGuard<'_, T> {
+            self.lock()
+        }
+        fn lock(&self) -> MutexGuard<'_, T> {
+            match self.0.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    panic!("an ObjectOpenMap table borrowed twice at once")
+                }
+            }
+        }
+    }
+    impl<T> Clone for Shared<T> {
+        fn clone(&self) -> Self {
+            Self(Arc::clone(&self.0))
+        }
+    }
+}
 #[derive(Clone)]
 struct Table<K, V> {
     keys: Vec<Option<K>>,
@@ -40,7 +98,7 @@ pub enum TraversalError<E> {
     Callback(E),
 }
 pub struct ObjectOpenMap<K, V> {
-    table: Rc<RefCell<Table<K, V>>>,
+    table: Shared<Table<K, V>>,
     size: i32,
     null: bool,
 }
@@ -48,7 +106,7 @@ pub struct ObjectOpenMap<K, V> {
 impl<K: Clone, V: Clone> Clone for ObjectOpenMap<K, V> {
     fn clone(&self) -> Self {
         Self {
-            table: Rc::new(RefCell::new(self.table.borrow().clone())),
+            table: Shared::new(self.table.borrow().clone()),
             size: self.size,
             null: self.null,
         }
@@ -57,7 +115,7 @@ impl<K: Clone, V: Clone> Clone for ObjectOpenMap<K, V> {
 impl<K, V> Default for ObjectOpenMap<K, V> {
     fn default() -> Self {
         Self {
-            table: Rc::new(RefCell::new(Table::new(32))),
+            table: Shared::new(Table::new(32)),
             size: 0,
             null: false,
         }
@@ -91,7 +149,8 @@ impl<K: ObjectKey + Clone, V: Clone> ObjectOpenMap<K, V> {
     }
     pub fn contains_key(&self, key: Option<&K>) -> bool {
         key.map_or(self.null, |k| {
-            self.table.borrow().keys[self.find(k)].is_some()
+            let p = self.find(k);
+            self.table.borrow().keys[p].is_some()
         })
     }
     pub fn get(&self, key: Option<&K>) -> Option<V> {
@@ -159,7 +218,7 @@ impl<K: ObjectKey + Clone, V: Clone> ObjectOpenMap<K, V> {
         }
         table.values[n] = old.values[old_n].clone();
         drop(old);
-        self.table = Rc::new(RefCell::new(table));
+        self.table = Shared::new(table);
     }
     fn shift(
         &mut self,
@@ -362,7 +421,8 @@ impl<K: ObjectKey + Clone, V: Clone> ObjectOpenMap<K, V> {
         mut action: impl FnMut(&mut Self, Option<K>, Option<V>) -> Result<(), E>,
     ) -> Result<(), TraversalError<E>> {
         if self.null {
-            let value = self.table.borrow().values[self.n()].clone();
+            let n = self.n();
+            let value = self.table.borrow().values[n].clone();
             action(self, None, value).map_err(TraversalError::Callback)?;
         }
         // Keys are captured after the null callback. Values remain live even if
