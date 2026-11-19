@@ -115,6 +115,7 @@ pub enum H {
     HdrPeak,
     HdrPaperWhite,
     HdrUiBrightness,
+    HdrColorBoost,
     HdrLook,
     BatteryMode,
     ShadowCache,
@@ -633,6 +634,11 @@ pub fn rows() -> Vec<(Page, Vec<(&'static str, Vec<Setting>)>)> {
                             "How bright the HUD and menus are. Auto: at paper white.",
                         ),
                         h(
+                            H::HdrColorBoost,
+                            None,
+                            "0%: exact colours. More: stretched to your display's range, as SDR often is.",
+                        ),
+                        h(
                             H::HdrLook,
                             None,
                             "Horizon: light sources and the sun shine past white. Vanilla: just as SDR.",
@@ -829,6 +835,7 @@ impl H {
                 n => (1.0 + crate::graphics::peak_step_of(n as f32)) / PEAK_POSITIONS as f32,
             }),
             H::HdrBlackLevel => Some(g.hdr_black_level as f32 / 100.0),
+            H::HdrColorBoost => Some(g.hdr_color_boost as f32 / 100.0),
             _ => None,
         }
     }
@@ -844,6 +851,8 @@ impl H {
             H::HdrPaperWhite | H::HdrUiBrightness => Some(crate::graphics::NITS_STEPS),
             H::HdrPeak => Some(PEAK_POSITIONS),
             H::HdrBlackLevel => Some(100),
+            // 0..100% by 5.
+            H::HdrColorBoost => Some(20),
             _ => None,
         }
     }
@@ -972,6 +981,7 @@ impl H {
                 "Black Level",
                 lang::tr("%s nits", &[&format!("{:.2}", g.black_level_nits())]),
             ),
+            H::HdrColorBoost => labelled_percent("Color Boost", g.hdr_color_boost),
             // Under a shader pack the look is the pack's: its name, greyed (`Item::blocked`).
             H::HdrLook => Text::option_name_value(
                 Text::literal(lang::get_or("horizon.hdr.look", "Look")),
@@ -1029,6 +1039,7 @@ impl H {
                 }
             }
             H::HdrBlackLevel => g.hdr_black_level = (v * 100.0).round() as u32,
+            H::HdrColorBoost => g.hdr_color_boost = (v * 20.0).round() as u32 * 5,
             _ => {}
         }
     }
@@ -1170,6 +1181,7 @@ impl Item {
                 | H::HdrPeak
                 | H::HdrPaperWhite
                 | H::HdrUiBrightness
+                | H::HdrColorBoost
                 | H::HdrLook,
             ) if !out.hdr_frame_supported => Some("Your GPU or graphics API doesn't support it."),
             Item::Horizon(
@@ -1178,6 +1190,7 @@ impl Item {
                 | H::HdrPeak
                 | H::HdrPaperWhite
                 | H::HdrUiBrightness
+                | H::HdrColorBoost
                 | H::HdrLook,
             ) if !out.hdr_offered() => Some("Your display or system doesn't offer HDR output."),
             Item::Horizon(
@@ -1186,6 +1199,7 @@ impl Item {
                 | H::HdrPeak
                 | H::HdrPaperWhite
                 | H::HdrUiBrightness
+                | H::HdrColorBoost
                 | H::HdrLook,
             ) if !out.requests_hdr(s.horizon.hdr) => Some(if out.held {
                 HDR_HELD
@@ -1217,6 +1231,9 @@ impl Item {
             // VideoSettingsScreen.tick: Max Anisotropy only works with Anisotropic filtering.
             Item::Vanilla(Opt::MaxAnisotropy) if s.file.int("textureFiltering") != 2 => {
                 Some("Only with Anisotropic texture filtering.")
+            }
+            Item::Horizon(H::LeafCulling) if !s.horizon.vanilla_models(&s.resource_packs) => {
+                Some("Only with the default resource pack.")
             }
             _ => None,
         }
@@ -1302,7 +1319,7 @@ impl Item {
         self.touched(s);
     }
     pub fn cycle(self, s: &mut Settings, back: bool, framebuffer: [i32; 2], out: &EffectiveOutput) {
-        if !self.available() {
+        if !self.available() || self.blocked(s, out).is_some() {
             return;
         }
         match self {
@@ -1500,6 +1517,7 @@ impl Screen for GraphicsScreen {
             id: page,
             name: lang::get(page.name()),
             about: lang::get(page.about()),
+            warning: None,
             groups: groups
                 .into_iter()
                 .map(|(name, settings)| Group {
@@ -2759,6 +2777,31 @@ mod tests {
         );
         assert_eq!(s.horizon.leaf_culling, LeafCullingMode::Hidden);
         assert_eq!(s.horizon.preset, Preset::Custom);
+
+        // A custom resource pack blocks leaf culling and explains why.
+        s.resource_packs = vec!["vanilla".into(), "faithful.zip".into()];
+        assert_eq!(
+            item.blocked(&s, &NONE),
+            Some("Only with the default resource pack.")
+        );
+        let before_mode = s.horizon.leaf_culling;
+        item.cycle(&mut s, false, FB, &NONE);
+        assert_eq!(s.horizon.leaf_culling, before_mode);
+        let screen_row = GraphicsScreen::default()
+            .sheets(&s)
+            .into_iter()
+            .flat_map(|sh| sh.groups)
+            .flat_map(|g| g.rows)
+            .find(|row| row.id == item)
+            .unwrap();
+        assert!(!screen_row.live);
+        assert_eq!(
+            screen_row.why.as_deref(),
+            Some("Only with the default resource pack.")
+        );
+
+        s.resource_packs = vec!["vanilla".into()];
+        assert_eq!(item.blocked(&s, &NONE), None);
     }
 
     #[test]
@@ -2776,6 +2819,7 @@ mod tests {
             H::HdrPeak,
             H::HdrBlackLevel,
             H::HdrUiBrightness,
+            H::HdrColorBoost,
         ];
         for h in options {
             let item = Item::Horizon(h);
@@ -2925,6 +2969,7 @@ mod tests {
                 "No settings match.",
                 "Undo",
                 "Done",
+                "Only with the default resource pack.",
             ] {
                 lang::get(text);
             }
