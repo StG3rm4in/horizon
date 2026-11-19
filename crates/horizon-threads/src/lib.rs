@@ -593,8 +593,9 @@ const ALLOW_THP: libmimalloc_sys::mi_option_t = 43;
 ///
 /// Either setting stays mimalloc's when its variable is in the environment
 /// (`MIMALLOC_PURGE_DELAY`, `MIMALLOC_ALLOW_THP`): mimalloc read it at startup.
-/// `horizon-server` sets both for the game it runs, to mimalloc's own values
-/// unless `[engine] low_memory` (horizon-server-launch, docs/hosting.md).
+/// `horizon-server` sets both for the game it runs (a second's delay, huge pages
+/// given back only whole) unless `[engine] low_memory` (horizon-server-launch,
+/// docs/hosting.md).
 pub fn configure_allocator() {
     if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
         // SAFETY: sets one integer option, which mimalloc reads at each purge.

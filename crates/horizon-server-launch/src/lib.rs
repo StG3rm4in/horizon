@@ -215,14 +215,15 @@ pub fn command_with_transfers(
         windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP
             | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
     );
-    // `[engine] low_memory` chooses the game's allocator settings (docs/hosting.md). Off, mimalloc's own:
-    // freed memory kept a second before it goes back to the OS, and transparent huge pages on its arenas,
-    // for a tick ~7 % faster at 100 players and ~0.7 GB more. On, the game client's (configure_allocator):
-    // freed memory back at once, no huge pages. A variable set in our own environment stays.
+    // `[engine] low_memory` chooses the game's allocator settings (docs/hosting.md). Off: freed memory kept
+    // a second before it goes back to the OS, and transparent huge pages on mimalloc's arenas, given back
+    // only whole (`MIMALLOC_ALLOW_THP=2`: a purge of less than 2 MiB would split one), for a tick ~12 %
+    // faster at 100 players and ~0.8 GB more. On, the game client's (configure_allocator): freed memory
+    // back at once, no huge pages. A variable set in our own environment stays.
     let (thp, purge) = if low_memory {
         ("0", "0")
     } else {
-        ("1", "1000")
+        ("2", "1000")
     };
     for (key, value) in [("MIMALLOC_ALLOW_THP", thp), ("MIMALLOC_PURGE_DELAY", purge)] {
         if std::env::var_os(key).is_none() {
@@ -359,7 +360,7 @@ mod tests {
                 .is_none()
                 .then(|| std::ffi::OsString::from(value))
         };
-        for (low_memory, thp, purge) in [(true, "0", "0"), (false, "1", "1000")] {
+        for (low_memory, thp, purge) in [(true, "0", "0"), (false, "2", "1000")] {
             for (key, value) in [("MIMALLOC_ALLOW_THP", thp), ("MIMALLOC_PURGE_DELAY", purge)] {
                 assert_eq!(
                     env(low_memory, key),

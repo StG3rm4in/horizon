@@ -804,8 +804,9 @@ For more than 50 active players, give it more cores.
 
 Off by default. The game's allocator (mimalloc) then keeps the memory it frees for a second before giving
 it back to the system, and on Linux backs its memory with transparent huge pages (2 MB each) where the
-system allows them. The server holds more memory, part of it in pages it doesn't use, but its tick runs
-faster: fewer page faults and fewer address translations. Under `[engine]`, `low_memory = true` starts the
+system allows them, giving memory back only by whole huge pages so they stay whole. The server holds more
+memory, part of it in pages it doesn't use, but its tick runs faster: fewer page faults and fewer address
+translations. Under `[engine]`, `low_memory = true` starts the
 game with the game client's settings instead: freed memory goes back at once, no huge pages. Measured on a
 6-core Linux server (Core i5-10600K) with 100 bots playing, three to six runs each (2026-11-18):
 
@@ -818,9 +819,14 @@ game with the game client's settings instead: freed memory goes back at once, no
 Huge pages give 2.4 ms of that gap for 0.4 GB. Keeping freed memory a second gives the other 3.7 ms for
 0.25 GB: it saves about 700,000 page faults a minute.
 
+Giving memory back only by whole huge pages (`MIMALLOC_ALLOW_THP=2`, the default since 2026-11-19; `1`
+before) raised the share of the game's memory in huge pages from 35 % to 61 % and took the average tick
+from 62.1 to 58.9 ms (−5 %), its 99th percentile from 82 to 77 ms, for about 0.1 GB more (same server, PGO
+build, cores at 4.9 GHz, three runs each).
+
 Turn it on when memory is what you're short of, for example on a small VPS. It applies at the next start.
 A game started without `horizon-server` (`horizon-client --dedicated`, a container of your own) runs with the
-`low_memory = true` settings; `MIMALLOC_ALLOW_THP=1 MIMALLOC_PURGE_DELAY=1000` in its environment give it the
+`low_memory = true` settings; `MIMALLOC_ALLOW_THP=2 MIMALLOC_PURGE_DELAY=1000` in its environment give it the
 default ones. Either variable set in `horizon-server`'s own environment wins over `low_memory`. On macOS and
 Windows only the delay applies, and it was not measured there.
 
