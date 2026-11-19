@@ -6,7 +6,10 @@ use crate::{
     fast_hash::FxHashMap,
     section_mask::SectionMask,
 };
-use horizon_world::{level::RandomTickMask, registry::BlockStateId};
+use horizon_world::{
+    level::{RandomTickMask, RandomTickMaskUpdate},
+    registry::BlockStateId,
+};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
@@ -117,6 +120,50 @@ impl RandomTickSections {
         });
         Some((y, mask.clone()))
     }
+    /// For [`ChunkTicking`]: the ticking sections of `chunk` from block `from_y` up, as
+    /// [`Sections::from`] counts them, in ascending order, each with the mask
+    /// [`Self::next_masked`] would hand out now (`None` when not built yet: it is built at the
+    /// section's first draw, as there). Returns the minimum Y of the chunk's section 0.
+    fn read_from(
+        &mut self,
+        key: (i32, i32),
+        chunk: &Arc<Chunk>,
+        facts: &BlockFacts,
+        from_y: i32,
+        out: &mut Vec<Ticking>,
+    ) -> i32 {
+        let cached = Self::refresh(&mut self.chunks, key, chunk, &mut |id| {
+            facts.get(BlockStateId(id)).random_ticks
+        });
+        let base = cached.sections.base;
+        let first = ((from_y - base) >> 4).max(0) as usize;
+        for index in cached.sections.mask.iter().filter(|&i| i >= first) {
+            out.push(Ticking {
+                y: base + index as i32 * 16,
+                index,
+                mask: cached.masks[index].clone(),
+            });
+        }
+        base
+    }
+    /// For [`ChunkTicking`]: the mask of section `index` of `chunk` as [`Self::next_masked`]
+    /// hands it out, built now if it is not yet.
+    fn mask_of(
+        &mut self,
+        key: (i32, i32),
+        chunk: &Arc<Chunk>,
+        facts: &BlockFacts,
+        index: usize,
+        mut candidate: impl FnMut(u32) -> bool,
+    ) -> Rc<RandomTickMask> {
+        let cached = Self::refresh(&mut self.chunks, key, chunk, &mut |id| {
+            facts.get(BlockStateId(id)).random_ticks
+        });
+        let mask = cached.masks[index].get_or_insert_with(|| {
+            Rc::new(Self::candidate_mask(&chunk.sections[index], &mut candidate))
+        });
+        mask.clone()
+    }
     /// Builds, on the tick's helper threads (`crate::parallel`), the masks [`Self::next_masked`]
     /// will build at the first draw in each ticking section of the chunks `keys` names, from their
     /// blocks now (`chunk_of`), so the random tick loop finds them built. A mask only tells the loop
@@ -215,6 +262,72 @@ impl RandomTickSections {
             cached.chunk = Arc::downgrade(chunk);
         }
         cached
+    }
+}
+
+/// A ticking section as [`ChunkTicking`] read it.
+struct Ticking {
+    y: i32,
+    index: usize,
+    /// Until it is handed out; `None` when it was not built at the reading.
+    mask: Option<Rc<RandomTickMask>>,
+}
+
+/// One chunk's ticking sections through its random tick
+/// (`Behaviours::tick_chunk_random_masked`): read once from [`RandomTickSections`], then answered
+/// from that reading for as long as the world stays as it was read (`stamp`: its block revision
+/// and its chunk membership), with the answers [`RandomTickSections::next_masked`] gives. Asking
+/// that at every section cost two map lookups and a mask's reference count each time, cache
+/// misses a few times per chunk; the masks are now counted together at the reading.
+#[derive(Default)]
+pub struct ChunkTicking {
+    key: (i32, i32),
+    stamp: Option<(u64, u64)>,
+    /// The minimum Y of the chunk's section 0 at the reading.
+    base: i32,
+    /// The ticking sections from the ask that read them up, in ascending order.
+    list: Vec<Ticking>,
+    /// The section of the last answer since the reading.
+    last: Option<usize>,
+}
+impl ChunkTicking {
+    /// Starts the asks for chunk `key`.
+    pub fn start(&mut self, key: (i32, i32)) {
+        self.key = key;
+        self.stamp = None;
+        self.list.clear();
+        self.last = None;
+    }
+    /// The lowest ticking section from block `from` up and its mask: `Keep` when it is the
+    /// section of the last answer at the same `stamp`, which is when the old per-ask lookup
+    /// said its answer still stood (the random tick asks from rising Ys). `chunk` (the chunk now)
+    /// is called only to read the chunk again or to build a mask.
+    pub fn next<'c>(
+        &mut self,
+        sections: &mut RandomTickSections,
+        chunk: impl Fn() -> Option<&'c Arc<Chunk>>,
+        facts: &BlockFacts,
+        candidate: impl FnMut(u32) -> bool,
+        from: i32,
+        stamp: (u64, u64),
+    ) -> Option<(i32, RandomTickMaskUpdate)> {
+        if self.stamp != Some(stamp) {
+            self.stamp = Some(stamp);
+            self.list.clear();
+            self.last = None;
+            self.base = sections.read_from(self.key, chunk()?, facts, from, &mut self.list);
+        }
+        let first = ((from - self.base) >> 4).max(0) as usize;
+        let section = self.list.iter_mut().find(|s| s.index >= first)?;
+        if self.last == Some(section.index) {
+            return Some((section.y, RandomTickMaskUpdate::Keep));
+        }
+        self.last = Some(section.index);
+        let mask = match section.mask.take() {
+            Some(mask) => mask,
+            None => sections.mask_of(self.key, chunk()?, facts, section.index, candidate),
+        };
+        Some((section.y, RandomTickMaskUpdate::Replace(Some(mask))))
     }
 }
 
@@ -432,6 +545,8 @@ mod tick_parity {
         events: Vec<LevelEvent>,
         time: i64,
         speed: i32,
+        /// Counts the block changes, as `World::revision` does (for `ChunkTicking`).
+        revision: u64,
     }
     impl horizon_world::level::BlockEntityNeighbors for Level {}
     impl LevelAccess for Level {
@@ -443,9 +558,11 @@ mod tick_parity {
         }
         fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
             let chunk = self.chunks.get_mut(&(pos.x >> 4, pos.z >> 4))?;
-            Some(BlockStateId(
-                Arc::make_mut(chunk).set(pos.x, pos.y, pos.z, state.0),
-            ))
+            let previous = Arc::make_mut(chunk).set(pos.x, pos.y, pos.z, state.0);
+            if previous != state.0 {
+                self.revision += 1;
+            }
+            Some(BlockStateId(previous))
         }
         fn is_loaded(&self, pos: BlockPos) -> bool {
             self.chunks.contains_key(&(pos.x >> 4, pos.z >> 4))
@@ -519,6 +636,7 @@ mod tick_parity {
             events: Vec::new(),
             time: 0,
             speed: 3,
+            revision: 0,
         };
         // More than 128 ticking sections: prepare_masks must exercise its
         // helper path when HORIZON_PARALLEL_TICK is enabled, not just defer work.
@@ -531,6 +649,11 @@ mod tick_parity {
         let mut masked = original.clone();
         // The masked path again, its masks built ahead of each tick (`prepare_masks`).
         let mut prepared = original.clone();
+        // The masked path once more, each chunk's sections read once (`ChunkTicking`).
+        let mut snapped = original.clone();
+        let mut snap_cache = RandomTickSections::default();
+        let mut snap_ticking = ChunkTicking::default();
+        let mut e = Ticks::new(12345);
         let mut prep_cache = RandomTickSections::default();
         let mut d = Ticks::new(12345);
         let mut cache = RandomTickSections::default();
@@ -541,9 +664,16 @@ mod tick_parity {
             b.add_empty_chunk(ChunkPos::new(x, 0)).unwrap();
             c.add_empty_chunk(ChunkPos::new(x, 0)).unwrap();
             d.add_empty_chunk(ChunkPos::new(x, 0)).unwrap();
+            e.add_empty_chunk(ChunkPos::new(x, 0)).unwrap();
         }
         for step in 0..128 {
-            for level in [&mut original, &mut cached, &mut masked, &mut prepared] {
+            for level in [
+                &mut original,
+                &mut cached,
+                &mut masked,
+                &mut prepared,
+                &mut snapped,
+            ] {
                 level.time = step;
                 level.speed = [0, 1, 3, 9][step as usize % 4];
                 level.reads.borrow_mut().clear();
@@ -584,16 +714,24 @@ mod tick_parity {
                 cache.remove(&(-1, 0));
                 mask_cache.remove(&(-1, 0));
                 prep_cache.remove(&(-1, 0));
+                snap_cache.remove(&(-1, 0));
             }
             if step == 50 || step == 60 {
                 facts.states[grass.0 as usize].random_ticks = step == 60;
                 cache.clear();
                 mask_cache.clear();
                 prep_cache.clear();
+                snap_cache.clear();
             }
             // A write between ticks.
             if step == 20 {
-                for level in [&mut original, &mut cached, &mut masked, &mut prepared] {
+                for level in [
+                    &mut original,
+                    &mut cached,
+                    &mut masked,
+                    &mut prepared,
+                    &mut snapped,
+                ] {
                     level.set_raw(BlockPos::new(0, MIN_Y + 16, 0), grass);
                 }
             }
@@ -645,6 +783,27 @@ mod tick_parity {
                         .map(|(y, mask)| (y, RandomTickMaskUpdate::Replace(Some(mask))))
                 };
                 behaviours.tick_chunk_random_masked(&mut masked, &mut c, ChunkPos::new(x, z), next);
+            }
+            for (x, z) in lit(&snapped) {
+                snap_ticking.start((x, z));
+                let next = |level: &mut Level, from| {
+                    let stamp = (level.revision, 0);
+                    let chunks = &level.chunks;
+                    snap_ticking.next(
+                        &mut snap_cache,
+                        || chunks.get(&(x, z)),
+                        &facts,
+                        |id| behaviours.random_tick_candidate(BlockStateId(id)),
+                        from,
+                        stamp,
+                    )
+                };
+                behaviours.tick_chunk_random_masked(
+                    &mut snapped,
+                    &mut e,
+                    ChunkPos::new(x, z),
+                    next,
+                );
             }
             let keys = lit(&prepared);
             let candidate = |id| behaviours.random_tick_candidate(BlockStateId(id));
@@ -702,6 +861,24 @@ mod tick_parity {
             );
             assert!(masked.reads.borrow().len() <= original.reads.borrow().len());
             assert_eq!(
+                original.events, snapped.events,
+                "snapped events at tick {step}"
+            );
+            assert_eq!(
+                *masked.reads.borrow(),
+                *snapped.reads.borrow(),
+                "snapped reads at tick {step}"
+            );
+            assert_eq!(
+                a.random_tick_value, e.random_tick_value,
+                "snapped position RNG at tick {step}"
+            );
+            assert_eq!(
+                original.random.clone().next_long(),
+                snapped.random.next_long(),
+                "snapped level RNG at tick {step}"
+            );
+            assert_eq!(
                 a.random_tick_value, c.random_tick_value,
                 "masked position RNG at tick {step}"
             );
@@ -736,6 +913,9 @@ mod tick_parity {
                 assert_eq!(s.blocks, t.blocks);
             }
             for (s, t) in c.sections.iter().zip(&prepared.chunks[key].sections) {
+                assert_eq!(s.blocks, t.blocks);
+            }
+            for (s, t) in c.sections.iter().zip(&snapped.chunks[key].sections) {
                 assert_eq!(s.blocks, t.blocks);
             }
         }

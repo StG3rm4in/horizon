@@ -273,35 +273,27 @@ impl Game<'_> {
                 });
             }
             horizon_client::spans::time("random_ticks", || {
+                // Each chunk's ticking sections, read once and answered from while no block
+                // changes and no chunk comes or goes; the mask itself is retained by
+                // tick_chunk_random_masked between callback asks.
+                let mut sections = horizon_client::random_tick_sections::ChunkTicking::default();
                 for (x, z) in scratch.ticking.drain(..).filter(|_| !debug) {
-                    // The last answer, asked from Y `from` at a world revision:
-                    // the next ticking section. It stands for a later Y up to
-                    // that section's until a block changes; the mask itself is
-                    // retained by tick_chunk_random_masked between callback asks.
-                    let mut last: Option<(u64, i32, Option<i32>)> = None;
                     let pos = horizon_core::position::ChunkPos::new(x, z);
+                    sections.start((x, z));
                     b.tick_chunk_random_masked(level, ticks, pos, |level, from| {
-                        let revision = level.world.revision;
-                        let stands = last.as_ref().is_some_and(|(r, f, next_y)| {
-                            *r == revision && *f <= from && next_y.is_none_or(|y| from <= y)
-                        });
-                        if stands {
-                            return last.as_ref().and_then(|(_, _, next_y)| {
-                                next_y.map(|y| (y, RandomTickMaskUpdate::Keep))
-                            });
-                        }
-                        let next = level.world.chunks.get(&(x, z)).and_then(|chunk| {
-                            level.random_tick_sections.next_masked(
-                                (x, z),
-                                chunk,
-                                level.facts,
-                                |id| b.random_tick_candidate(BlockStateId(id)),
-                                from,
-                            )
-                        });
-                        let next_y = next.as_ref().map(|(y, _)| *y);
-                        last = Some((revision, from, next_y));
-                        next.map(|(y, mask)| (y, RandomTickMaskUpdate::Replace(Some(mask))))
+                        let stamp = (
+                            level.world.revision,
+                            level.world.chunks.membership_revision(),
+                        );
+                        let chunks = &level.world.chunks;
+                        sections.next(
+                            level.random_tick_sections,
+                            || chunks.get(&(x, z)),
+                            level.facts,
+                            |id| b.random_tick_candidate(BlockStateId(id)),
+                            from,
+                            stamp,
+                        )
                     });
                 }
             });
