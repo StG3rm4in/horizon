@@ -443,6 +443,22 @@ pub fn decide_consumption(m: &Mob, w: &MobWorld) -> Option<Consumption> {
     })
 }
 
+/// Whether this fox's next `aiStep` may stop for a meal ([`ai_step_until_consumption`]), as its
+/// last tick left it: awake on the ground without a target, holding something it eats, and 600 ticks
+/// since it last ate.
+pub fn may_eat_next_tick(m: &Mob, w: &MobWorld) -> bool {
+    m.species() == Species::Fox
+        && !m.no_ai
+        && m.alive()
+        && m.extra.ints[TICKS_SINCE_EATEN] >= 600
+        && m.ai.target.is_none()
+        && m.on_ground
+        && !flag(m, SLEEPING)
+        && m.extra
+            .main_hand_stack()
+            .is_some_and(|stack| eats(w, stack))
+}
+
 /// Apply a still-current consumption decision using the existing effects and remainder.
 /// The game can resume at the same boundary after giving its full host to a listener.
 pub fn apply_consumption(

@@ -595,6 +595,21 @@ impl<T, const DIRECT: bool> JoinList<T, DIRECT> {
         self.written();
         std::mem::take(self)
     }
+    /// A pass's rows, moved out as they are for work that gives the same entities back in the
+    /// same order through [`Self::put_rows`] (the parallel mob tick's groups own their mobs on
+    /// other threads): no membership change is told, and the pass keeps its bindings and leases.
+    #[cfg(feature = "upstream-parallel-mob-islands")]
+    pub fn take_rows(&mut self) -> Vec<T> {
+        self.written();
+        std::mem::take(&mut self.0)
+    }
+    /// The rows [`Self::take_rows`] took, back into the emptied pass.
+    #[cfg(feature = "upstream-parallel-mob-islands")]
+    pub fn put_rows(&mut self, rows: Vec<T>) {
+        self.written();
+        debug_assert!(self.0.is_empty(), "rows put back into a pass that has rows");
+        self.0 = rows;
+    }
     /// Restore a lifted pass using its established spawn-buffer ordering.
     /// An unbound staged batch is admitted without closing another pass.
     pub fn restore(&mut self, mut taken: Self, order: RestoreOrder) {

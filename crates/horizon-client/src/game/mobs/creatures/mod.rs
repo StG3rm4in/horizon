@@ -7,6 +7,8 @@ pub(super) mod biome_facts;
 #[cfg(test)]
 mod borrowed_panic_tests;
 mod borrowed_tick;
+#[cfg(feature = "upstream-parallel-mob-islands")]
+mod island_tick;
 mod breeding;
 mod combat_adaptations;
 mod conversion_identity;
@@ -1351,7 +1353,7 @@ impl Game<'_> {
         // The level's random and attachments, lent to the mobs (brain behaviours draw from
         // the random, and a hit's damage hooks get both) and taken back after their ticks.
         let lent = horizon_client::health::LentLevel::take(&mut self.world);
-        let (lent, dispatch_panic) = self.tick_borrowed_creatures(borrowed_tick::BorrowedMobTick {
+        let state = borrowed_tick::BorrowedMobTick {
             mobs: &mut mobs,
             snapshot: &mut snapshot,
             passenger_objects: &passenger_objects,
@@ -1375,7 +1377,16 @@ impl Game<'_> {
             uuid,
             level_id,
             round: &round,
-        });
+        };
+        // Under the parallel tick, in islands on several threads when nothing in the tick needs
+        // the game between two turns (island_tick.rs).
+        #[cfg(feature = "upstream-parallel-mob-islands")]
+        let (lent, dispatch_panic) = match self.tick_mob_islands(state) {
+            Ok(done) => done,
+            Err(state) => self.tick_borrowed_creatures(*state),
+        };
+        #[cfg(not(feature = "upstream-parallel-mob-islands"))]
+        let (lent, dispatch_panic) = self.tick_borrowed_creatures(state);
         if dispatch_panic.is_some() {
             // The aborted pass never applies retention, including previously
             // finished despawn answers. Do not carry those into the retry.

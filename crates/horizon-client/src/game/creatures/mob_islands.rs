@@ -19,8 +19,9 @@
 //! `HORIZON_PARALLEL_TICK=1` turns it on (off by default), `verify` also runs the serial loop on
 //! copies and logs a tick whose result differs. The loop stays serial under `HORIZON_TEST_SEEDS`,
 //! with few ticking mobs, when one island holds most of them, and while a native mod may hook a
-//! mob's turn, as the build finds it (`horizon_mod_api_gen::mob_turn`). The hooks that hand
-//! nothing back are kept and told at the join, in list order (`native_client_hooks::Deferred`).
+//! mob's turn, as the build finds it (`horizon_mod_api_gen::mob_turn`), whenever a turn would
+//! call back into the game ([`HostSerial`]), and while a fox may stop for a meal, which the game
+//! serves between two turns.
 //! Everything else a mob can reach in its turn is in its reach: a pet's teleport to its owner, a
 //! teleporting meal, a changed speed, a wither's head targets and a warden's suspects; a raid's
 //! raiders share an island. How each bound is derived: `docs/mob-islands.md`.
@@ -31,7 +32,7 @@ use super::mob_group::{Group, Shared, Start, Turns};
 use super::*;
 use horizon_client::{
     fast_hash::{FxHashMap, FxHashSet},
-    mobs::{ForeignSeen, MobSlot, WhoLookup, leash, seen_grid::SeenGrid},
+    mobs::{ForeignSeen, WhoLookup, leash, seen_grid::SeenGrid},
 };
 use horizon_core::{
     geometry::{Aabb, Axis},
@@ -108,6 +109,11 @@ fn capped_lanes(requested: usize, hardware: Option<usize>) -> usize {
     requested.clamp(1, 8).min(hardware.unwrap_or(1).max(1))
 }
 
+/// Whether the loop may run in groups at all: more than one lane (the parallel tick is on).
+pub(super) fn may_group() -> bool {
+    lanes() > 1
+}
+
 /// The threads the loop may run on, capped at the machine's available parallelism.
 fn lanes() -> usize {
     let hardware = std::thread::available_parallelism().ok().map(usize::from);
@@ -145,32 +151,62 @@ pub(super) struct Islands<'t> {
     pub uuid: Option<[i32; 4]>,
     /// A new entity-ticking test for a group's thread (`Game::entity_ticking_area`).
     pub ticking: &'t dyn Fn() -> Box<dyn Fn(i32, i32) -> bool + Send>,
+    /// What keeps the tick serial on the game's side.
+    pub host: HostSerial,
+}
+
+/// What on the game's side keeps a tick serial: the borrowed loop (`borrowed_tick.rs`) calls back
+/// into the game for it, in a turn or between two, which no group can do.
+#[derive(Default)]
+pub(super) struct HostSerial {
+    /// A native mod is loaded, or the mobs' world calls into the game in a turn: its mod hooks
+    /// and goal host, the asked events, the `MobDespawn` and `LivingChangeTarget` listeners, the
+    /// entity section observers.
+    pub hooks: bool,
+    /// A mob rides below a vehicle that left the level, a vehicle was removed under its riders,
+    /// or entities wait off the level: the borrowed loop settles them through the game.
+    pub off_level: bool,
+    /// Pushes kept from an aborted pass, which its mobs take at their turns.
+    pub pending_pushes: bool,
+    /// A fox may stop for a meal (`fox::may_eat_next_tick`): its turn pauses for the game to serve
+    /// it (`TickProgress::Consumption`).
+    pub meal: bool,
 }
 
 impl Islands<'_> {
-    /// The groups this tick's mobs run in; None when the loop runs serially.
-    pub(super) fn plan(
-        &self,
-        mobs: &[Mob],
-        snapshot: &[Seen],
-        turns: &Turns,
-        start: &Start,
-    ) -> Option<Plan> {
-        let lanes = lanes();
-        let early = if lanes < 2 {
-            Some(Verdict::OneLane)
-        } else if mods_hook_turns() {
-            Some(Verdict::ModsHookTurns)
-        } else if mobs.len() < MIN_TICKING {
-            Some(Verdict::FewMobs)
-        } else if horizon_client::random_source::repeating_per_thread() {
-            Some(Verdict::RepeatingSeeds)
-        } else {
-            None
-        };
-        if let Some(verdict) = early {
-            verdict.record(&Census::default());
-            return None;
+    /// Whether the tick runs serially for a reason found without the plan, counted under its
+    /// verdict: the caller asks before it builds what the plan reads.
+    pub(super) fn serial_now(&self, mobs: &[Mob]) -> bool {
+        match self.early(mobs) {
+            Some(verdict) => {
+                verdict.record(&Census::default());
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn early(&self, mobs: &[Mob]) -> Option<Verdict> {
+        if lanes() < 2 {
+            return Some(Verdict::OneLane);
+        }
+        if mods_hook_turns() {
+            return Some(Verdict::ModsHookTurns);
+        }
+        if mobs.len() < MIN_TICKING {
+            return Some(Verdict::FewMobs);
+        }
+        if horizon_client::random_source::repeating_per_thread() {
+            return Some(Verdict::RepeatingSeeds);
+        }
+        if self.host.hooks {
+            return Some(Verdict::HostHooks);
+        }
+        if self.host.off_level {
+            return Some(Verdict::OffLevel);
+        }
+        if self.host.pending_pushes {
+            return Some(Verdict::PendingPushes);
         }
         // A content mod's effect ticks through the native mods (`ModEffectTicks`), which run
         // only on the server thread.
@@ -179,12 +215,29 @@ impl Islands<'_> {
                 m.extra
                     .effects
                     .iter()
-                    .any(|e| horizon_client_core::potions::is_mod_effect(e.0))
+                    .any(|e| horizon_client_core::potions::is_mod_effect(e.id))
             })
         {
-            Verdict::ModEffect.record(&Census::default());
+            return Some(Verdict::ModEffect);
+        }
+        if self.host.meal {
+            return Some(Verdict::Meal);
+        }
+        None
+    }
+
+    /// The groups this tick's mobs run in; None when the loop runs serially.
+    pub(super) fn plan(
+        &self,
+        mobs: &[Mob],
+        snapshot: &[Seen],
+        turns: &Turns,
+        start: &Start,
+    ) -> Option<Plan> {
+        if self.serial_now(mobs) {
             return None;
         }
+        let lanes = lanes();
         // Where an owner stands: the players a pet can see this tick.
         let players: Vec<([i32; 4], Vec3)> = start
             .player
@@ -217,16 +270,17 @@ impl Islands<'_> {
     }
 
     /// The loop's turns in the plan's groups, each on its own thread, put back together as the
-    /// serial loop's one group would have left them.
+    /// serial loop's one group would have left them. The groups take the mobs out of `mobs`; a
+    /// turn's panic puts them all back into it, as far as their turns got, before it goes on.
     pub(super) fn run(
         &self,
         plan: Plan,
-        mut mobs: Vec<Mob>,
+        mobs: &mut Vec<Mob>,
         snapshot: Vec<Seen>,
         mut start: Start,
         turns: &mut Turns,
         shared: &Shared,
-    ) -> Group<Mob> {
+    ) -> Group {
         use horizon_client::random_source;
         // `verify`: allocate seeds only in the serial copy, replay them in the grouped copy.
         // Neither the global counter nor the client threads' clock/seed policy is changed.
@@ -241,13 +295,14 @@ impl Islands<'_> {
         let draws = OrderedDraws::new(&start.random, lanes);
         // The whole list's grid, as each group's must answer.
         let whole = SeenGrid::bounds_of(snapshot.iter().map(|s| s.bounds));
-        let mut slots: Vec<Option<&mut Mob>> = mobs.iter_mut().map(Some).collect();
-        let mut groups: Vec<Group<&mut Mob>> = plan
+        // Each group takes its mobs out of the list, and they go back at the end.
+        let mut slots: Vec<Option<Mob>> = std::mem::take(mobs).into_iter().map(Some).collect();
+        let mut groups: Vec<Group> = plan
             .groups
             .into_iter()
             .enumerate()
             .map(|(lane, members)| {
-                let group_mobs: Vec<&mut Mob> = members
+                let group_mobs: Vec<Mob> = members
                     .iter()
                     .map(|&k| slots[k].take().expect("a mob is in one group"))
                     .collect();
@@ -269,7 +324,6 @@ impl Islands<'_> {
                     bindings,
                     died,
                     ticked: FxHashSet::default(),
-                    targets: members.iter().map(|&k| start.targets[k]).collect(),
                 };
                 let seen = members.iter().map(|&k| snapshot[k].clone()).collect();
                 let mut group = Group::new(group_mobs, seen, group_start).answering_as(whole);
@@ -280,13 +334,19 @@ impl Islands<'_> {
         #[cfg(test)]
         RAN.with(|r| r.set(lanes));
         let mut board = Board::new(snapshot, &groups, Arc::clone(&draws));
-        self.run_threads(
-            &mut groups,
-            &board,
-            turns,
-            shared,
-            serial.as_ref().map(|s| &s.1),
-        );
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run_threads(
+                &mut groups,
+                &board,
+                turns,
+                shared,
+                serial.as_ref().map(|s| &s.1),
+            )
+        }));
+        if let Err(payload) = ran {
+            *mobs = in_list_order(groups, n);
+            std::panic::resume_unwind(payload);
+        }
         // Each mob's entries, in list order: the turns' ranges in its group.
         let mut place = vec![(0u32, 0u32); n];
         for (gi, g) in groups.iter().enumerate() {
@@ -295,14 +355,11 @@ impl Islands<'_> {
             }
         }
         let mut keep = Vec::with_capacity(n);
-        let mut targets = std::mem::take(&mut start.targets);
-        targets.clear();
         let (mut dead, mut corpses, mut gone, mut guest_events) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for &(gi, li) in &place {
             let (g, li) = (&mut groups[gi as usize], li as usize);
             keep.push(g.keep[li]);
-            targets.push(g.targets[li]);
             let from = if li == 0 { [0; 5] } else { g.ends[li - 1] };
             let to = g.ends[li];
             start.events.extend_from_slice(&g.events[from[0]..to[0]]);
@@ -312,11 +369,11 @@ impl Islands<'_> {
             guest_events.extend(g.guest_events[from[4]..to[4]].iter().cloned());
         }
         let mut pushes = horizon_client::mobs::PendingPushes::default();
-        let mut deferred = Vec::new();
+        let mut credit_expired = Vec::new();
         for g in &mut groups {
-            deferred.append(&mut g.deferred);
+            credit_expired.append(&mut g.credit_expired);
             // Each member's binding and death mark as its group left them.
-            for m in g.mobs.iter().map(MobSlot::mob) {
+            for m in g.mobs.iter() {
                 match g.bindings.get(&m.id) {
                     Some(&conn) => start.bindings.insert(m.id, conn),
                     None => start.bindings.remove(&m.id),
@@ -335,25 +392,19 @@ impl Islands<'_> {
                 board.frozen[at] = seen.clone();
             }
         }
-        drop(groups);
-        // The mods hear the kept hooks as the serial loop told them: by turn, each turn's in order.
-        deferred.sort_by_key(|d| d.0);
-        for (_, d) in deferred {
-            horizon_client::native_client_hooks::replay(d);
-        }
         let Board { frozen, .. } = board;
         let mut merged = Group::new(
-            mobs,
+            in_list_order(groups, n),
             Vec::new(),
             Start {
                 random: LevelRandom::for_level(draws.finish()),
-                targets,
                 ..start
             },
         );
         (merged.keep, merged.pushes, merged.snapshot) = (keep, pushes, frozen);
         (merged.dead, merged.corpses, merged.gone) = (dead, corpses, gone);
         merged.guest_events = guest_events;
+        merged.credit_expired = credit_expired;
         if let Some((serial, seeds)) = serial {
             let diff = difference(&serial, &merged)
                 .or_else(|| (!seeds.complete()).then(|| "new RNG allocation counts differ".into()));
@@ -369,7 +420,7 @@ impl Islands<'_> {
     /// answers). The helpers' sampled costs join this thread's sums.
     fn run_threads(
         &self,
-        groups: &mut [Group<&mut Mob>],
+        groups: &mut [Group],
         board: &Board,
         turns: &Turns,
         shared: &Shared,
@@ -383,13 +434,12 @@ impl Islands<'_> {
         let (nearest, single_player, difficulty) =
             (turns.nearest, turns.single_player, turns.difficulty);
         let lookup = LoopLookup(self.uuid);
-        let (defers, canceled) = (defers(), turns.canceled);
+        let canceled = turns.canceled;
         let sampling = super::super::tick_profile::sampling();
-        let run = |g: &mut Group<&mut Mob>, ticking: Box<dyn Fn(i32, i32) -> bool + Send>| {
+        let run = |g: &mut Group, ticking: Box<dyn Fn(i32, i32) -> bool + Send>| {
             let foreign = Foreign {
                 board,
                 reader: Cell::new(0),
-                defers,
             };
             let mut base = rebuild();
             base.who_lookup = Some(&lookup);
@@ -486,6 +536,20 @@ impl Islands<'_> {
     }
 }
 
+/// Every mob of `groups` back in its place in a list of `n`, as its group's turns left it.
+fn in_list_order(groups: Vec<Group>, n: usize) -> Vec<Mob> {
+    let mut slots: Vec<Option<Mob>> = (0..n).map(|_| None).collect();
+    for g in groups {
+        for (m, &at) in g.mobs.into_iter().zip(&g.global) {
+            slots[at] = Some(m);
+        }
+    }
+    slots
+        .into_iter()
+        .map(|m| m.expect("every mob comes back from its group"))
+        .collect()
+}
+
 /// What one mob can reach this tick, for the plan.
 #[derive(Clone, Debug)]
 struct Reach {
@@ -535,11 +599,13 @@ fn jump(species: Species) -> f64 {
 /// lands within half of it on each axis, then drops to the ground. None when it holds none; a
 /// diameter that isn't finite is returned as it is, and keeps the tick serial.
 fn teleport_consumable(m: &Mob, items: &horizon_client::items::Items) -> Option<f64> {
-    [&m.extra.main_hand, &m.extra.off_hand]
+    use horizon_items::equipment::{MAINHAND, OFFHAND};
+    // A fox eats a stack, whose own `consumable` component may replace its item's.
+    [MAINHAND, OFFHAND]
         .into_iter()
-        .flatten()
-        .filter_map(|id| items.items.get(&**id)?.consumable.as_ref())
-        .flat_map(|c| &c.effects)
+        .filter_map(|slot| m.extra.slot_stack(slot))
+        .filter_map(|stack| horizon_client::item_sync::consumable(stack, items))
+        .flat_map(|c| c.effects)
         .filter_map(|e| match e {
             horizon_client::items::ConsumeEffect::TeleportRandomly(t) => {
                 Some(f64::from(t.diameter).abs())
@@ -591,9 +657,9 @@ fn default_locomotion(m: &Mob) -> bool {
         && m.movement_speed() == m.kind.speed
         && m.attrs.jump_strength == m.kind.jump_strength
         && value(m, Attr::FlyingSpeed) == m.kind.flying_speed
-        && !m.extra.effects.iter().any(|(effect, ..)| {
+        && !m.extra.effects.iter().any(|e| {
             matches!(
-                *effect,
+                e.id,
                 "minecraft:speed"
                     | "minecraft:slowness"
                     | "minecraft:jump_boost"
@@ -614,12 +680,7 @@ fn locomotion(m: &Mob) -> Option<f64> {
     if default_locomotion(m) {
         return Some(0.0);
     }
-    let effects = || {
-        m.extra
-            .effects
-            .iter()
-            .map(|&(effect, _, amp)| (effect, amp))
-    };
+    let effects = || m.extra.effects.iter().map(|e| (e.id, e.amplifier));
     // Speed: +20% a level (an amplifier below 0 slows, and is left out).
     let swift = effects()
         .filter(|e| e.0 == "minecraft:speed")
@@ -1008,6 +1069,14 @@ enum Verdict {
     OneIsland,
     /// The islands fit in one group.
     OneGroup,
+    /// A turn would call back into the game (`HostSerial::hooks`).
+    HostHooks,
+    /// A rider's vehicle left the level (`HostSerial::off_level`).
+    OffLevel,
+    /// Pushes kept from an aborted pass (`HostSerial::pending_pushes`).
+    PendingPushes,
+    /// A fox may stop for a meal (`HostSerial::meal`).
+    Meal,
 }
 
 impl Verdict {
@@ -1027,6 +1096,10 @@ impl Verdict {
             Verdict::OverBudget => "over_budget",
             Verdict::OneIsland => "one_island",
             Verdict::OneGroup => "one_group",
+            Verdict::HostHooks => "host_hooks",
+            Verdict::OffLevel => "off_level",
+            Verdict::PendingPushes => "pending_pushes",
+            Verdict::Meal => "meal",
         }
     }
 
@@ -1230,7 +1303,7 @@ struct Board {
     draws: Arc<OrderedDraws>,
 }
 impl Board {
-    fn new(frozen: Vec<Seen>, groups: &[Group<&mut Mob>], draws: Arc<OrderedDraws>) -> Self {
+    fn new(frozen: Vec<Seen>, groups: &[Group], draws: Arc<OrderedDraws>) -> Self {
         let mut index = FxHashMap::default();
         for (i, s) in frozen.iter().enumerate() {
             index.entry(s.id).or_insert(i as u32);
@@ -1256,8 +1329,6 @@ impl Board {
 pub(super) struct Foreign<'b> {
     board: &'b Board,
     pub reader: Cell<usize>,
-    /// Whether the turns keep their mod hooks for the join ([`defers`]).
-    pub defers: bool,
 }
 impl Foreign<'_> {
     /// A turn's new RNGs, including projectile RNGs and long-jump angle shuffles, follow list
@@ -1314,7 +1385,7 @@ fn without_counters(m: &Mob) -> Mob {
 }
 
 /// The first difference between the serial loop's result and the groups', if any.
-fn difference(serial: &Group<Mob>, grouped: &Group<Mob>) -> Option<String> {
+fn difference(serial: &Group, grouped: &Group) -> Option<String> {
     if serial.mobs.len() != grouped.mobs.len() {
         return Some(format!(
             "{} mobs serially, {} in groups",
@@ -1338,13 +1409,13 @@ fn difference(serial: &Group<Mob>, grouped: &Group<Mob>) -> Option<String> {
             ));
         }
     }
-    let debug = |g: &Group<Mob>| {
+    let debug = |g: &Group| {
         format!(
-            "{:?} {:?} {:?} {:?} {:?} {:?}",
-            g.events, g.dead, g.corpses, g.gone, g.guest_events, g.targets,
+            "{:?} {:?} {:?} {:?} {:?}",
+            g.events, g.dead, g.corpses, g.gone, g.guest_events,
         )
     };
-    let pushed = |g: &Group<Mob>| {
+    let pushed = |g: &Group| {
         let mut pushes = g.pushes.clone();
         g.mobs
             .iter()
@@ -1357,7 +1428,7 @@ fn difference(serial: &Group<Mob>, grouped: &Group<Mob>) -> Option<String> {
             })
             .collect::<Vec<_>>()
     };
-    let snapshot = |g: &Group<Mob>| {
+    let snapshot = |g: &Group| {
         g.snapshot
             .iter()
             .map(|seen| {
@@ -1368,7 +1439,7 @@ fn difference(serial: &Group<Mob>, grouped: &Group<Mob>) -> Option<String> {
             })
             .collect::<Vec<_>>()
     };
-    let stream = |g: &Group<Mob>| {
+    let stream = |g: &Group| {
         use horizon_core::random::RandomSource;
         let mut random = g.random.clone();
         (
@@ -1456,14 +1527,18 @@ mod tests {
             ] {
                 let mut game = super::super::super::native_machines::tests::server_game();
                 for x in [0.5, 1.5, 2.5] {
-                    game.spawn_mob("minecraft:cow", [x, 65.0, 0.5], true)
+                    game.spawn_mob("minecraft:cow", [x, 65.0, 0.5], true, SpawnSite::Plain)
                         .unwrap();
                 }
-                let mobs: Vec<Mob> = std::mem::take(&mut game.mobs).into();
-                let snapshot = mobs.iter().map(|m| m.seen(None)).collect();
+                let mobs: Vec<Mob> = std::mem::take(&mut game.mobs).into_iter().collect();
+                let snapshot = mobs.iter().map(|m| m.seen(None, game.items())).collect();
                 let base = game.mob_world_base(&[]);
                 let players = super::super::super::natural_spawning::NearestPlayers::new(&[]);
-                let nearest = super::super::prep::MobsNearest::new(&players, &mobs, false);
+                let nearest = super::super::prep::MobsNearest::new(
+                    &players,
+                    &super::super::prep::positions(&mobs),
+                    false,
+                );
                 let mut turns = Turns {
                     base: &base,
                     ticking: &|_, _| true,
@@ -1483,13 +1558,17 @@ mod tests {
                     bindings: Default::default(),
                     died: Default::default(),
                     ticked: Default::default(),
-                    targets: vec![None; 3],
                 };
                 let shared = Shared {
                     uuid: None,
                     level_id: "minecraft:overworld",
                     path_changes: &[],
                     guest_ids: &[],
+                    guest_identities: &[],
+                    items: game.items(),
+                    registry: game.pack.assets.registry,
+                    block_registries: &game.pack.block_registries,
+                    damage_hooks: &game.damage_hooks,
                 };
                 FAIL_THREADS.with(|f| {
                     *f.borrow_mut() = Some(FailThreads {
@@ -1501,12 +1580,13 @@ mod tests {
                     Islands {
                         uuid: None,
                         ticking: &|| Box::new(|_, _| true),
+                        host: HostSerial::default(),
                     }
                     .run(
                         Plan {
                             groups: vec![vec![0], vec![1], vec![2]],
                         },
-                        mobs.clone(),
+                        &mut mobs.clone(),
                         snapshot,
                         start,
                         &mut turns,
@@ -1537,10 +1617,13 @@ mod tests {
     fn verification_detects_snapshot_and_gaussian_only_differences() {
         use horizon_core::random::RandomSource;
         let mut game = super::super::super::native_machines::tests::server_game();
-        game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true)
+        game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true, SpawnSite::Plain)
             .unwrap();
         let mobs = game.mobs.to_vec();
-        let snapshot = mobs.iter().map(|m| m.seen(None)).collect::<Vec<_>>();
+        let snapshot = mobs
+            .iter()
+            .map(|m| m.seen(None, game.items()))
+            .collect::<Vec<_>>();
         let mut random = LevelRandom::for_level(horizon_core::random::LegacyRandom::new(7));
         random.next_gaussian();
         let start = Start {
@@ -1551,7 +1634,6 @@ mod tests {
             bindings: Default::default(),
             died: Default::default(),
             ticked: Default::default(),
-            targets: vec![None],
         };
         let serial = Group::new(mobs.clone(), snapshot.clone(), start.clone());
         let mut grouped = Group::new(mobs, snapshot, start);
@@ -1690,7 +1772,7 @@ mod tests {
     #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn actual_reaches_cover_links_villages_and_bounded_moves() {
         let mut game = super::super::super::native_machines::tests::server_game();
-        game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true)
+        game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true, SpawnSite::Plain)
             .unwrap();
         let kind = Arc::clone(&game.mobs[0].kind);
         let mut mobs: Vec<_> = (0..400)
@@ -1707,10 +1789,14 @@ mod tests {
                 Mob::new(i, Arc::clone(&kind), Vec3::new(x, 65.0, z), 0.0)
             })
             .collect();
-        let mut snapshot: Vec<_> = mobs.iter().map(|m| m.seen(None)).collect();
+        let mut snapshot: Vec<_> = mobs.iter().map(|m| m.seen(None, game.items())).collect();
         let base = game.mob_world_base(&[]);
         let players = super::super::super::natural_spawning::NearestPlayers::new(&[]);
-        let nearest = super::super::prep::MobsNearest::new(&players, &mobs, false);
+        let nearest = super::super::prep::MobsNearest::new(
+            &players,
+            &super::super::prep::positions(&mobs),
+            false,
+        );
         let turns = Turns {
             base: &base,
             ticking: &|_, _| true,
@@ -1805,7 +1891,14 @@ mod tests {
         mobs[0] = unchanged.clone();
         // Changed locomotion grows the reach by its bound, even from rest and with NoAI: a
         // Speed II effect by a few blocks, a speed of 128 to the next herd, not the one after.
-        mobs[0].extra.effects.push(("minecraft:speed", 100, 1));
+        mobs[0]
+            .extra
+            .effects
+            .push(horizon_client::mobs::StoredEffect::new(
+                "minecraft:speed",
+                100,
+                1,
+            ));
         let speedy = reaches(&mobs, &snapshot, &turns, &owners).unwrap()[0].body;
         let grown = speedy.max(Axis::X) - plain.body.max(Axis::X);
         assert!(grown > 1.0 && grown < 10.0, "{grown}");
@@ -1849,9 +1942,9 @@ mod tests {
     #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn foreign_lookup_observes_serial_visibility_and_unwind() {
         let mut game = super::super::super::native_machines::tests::server_game();
-        game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true)
+        game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true, SpawnSite::Plain)
             .unwrap();
-        let template = game.mobs[0].seen(None);
+        let template = game.mobs[0].seen(None, game.items());
         let (sent, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let draws = OrderedDraws::new(&horizon_core::random::LegacyRandom::new(7), 2);
@@ -1869,7 +1962,6 @@ mod tests {
             let foreign = Foreign {
                 board: &board,
                 reader: Cell::new(0),
-                defers: false,
             };
             assert_eq!(foreign.seen(11).unwrap().position, board.frozen[1].position);
             assert!(foreign.seen(999).is_none());
@@ -1881,7 +1973,6 @@ mod tests {
                     let publisher = Foreign {
                         board: &board,
                         reader: Cell::new(0),
-                        defers: false,
                     };
                     let mut moved = board.frozen[0].clone();
                     moved.position.x = 42.0;
@@ -1890,7 +1981,6 @@ mod tests {
                 let later = Foreign {
                     board: &board,
                     reader: Cell::new(1),
-                    defers: false,
                 };
                 assert_eq!(later.seen(10).unwrap().position.x, 42.0);
             });
@@ -1908,7 +1998,6 @@ mod tests {
                 let later = Foreign {
                     board: &missing,
                     reader: Cell::new(1),
-                    defers: false,
                 };
                 assert!(later.seen(10).is_none());
                 assert!(earlier.join().is_err());
@@ -1924,14 +2013,14 @@ mod tests {
     #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn moved_riders_use_loaded_and_ticking_state_at_their_turn() {
         let mut game = super::super::super::native_machines::tests::server_game();
-        game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true)
+        game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true, SpawnSite::Plain)
             .unwrap();
         let kind = Arc::clone(&game.mobs[0].kind);
         game.world.chunks.insert(
             (62, 0),
             Arc::new(horizon_client::chunk::Chunk::empty(62, 0)),
         );
-        let mut mobs: Vec<_> = [1.5, 0.5, 1001.5, 1001.5]
+        let mobs: Vec<_> = [1.5, 0.5, 1001.5, 1001.5]
             .into_iter()
             .enumerate()
             .map(|(i, x)| {
@@ -1946,16 +2035,22 @@ mod tests {
                 m
             })
             .collect();
-        horizon_client::mobs::riders::link(&mut mobs, 11, 10);
-        horizon_client::mobs::riders::link(&mut mobs, 13, 12);
-        let snapshot: Vec<_> = mobs.iter().map(|m| m.seen(None)).collect();
+        let mut list: horizon_client::join_seq::JoinList<Mob> = mobs.into_iter().collect();
+        horizon_client::mobs::riders::link(&mut list, 11, 10);
+        horizon_client::mobs::riders::link(&mut list, 13, 12);
+        let mut mobs: Vec<Mob> = list.into_iter().collect();
+        let snapshot: Vec<_> = mobs.iter().map(|m| m.seen(None, game.items())).collect();
         // A passenger is repositioned after the initial snapshot: one enters the ticking area,
         // another leaves the loaded area. The turn must not reuse those initial roles.
         mobs[1].position.x = 1.5;
         mobs[3].position.x = 1024.5;
         let base = game.mob_world_base(&[]);
         let players = super::super::super::natural_spawning::NearestPlayers::new(&[]);
-        let nearest = super::super::prep::MobsNearest::new(&players, &mobs, false);
+        let nearest = super::super::prep::MobsNearest::new(
+            &players,
+            &super::super::prep::positions(&mobs),
+            false,
+        );
         let ticking = |x: i32, _: i32| x.rem_euclid(1000) >= 1;
         let mut turns = Turns {
             base: &base,
@@ -1974,13 +2069,17 @@ mod tests {
             bindings: Default::default(),
             died: Default::default(),
             ticked: Default::default(),
-            targets: vec![None; 4],
         };
         let shared = Shared {
             uuid: None,
             level_id: "minecraft:overworld",
             path_changes: &[],
             guest_ids: &[],
+            guest_identities: &[],
+            items: game.items(),
+            registry: game.pack.assets.registry,
+            block_registries: &game.pack.block_registries,
+            damage_hooks: &game.damage_hooks,
         };
         let mut serial = Group::new(mobs.clone(), snapshot.clone(), start.clone());
         serial.run(&mut turns, &shared, None);
@@ -1988,12 +2087,13 @@ mod tests {
         let grouped = Islands {
             uuid: None,
             ticking: &|| Box::new(ticking),
+            host: HostSerial::default(),
         }
         .run(
             Plan {
                 groups: vec![vec![0, 1], vec![2, 3]],
             },
-            mobs,
+            &mut mobs,
             snapshot,
             start,
             &mut turns,
@@ -2286,8 +2386,13 @@ mod tests {
         let herds = game.mobs.clone();
         for species in ["wolf", "cat", "parrot"] {
             game.mobs = herds.clone();
-            game.spawn_mob(&format!("minecraft:{species}"), [2.5, 65.0, 2.5], true)
-                .unwrap();
+            game.spawn_mob(
+                &format!("minecraft:{species}"),
+                [2.5, 65.0, 2.5],
+                true,
+                SpawnSite::Plain,
+            )
+            .unwrap();
             let mut pet = game.mobs.pop().unwrap();
             horizon_client::mobs::tame::set_tame(&mut pet, true);
             pet.extra.owner = Some(game.level.player_uuid.unwrap_or_default());
@@ -2384,7 +2489,7 @@ mod tests {
     fn a_raid_shares_one_group_beside_a_herd() {
         let mut game = separated_herds_game();
         for x in [2.5, 194.5] {
-            game.spawn_mob("minecraft:pillager", [x, 66.0, 2.5], true)
+            game.spawn_mob("minecraft:pillager", [x, 66.0, 2.5], true, SpawnSite::Plain)
                 .unwrap();
             let raider = game.mobs.len() - 1;
             let state = horizon_client::mobs::raider::state_mut(&mut game.mobs[raider]);
@@ -2395,19 +2500,19 @@ mod tests {
         assert_eq!(groups, groups_for(2));
     }
 
-    /// A fox that finishes a chorus fruit teleports to the first ground below a point within the
-    /// item's diameter, a fall of any length: 85 blocks above one herd, it joins that herd's
-    /// island, and the two others tick apart.
+    /// A fox about to finish its meal keeps the tick serial: the meal pauses its turn for the game
+    /// to serve it (`TickProgress::Consumption`). Fed, the same fox ticks in the island of the
+    /// herd 85 blocks below, where its chorus fruit could take it.
     #[test]
     #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
-    fn a_fox_eating_chorus_fruit_joins_the_herd_below() {
+    fn a_fox_about_to_eat_keeps_the_tick_serial() {
         let mut game = separated_herds_game();
         for m in &mut game.mobs {
             m.no_ai = true;
         }
         // The fox waits 85 blocks above the second herd, far outside every read of it, and
         // finishes its fruit this tick (`TICKS_SINCE_EATEN` is 600; the tick makes it 601).
-        game.spawn_mob("minecraft:fox", [2.5, 65.0, 2.5], true)
+        game.spawn_mob("minecraft:fox", [2.5, 65.0, 2.5], true, SpawnSite::Plain)
             .unwrap();
         let mut fox = game.mobs.pop().unwrap();
         // It stands on a one-block pillar, so `travel` keeps it on the ground until it eats.
@@ -2430,14 +2535,25 @@ mod tests {
         game.tick_creature_entities().unwrap();
         assert_eq!(game.mobs[0].position, Vec3::new(106.5, 150.0, 10.5));
         game.mobs[0].extra.ints[1] = 600;
-        let groups = grouped_as_serial(&mut game, 1, "fox", |_| {});
-        assert_eq!(groups, groups_for(3));
-        let fox = &game.mobs[0];
+        // Awake, unhurried and on the ground, as a fox eats: it sleeps by day.
+        game.mobs[0].extra.ints[0] &= !horizon_client::mobs::fox::SLEEPING;
+        game.mobs[0].ai.target = None;
+        // On its pillar: the first tick, which runs no step, left it unsettled.
+        game.mobs[0].on_ground = true;
+        let hungry = {
+            let w = game.mob_world_base(&[]);
+            horizon_client::mobs::fox::may_eat_next_tick(&game.mobs[0], &w)
+        };
         assert!(
-            fox.position.y < 100.0 && fox.extra.main_hand.is_none(),
-            "the fox ate its fruit and really teleported down to the herd: {:?}",
-            fox.position
+            hungry,
+            "the fox holds what it eats and has not eaten for 600 ticks"
         );
+        let groups = grouped_as_serial(&mut game, 1, "hungry fox", |_| {});
+        assert_eq!(groups, 0, "a fox that may eat keeps the tick serial");
+        // Fed, the same fox ticks in the island of the herd its fruit could take it to.
+        game.mobs[0].extra.ints[1] = 0;
+        let groups = grouped_as_serial(&mut game, 1, "fed fox", |_| {});
+        assert_eq!(groups, groups_for(3));
     }
 
     /// `MoveControl` accelerates a stationary mob with a movement speed of 8 into the next herd,
@@ -2453,7 +2569,7 @@ mod tests {
             m.on_ground = true;
             m.velocity = Vec3::ZERO;
         }
-        game.spawn_mob("minecraft:cow", [2.5, 65.0, 2.5], true)
+        game.spawn_mob("minecraft:cow", [2.5, 65.0, 2.5], true, SpawnSite::Plain)
             .unwrap();
         let mut fast = game.mobs.pop().unwrap();
         // A road from its herd's floor to the next herd's, so it runs rather than falls.

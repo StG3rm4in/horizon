@@ -134,10 +134,11 @@ wgpu = { version = "30.0.1", default-features = false, features = ["gles"] }
 # Source retention only: not compiled/tested on the fork; incompatible with typed residency.
 # Do not enable (including via --all-features); integration is tracked in arismoko/horizon#3491.
 upstream-parallel-mobs = ["horizon-gameplay/upstream-parallel-mobs", "horizon-world/send-attributes"]
-# The grouped mob loop (game/creatures/mob_islands.rs, mob_group.rs and the preparation they use),
-# which no call site reaches since the borrowed loop replaced it; set apart until it is rewritten on
-# that loop. Natural spawning on helper threads (upstream-parallel-mobs) builds without it.
-upstream-parallel-mob-islands = ["upstream-parallel-mobs"]
+# The mob loop in islands on several threads under the parallel tick (game/creatures/mob_islands.rs
+# and mob_group.rs, their call site game/mobs/creatures/island_tick.rs), for the ticks the borrowed
+# loop would run without calling back into the game. Natural spawning on helper threads
+# (upstream-parallel-mobs) builds without it.
+upstream-parallel-mob-islands = ["upstream-parallel-mobs", "horizon-client-lib/upstream-parallel-mob-islands"]
 default = ["audio", "controllers", "horizon-extras", "cuda"]
 # CUDA for the GPU stages of world generation and light (horizon-gpu); a build without it never
 # needs CUDA, and every stage runs on the CPU.

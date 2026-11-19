@@ -355,6 +355,27 @@ impl LentLevel {
             attachment_syncs: std::mem::take(&mut world.attachment_syncs),
         }
     }
+    /// A level for one group of the parallel mob tick: its own random (the group's lane of the
+    /// level's draws), and no attachments, which only native mods write and which keep the tick
+    /// serial.
+    #[cfg(feature = "upstream-parallel-mob-islands")]
+    pub fn lane(random: horizon_core::random::LevelRandom) -> Self {
+        Self {
+            random,
+            attachments: Default::default(),
+            attachment_syncs: Default::default(),
+        }
+    }
+    /// The random a [`Self::lane`] level was made with, as the group's turns left it.
+    #[cfg(feature = "upstream-parallel-mob-islands")]
+    pub fn into_random(self) -> horizon_core::random::LevelRandom {
+        self.random
+    }
+    /// Its random, which the parallel mob tick's groups draw in their lanes and give back.
+    #[cfg(feature = "upstream-parallel-mob-islands")]
+    pub fn random_mut(&mut self) -> &mut horizon_core::random::LevelRandom {
+        &mut self.random
+    }
     /// Put them back into `world`.
     pub fn give_back(self, world: &mut crate::world::World) {
         world.random = self.random;

@@ -2,7 +2,7 @@
 use super::*;
 /// Route each player event to the player selected when it was emitted.
 /// Untagged events retain the previous per-tick guest binding.
-fn route_player_events(
+pub(super) fn route_player_events(
     events: &mut Vec<MobEvent>,
     from: usize,
     seen_guest: Option<u32>,
@@ -162,6 +162,10 @@ impl Game<'_> {
         let mut resume_was_on_fire = false;
         let mut resume_sampled = None;
         let mut resume_guest = None;
+        // Under the parallel tick, a turn draws its level-random rolls from a stream of its own,
+        // as a turn of the mob islands does (`mob_group.rs`), kept across a meal's pause.
+        #[cfg(feature = "upstream-parallel-mob-islands")]
+        let mut own_random: Option<horizon_core::random::LevelRandom> = None;
         loop {
             let mut pause = None;
             let mut retry_rider = None;
@@ -471,7 +475,20 @@ impl Game<'_> {
                     } else {
                         super::super::tick_profile::start_mob(&mobs[i].kind)
                     };
+                    #[cfg(feature = "upstream-parallel-mob-islands")]
+                    if !resuming {
+                        own_random = super::mob_group::own_random().then(|| {
+                            horizon_core::random::LevelRandom::for_level(
+                                horizon_client::parallel::mob_turn_random(mobs[i].id, w.game_time),
+                            )
+                        });
+                    }
                     let run_tick = || {
+                        #[cfg(feature = "upstream-parallel-mob-islands")]
+                        let mut level = match own_random.as_mut() {
+                            Some(own) => level.reborrow_with_random(own),
+                            None => level.reborrow(),
+                        };
                         if resuming {
                             resuming = false;
                             horizon_client::mobs::ai::TickProgress::Complete(

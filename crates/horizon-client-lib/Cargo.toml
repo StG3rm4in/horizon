@@ -140,6 +140,9 @@ audio = ["horizon-client-render/audio"]
 controllers = ["dep:gilrs", "horizon-client-input/controllers"]
 # Records the call sites of mob random draws (`mob_ai_probe` traces).
 rng-trace = ["horizon-core/rng-trace"]
+# What the grouped mob loop of horizon-client's upstream-parallel-mob-islands borrows: a pass's
+# rows (`JoinList::take_rows`) and the level random (`LentLevel::random_mut`, `lane`).
+upstream-parallel-mob-islands = []
 # Compatibility with earlier experiment commands: main already uses mimalloc.
 windows-mimalloc = []
 # Opt-in Windows heap experiment; see docs/windows-allocators.md.

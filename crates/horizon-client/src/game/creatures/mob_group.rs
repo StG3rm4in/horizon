@@ -1,12 +1,16 @@
-//! The mob loop of `tick_creature_entities` over a group of mobs, in their list order, with
-//! everything the loop keeps for them: their snapshot and its indexes, the pushes and events
-//! their ticks give, the level random they draw from, the players they see and what dies. The
-//! serial loop is one group holding every mob; a group of the parallel mob tick (#14457) holds
-//! the mobs no mob outside it can reach this tick.
+//! The mob loop of `tick_creature_entities` over a group of mobs of the parallel mob tick (#14457),
+//! in their list order, with everything the loop keeps for them: their snapshot and its indexes,
+//! the pushes and events their ticks give, the level random they draw from, the players they see
+//! and what dies. A group holds the mobs no mob outside it can reach this tick. Each turn is the
+//! turn of the borrowed loop (`borrowed_tick.rs`) for a level without native mods, the only
+//! levels whose ticks run in groups (`mob_islands`): the steps that only a mod can reach (despawn
+//! events, target listeners, section observers), a fox about to eat and removed vehicles keep the
+//! tick serial instead.
 use super::*;
 use horizon_client::{
     fast_hash::{FxHashMap, FxHashSet},
-    mobs::{MobSlot, PendingPushes, seen_grid::SeenGrid, spawning::LocalDifficulty},
+    join_seq::JoinList,
+    mobs::{PendingPushes, seen_grid::SeenGrid, spawning::LocalDifficulty},
 };
 use horizon_core::random::LevelRandom;
 
@@ -16,9 +20,14 @@ pub(super) struct Shared<'a> {
     pub level_id: &'static str,
     /// The blocks whose collision changed since the last tick: mobs re-path around them.
     pub path_changes: &'a [[i32; 3]],
-    /// The guests' entity ids by connection, for the shulker bullets fired at the guest a mob
-    /// sees.
+    /// The guests' entity ids by connection, for the events a mob sends the guest it sees.
     pub guest_ids: &'a [(u32, u32)],
+    /// The guests' identities by connection (`Game::guest_identity`), read on the server thread.
+    pub guest_identities: &'a [(u32, ([i32; 4], u32))],
+    pub items: &'a horizon_client::items::Items,
+    pub registry: &'a horizon_world::registry::BlockRegistry,
+    pub block_registries: &'a horizon_client::command::args::Registries,
+    pub damage_hooks: &'a horizon_client::health::DamageHooks,
 }
 
 /// A mob whose body goes this tick: (id, feet, width, height, the grown cube it splits into).
@@ -28,8 +37,8 @@ pub(super) struct Shared<'a> {
 pub(super) type Gone = (u32, Vec3, f64, f64, Option<Mob>);
 
 /// A group's mobs and everything the loop keeps for them, in their list order.
-pub(super) struct Group<M: MobSlot> {
-    pub mobs: Vec<M>,
+pub(super) struct Group {
+    pub mobs: JoinList<Mob>,
     /// Each mob's place in the whole list; empty when the group is the whole list.
     pub global: Vec<usize>,
     /// After each turn, where the turn's entries end: in `events`, `dead`, `corpses`, `gone` and
@@ -46,7 +55,7 @@ pub(super) struct Group<M: MobSlot> {
     solid_slots: Vec<u32>,
     pub pushes: PendingPushes,
     pub events: Vec<MobEvent>,
-    /// The level random, lent to the mobs (brain behaviours draw from it).
+    /// The level random, lent to the mobs' level at each turn (brain behaviours draw from it).
     pub random: LevelRandom,
     pub guests: super::super::lan_mobs::GuestViews,
     /// What stands in a guest's slot while a mob holds that guest's view for its tick.
@@ -57,17 +66,15 @@ pub(super) struct Group<M: MobSlot> {
     pub bindings: FxHashMap<u32, u32>,
     pub died: FxHashSet<u32>,
     pub ticked: FxHashSet<u32>,
-    /// Each mob's target as the mods last heard it (`native_living_change_target`).
-    pub targets: Vec<Option<Who>>,
     /// Whether each mob stays in the list, pushed at its turn.
     pub keep: Vec<bool>,
     pub dead: Vec<Mob>,
     pub corpses: Vec<Mob>,
     pub gone: Vec<Gone>,
     pub guest_events: Vec<(u32, u32, MobEvent)>,
-    /// The mod hooks its turns kept for the join, with each turn's place in the whole list (a
-    /// group of the parallel tick with mods loaded: `native_client_hooks::Deferred`).
-    pub deferred: Vec<(usize, horizon_client::native_client_hooks::Deferred)>,
+    /// The mobs whose last-hurt-by-player credit ran out in their turn: the game forgets who it
+    /// credits for them at the join, as the borrowed loop does at the turn (no turn reads it).
+    pub credit_expired: Vec<u32>,
     /// Whether each turn draws its level-random rolls from a stream of its own, so that it waits
     /// for no other lane (`parallel::mobs_own_random`, read once where the group is made).
     own_random: bool,
@@ -79,7 +86,7 @@ thread_local! {
     pub(super) static OWN_RANDOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn own_random() -> bool {
+pub(super) fn own_random() -> bool {
     #[cfg(test)]
     if OWN_RANDOM.with(std::cell::Cell::get) {
         return true;
@@ -113,12 +120,11 @@ pub(super) struct Start {
     pub bindings: FxHashMap<u32, u32>,
     pub died: FxHashSet<u32>,
     pub ticked: FxHashSet<u32>,
-    pub targets: Vec<Option<Who>>,
 }
 
-impl<M: MobSlot> Group<M> {
+impl Group {
     /// A group of `mobs`, whose snapshot entries are `snapshot`.
-    pub(super) fn new(mobs: Vec<M>, snapshot: Vec<Seen>, start: Start) -> Self {
+    pub(super) fn new(mobs: Vec<Mob>, snapshot: Vec<Seen>, start: Start) -> Self {
         let grid = SeenGrid::new(snapshot.iter().map(|s| s.bounds));
         let mut index = FxHashMap::with_capacity_and_hasher(snapshot.len(), Default::default());
         let (mut villager_slots, mut solid_slots) = (Vec::new(), Vec::new());
@@ -135,7 +141,7 @@ impl<M: MobSlot> Group<M> {
         let species_slots = horizon_client::mobs::species_slots::SpeciesSlots::new(&snapshot);
         Self {
             spare: start.guests.first().map(|g| g.1.clone()),
-            mobs,
+            mobs: mobs.into_iter().collect(),
             global: Vec::new(),
             ends: Vec::with_capacity(n),
             snapshot,
@@ -152,13 +158,12 @@ impl<M: MobSlot> Group<M> {
             bindings: start.bindings,
             died: start.died,
             ticked: start.ticked,
-            targets: start.targets,
             keep: Vec::with_capacity(n),
             dead: Vec::new(),
             corpses: Vec::new(),
             gone: Vec::new(),
             guest_events: Vec::new(),
-            deferred: Vec::new(),
+            credit_expired: Vec::new(),
             own_random: own_random(),
         }
     }
@@ -194,19 +199,7 @@ impl<M: MobSlot> Group<M> {
             super::mob_islands::inject_turn_failure(at);
             if let Some(foreign) = foreign {
                 foreign.reader.set(at);
-            }
-            if let Some(foreign) = foreign {
-                foreign.in_seed_order(at, || {
-                    if foreign.defers {
-                        let ((), kept) =
-                            horizon_client::native_client_hooks::deferring_turn(|| {
-                                self.turn(i, turns, shared);
-                            });
-                        self.deferred.extend(kept.into_iter().map(|d| (at, d)));
-                    } else {
-                        self.turn(i, turns, shared);
-                    }
-                });
+                foreign.in_seed_order(at, || self.turn(i, turns, shared));
             } else {
                 self.turn(i, turns, shared);
             }
@@ -226,10 +219,18 @@ impl<M: MobSlot> Group<M> {
         self.random.finish_lane();
     }
 
-    /// Mob `i`'s turn: whether its chunk is loaded and ticking is decided now, as the serial
-    /// loop decides it, then its tick or its despawn check.
+    /// Mob `i`'s turn, decided as the borrowed loop decides it: a removed mob leaves the list, a
+    /// mob in an unloaded chunk is kept or despawns, one outside the entity-ticking chunks stays
+    /// as it is, the others tick.
     fn turn(&mut self, i: usize, turns: &mut Turns, shared: &Shared) {
-        let position = self.mobs[i].mob().position;
+        if self.mobs[i].removed {
+            self.keep.push(false);
+            self.snapshot[i].alive = false;
+            // `removed` is the view's authoritative gone (arismoko/horizon#795).
+            self.snapshot[i].removed = true;
+            return;
+        }
+        let position = self.mobs[i].position;
         let (bx, bz) = (position.x.floor() as i32, position.z.floor() as i32);
         let seen_guest = self.bind_guest(i);
         if !turns.base.world.loaded(bx, bz) {
@@ -237,7 +238,7 @@ impl<M: MobSlot> Group<M> {
             return;
         }
         // ServerLevel.tick: entities outside entity-ticking chunks do not tick
-        // and do not check despawn (#16553).
+        // and do not check despawn (#16749).
         if !(turns.ticking)(bx, bz) {
             self.keep.push(true);
             return;
@@ -247,7 +248,8 @@ impl<M: MobSlot> Group<M> {
             .unwrap_or_else(|| turns.nearest.at(self.at(i), position));
         let controlling = self.controlling(i);
         // A mod canceled its tick: it stays as it is.
-        if (turns.canceled)(self.mobs[i].mob().id) {
+        if (turns.canceled)(self.mobs[i].id) {
+            self.mobs[i].despawn = mod_api::Despawn::default();
             self.keep.push(true);
             return;
         }
@@ -271,7 +273,7 @@ impl<M: MobSlot> Group<M> {
         if self.guests.is_empty() {
             return None;
         }
-        let m = self.mobs[i].mob();
+        let m = &self.mobs[i];
         let bound = self.bindings.get(&m.id).copied();
         let conn = super::super::lan_mobs::player_for(m, self.player.as_ref(), &self.guests, bound);
         match conn {
@@ -283,14 +285,14 @@ impl<M: MobSlot> Group<M> {
 
     /// Mob `i`'s turn when its chunk isn't loaded: it is kept as it is, unless it would despawn.
     fn unloaded(&mut self, i: usize) {
-        let m = self.mobs[i].mob();
+        let m = &self.mobs[i];
         self.keep.push(!m.hostile() || m.persistent);
     }
 
     /// Who controls mob `i`'s moves this tick: the velocity of the player riding it, when it is
     /// a controlled mount.
     fn controlling(&self, i: usize) -> Option<Vec3> {
-        let m = self.mobs[i].mob();
+        let m = &self.mobs[i];
         horizon_client::mobs::equine::controlled(m)
             .then(|| {
                 self.player
@@ -307,9 +309,9 @@ impl<M: MobSlot> Group<M> {
             .flatten()
     }
 
-    /// Mob `i`'s own tick, then what the loop does with what it did. `players`: the guest it
-    /// sees (none: the host's player), its nearest player, and the velocity of the player
-    /// controlling it as a mount ([`Self::controlling`]).
+    /// Mob `i`'s own tick, then what the loop does with what it did, in the borrowed loop's
+    /// order. `players`: the guest it sees (none: the host's player), its nearest player, and the
+    /// velocity of the player controlling it as a mount ([`Self::controlling`]).
     fn tick(
         &mut self,
         i: usize,
@@ -322,13 +324,20 @@ impl<M: MobSlot> Group<M> {
         base: &MobWorld,
         shared: &Shared,
     ) {
-        let m = self.mobs[i].mob_mut();
+        let m = &mut self.mobs[i];
         horizon_client::mobs::apply_mob_pushes(m, &mut self.pushes);
         horizon_client::mobs::blocks_changed(m, shared.path_changes);
+        // LivingEntity.aiStep -> EntityEquipment.tick, before movement.
+        super::super::inventory_tick::equipment_inventory_tick(
+            base.world,
+            base.facts,
+            shared.level_id,
+            &mut m.extra.equipment,
+        );
         let from = self.events.len();
-        // The guest's view is lent to the mob for its tick, not copied:
-        // the tick only reads it (`&MobWorld`), and it goes back to the
-        // guest's slot straight after.
+        // The guest's view is lent to the mob for its tick, not copied: the tick only reads it
+        // (`&MobWorld`), and it goes back to the guest's slot straight after. Its identity is
+        // captured with it (arismoko/horizon#1077).
         let lent = seen_guest.and_then(|conn| self.guests.iter().position(|g| g.0 == conn));
         let active_player = match (seen_guest, lent) {
             (None, _) => self.player.take(),
@@ -337,6 +346,14 @@ impl<M: MobSlot> Group<M> {
                 .take()
                 .map(|stand_in| std::mem::replace(&mut self.guests[k].1, stand_in)),
             (Some(_), None) => None,
+        };
+        let active_identity = match seen_guest {
+            None => base.player_identity,
+            Some(conn) => shared
+                .guest_identities
+                .iter()
+                .find(|g| g.0 == conn)
+                .map(|g| g.1),
         };
         let mut w = MobWorld {
             others: &self.snapshot,
@@ -348,78 +365,76 @@ impl<M: MobSlot> Group<M> {
             difficulty,
             nearest_player,
             player: active_player,
+            player_identity: active_identity,
+            player_selection: None,
             teams: std::sync::Arc::clone(&base.teams),
+            section_writer: None,
             ..*base
         };
         w.controlling_player_movement = controlling_player_movement;
-        self.ticked.insert(self.mobs[i].mob().id);
-        let sampled = super::super::tick_profile::start_mob(&self.mobs[i].mob().kind);
+        let id = self.mobs[i].id;
+        let credit_expiring = self.mobs[i].ai.last_hurt_by_player == 1;
+        self.ticked.insert(id);
+        let sampled = super::super::tick_profile::start_mob(&self.mobs[i].kind);
         // The level's stream is one for every lane: a turn that draws from it waits for the
         // turns before it. On its own stream it waits for none.
         let mut own = self.own_random.then(|| {
-            LevelRandom::for_level(horizon_client::parallel::mob_turn_random(
-                self.mobs[i].mob().id,
-                w.game_time,
-            ))
+            LevelRandom::for_level(horizon_client::parallel::mob_turn_random(id, w.game_time))
         });
-        let kept = horizon_client::mobs::riders::tick(
-            &mut self.mobs,
-            i,
-            &w,
-            own.as_mut().unwrap_or(&mut self.random),
-            &mut self.events,
-        );
+        // The group's random is its mobs' level random for the turn, and comes back after it.
+        let mut lent_level = horizon_client::health::LentLevel::lane(std::mem::replace(
+            &mut self.random,
+            LevelRandom::for_level(horizon_core::random::LegacyRandom::new(0)),
+        ));
+        let kept = {
+            let mut level = horizon_client::health::DamageLevel::lent(
+                base.world,
+                shared.registry,
+                &mut lent_level,
+                Some(shared.items),
+                Some(shared.block_registries),
+                shared.damage_hooks,
+            );
+            let mut level = match own.as_mut() {
+                Some(own) => level.reborrow_with_random(own),
+                None => level.reborrow(),
+            };
+            match horizon_client::mobs::riders::tick_until_consumption(
+                &mut self.mobs,
+                i,
+                &w,
+                &mut level,
+                &mut self.events,
+            ) {
+                horizon_client::mobs::ai::TickProgress::Complete(kept) => kept,
+                // A meal pauses the turn for the game to serve it, which a group can't call, so a
+                // tick with a fox about to eat stays serial (`fox::may_eat_next_tick`). One that
+                // came to it all the same (an earlier turn woke it, or its target went) goes on
+                // without the meal, and eats next tick.
+                horizon_client::mobs::ai::TickProgress::Consumption { was_on_fire, .. } => {
+                    horizon_client::mobs::riders::resume_after_consumption(
+                        &mut self.mobs,
+                        i,
+                        &w,
+                        &mut level,
+                        was_on_fire,
+                        &mut self.events,
+                    )
+                }
+            }
+        };
         super::super::tick_profile::end_mob(shared.level_id, sampled);
-        let m = self.mobs[i].mob_mut();
+        let m = &mut self.mobs[i];
+        m.despawn = mod_api::Despawn::default();
+        if credit_expiring && m.ai.last_hurt_by_player == 0 {
+            self.credit_expired.push(m.id);
+        }
         if seen_guest.is_none() {
             self.player = w.player;
         } else if let Some(k) = lent {
             self.spare = w
                 .player
                 .map(|v| std::mem::replace(&mut self.guests[k].1, v));
-        }
-        // Its tick changed its target: the mods may keep the one it had
-        // (`native_living_change_target`), and then what the tick did to
-        // the new one is not dealt.
-        if let Some(&before) = self.targets.get(i)
-            && m.ai.target != before
-        {
-            let named = target_named(
-                m.ai.target,
-                seen_guest,
-                &self.guests,
-                shared.guest_ids,
-                self.player.as_ref(),
-            );
-            // A grouped turn runs while no mod hooks the change (`horizon_mod_api_gen::mob_turn`).
-            if let Some((player, mob)) = named
-                && !horizon_client::native_client_hooks::deferring()
-            {
-                let kind = super::super::native_hooks::mob_kind(m);
-                let mut cancel = false;
-                Game::native_living_change_target(
-                    shared.level_id,
-                    m.id,
-                    &kind,
-                    player,
-                    mob,
-                    &mut cancel,
-                );
-                if cancel {
-                    if let Some(new) = m.ai.target {
-                        let mut k = from;
-                        while k < self.events.len() {
-                            if hits_target(&self.events[k], new) {
-                                self.events.remove(k);
-                            } else {
-                                k += 1;
-                            }
-                        }
-                    }
-                    m.ai.target = before;
-                }
-            }
-            self.targets[i] = m.ai.target;
         }
         // A killed mob's body is removed: its effects that act on
         // death run (`LivingEntity.remove` with KILLED).
@@ -445,29 +460,14 @@ impl<M: MobSlot> Group<M> {
             };
             self.gone.push((m.id, m.position, width, height, split));
         }
-        if let Some(conn) = seen_guest {
-            // ShulkerBullet.finalTarget is the guest's entity: the
-            // bullet homes on it while the projectiles tick, where
-            // `Who::Player` is the host's own player.
-            if let Some(&(_, id)) = shared.guest_ids.iter().find(|g| g.0 == conn) {
-                for e in &mut self.events[from..] {
-                    if let MobEvent::Projectile(p) = e
-                        && let ProjectileKind::ShulkerBullet { target, .. } = &mut p.kind
-                        && *target == Some(Who::Player)
-                    {
-                        *target = Some(Who::Mob(id));
-                    }
-                }
-            }
-            let mut k = from;
-            while k < self.events.len() {
-                if super::super::lan_mobs::acts_on_player(&self.events[k]) {
-                    self.guest_events.push((conn, m.id, self.events.remove(k)));
-                } else {
-                    k += 1;
-                }
-            }
-        }
+        super::borrowed_tick::route_player_events(
+            &mut self.events,
+            from,
+            seen_guest,
+            shared.guest_ids,
+            &mut self.guest_events,
+            m.id,
+        );
         // Killed during its own tick (drowning, burning, falling...).
         if !m.alive() && !m.removed && self.died.insert(m.id) {
             self.dead.push(m.clone());
@@ -478,26 +478,32 @@ impl<M: MobSlot> Group<M> {
         self.keep.push(kept);
         // ServerLevel ticks entities one after another: the ones
         // after this mob see it as it is now.
-        let collisions = self.snapshot[i].collisions;
-        let fresh = seen(m, shared.uuid);
+        let fresh = seen(m, shared.uuid, shared.items);
         let reclassified = self.snapshot[i].species != fresh.species;
         self.snapshot[i] = fresh;
         if reclassified {
             self.species_slots =
                 horizon_client::mobs::species_slots::SpeciesSlots::new(&self.snapshot);
         }
-        self.snapshot[i].collisions = collisions;
         self.snapshot[i].alive &= kept;
-        // The server's collision cap (`mobs::max_collisions`): each mob `m` pushed in its turn
-        // counts one more for it and for the mob pushed, which the mobs after it see. Off, a turn
-        // leaves no list.
-        for id in std::mem::take(&mut m.pushed) {
-            self.snapshot[i].collisions += 1;
-            if let Some(&slot) = self.index.get(&id) {
-                self.snapshot[slot as usize].collisions += 1;
-            }
-        }
+        self.snapshot[i].removed |= !kept;
         self.grid.update(i, self.snapshot[i].bounds);
-        horizon_client::mobs::apply_brain_events(&mut self.mobs, &mut self.events, from);
+        {
+            let mut level = horizon_client::health::DamageLevel::lent(
+                base.world,
+                shared.registry,
+                &mut lent_level,
+                Some(shared.items),
+                Some(shared.block_registries),
+                shared.damage_hooks,
+            );
+            horizon_client::mobs::apply_brain_events(
+                &mut self.mobs,
+                &mut level,
+                &mut self.events,
+                from,
+            );
+        }
+        self.random = lent_level.into_random();
     }
 }

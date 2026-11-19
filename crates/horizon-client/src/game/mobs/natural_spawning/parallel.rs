@@ -140,6 +140,11 @@ impl FinalizeLevel for LaneFinalize<'_, '_> {
     fn ride_chicken(&mut self, chicken: u32, rider: u32) {
         self.rides.push((chicken, rider));
     }
+    // As the serial level's `finalize_game_time` reads it.
+    #[expect(
+        clippy::misnamed_getters,
+        reason = "the serial level reads the day time too"
+    )]
     fn game_time(&self) -> i64 {
         self.l.w.day_time
     }
