@@ -120,7 +120,7 @@ Any other server.properties key, spelled as vanilla spells it, for example: spaw
 | `path` | `""` |  | the game program; empty: the one installed beside horizon-server |
 | `resources` | `""` |  | the prepared game files; empty: resources/ here, else the usual places |
 | `restart_on_crash` | `true` |  | start the game again when it crashes |
-| `low_memory` | `false` |  | true: no transparent huge pages, ~60 MB less idle for ~1 % more tick time |
+| `low_memory` | `false` |  | true: less memory (~0.7 GB at 100 players) for ~7 % slower ticks |
 | `parallel_tick` | `false` |  | true: the server tick shares its work among helper threads (docs/hosting.md) |
 | `worker_threads` | `0` |  | the game's worker threads (docs/hosting.md); 0: as many as the machine has |
 
