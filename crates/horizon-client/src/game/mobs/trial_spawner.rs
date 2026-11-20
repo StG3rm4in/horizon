@@ -109,6 +109,9 @@ impl Game<'_> {
         let Some((current, ominous)) = self.trial_spawner_block(key) else {
             return Ok(());
         };
+        if current == TrialState::WaitingForPlayers && self.trial_spawner_only_waits(key, ominous) {
+            return Ok(());
+        }
         let Some((lease, BlockEntity::TrialSpawner(mut spawner))) =
             self.world.block_entities.take(&key)
         else {
@@ -119,6 +122,46 @@ impl Game<'_> {
             .block_entities
             .put(lease, BlockEntity::TrialSpawner(spawner));
         result
+    }
+    /// Whether the spawner at `key`, waiting for players, only waits this tick, as
+    /// `TrialSpawner.tick` does in `WAITING_FOR_PLAYERS`: a level where it may spawn (spawner
+    /// blocks work, mobs spawn, not peaceful), no mob it keeps track of, no player detected, its next
+    /// spawn data holding a mob, and not one of the ticks in 20 when it looks for players
+    /// (`tryDetectPlayers`). Its tick then draws nothing, changes nothing and tells nothing but its
+    /// ominous flag, set here: the spawning level that `server_tick_trial_spawner` builds for each
+    /// spawner on every tick is not needed.
+    fn trial_spawner_only_waits(&mut self, key: Pos, ominous: bool) -> bool {
+        let packed = horizon_core::position::BlockPos::new(key.0, key.1, key.2).pack();
+        let rules = &self.ui.rules;
+        if packed.wrapping_add(self.world.game_time) % 20 == 0
+            || !rules.bool_at(horizon_client::gamerules::vanilla::SPAWNER_BLOCKS_WORK)
+            || !rules.bool_at(horizon_client::gamerules::vanilla::SPAWN_MOBS)
+            || self.ui.difficulty == 0
+        {
+            return false;
+        }
+        let Some((lease, entity)) = self.world.block_entities.take(&key) else {
+            return false;
+        };
+        let waits = match &entity {
+            BlockEntity::TrialSpawner(spawner) => {
+                spawner.current_mobs.is_empty()
+                    && spawner.detected_players.is_empty()
+                    && (spawner.next_spawn_data.as_ref()).is_some_and(|data| {
+                        horizon_client::mobs::spawner::SpawnDataExt::id(data).is_some()
+                    })
+            }
+            _ => false,
+        };
+        let entity = match entity {
+            BlockEntity::TrialSpawner(mut spawner) if waits => {
+                spawner.is_ominous = ominous;
+                BlockEntity::TrialSpawner(spawner)
+            }
+            other => other,
+        };
+        self.world.block_entities.put(lease, entity);
+        waits
     }
     /// What the LAN encoder builds update tags from beyond the block entity:
     /// the mods' hook (`api_block_entity_update_tag`), and the block
