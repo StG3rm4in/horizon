@@ -114,14 +114,30 @@ pub(super) fn may_group() -> bool {
     lanes() > 1
 }
 
-/// The threads the loop may run on, capped at the machine's available parallelism.
+/// The threads the loop may run on, capped at the machine's available parallelism and at the
+/// tick's helpers ([`on_helpers`]).
 fn lanes() -> usize {
-    let hardware = std::thread::available_parallelism().ok().map(usize::from);
     #[cfg(test)]
     if let Some(lanes) = LANES.with(Cell::get) {
-        return capped_lanes(lanes, hardware);
+        return on_helpers(capped_lanes(lanes, hardware()));
     }
-    capped_lanes(horizon_client::parallel::lanes(), hardware)
+    on_helpers(capped_lanes(horizon_client::parallel::lanes(), hardware()))
+}
+
+/// The machine's available parallelism, asked once: the standard library reads the cgroup's
+/// quota files on every call, and the loop asks on every tick.
+fn hardware() -> Option<usize> {
+    static HARDWARE: OnceLock<Option<usize>> = OnceLock::new();
+    *HARDWARE.get_or_init(|| std::thread::available_parallelism().ok().map(usize::from))
+}
+
+/// At most as many lanes as the tick's helpers and this thread: each lane runs on a thread of its
+/// own while the others run (`parallel::helper_scope`).
+fn on_helpers(lanes: usize) -> usize {
+    if lanes < 2 {
+        return lanes;
+    }
+    lanes.min(horizon_client::parallel::helpers() + 1)
 }
 
 /// Whether a native mod can run in a mob's turn, as the build found it (`HORIZON_MOB_TURN`, from
@@ -143,6 +159,24 @@ fn defers() -> bool {
 /// The mobs of each group, by their place in the list, ascending.
 pub(super) struct Plan {
     groups: Vec<Vec<usize>>,
+}
+
+impl Plan {
+    /// The plan in at most `lanes` groups: the groups past them join the first ones in turn. A
+    /// union of islands still holds every mob its mobs can reach, so the turns give the same
+    /// result, on fewer threads.
+    fn fit(mut self, lanes: usize) -> Self {
+        let lanes = lanes.max(1);
+        if self.groups.len() > lanes {
+            for (k, extra) in self.groups.split_off(lanes).into_iter().enumerate() {
+                self.groups[k % lanes].extend(extra);
+            }
+            for members in &mut self.groups {
+                members.sort_unstable();
+            }
+        }
+        self
+    }
 }
 
 /// What the islands need from the game besides the loop's own state.
@@ -290,22 +324,38 @@ impl Islands<'_> {
             turns.cached_difficulty = None;
             (serial, seeds)
         });
+        let setup = horizon_client::spans::guard("islands_setup");
+        // Each lane runs on a thread of its own while the others run.
+        let plan = plan.fit(horizon_client::parallel::helpers() + 1);
         let n = mobs.len();
         let lanes = plan.groups.len();
         let draws = OrderedDraws::new(&start.random, lanes);
         // The whole list's grid, as each group's must answer.
         let whole = SeenGrid::bounds_of(snapshot.iter().map(|s| s.bounds));
-        // Each group takes its mobs out of the list, and they go back at the end.
-        let mut slots: Vec<Option<Mob>> = std::mem::take(mobs).into_iter().map(Some).collect();
+        // Each group takes its mobs out of the list in one pass, and they go back at the end, into
+        // the list's own buffer.
+        let mut lane_of = vec![usize::MAX; n];
+        for (lane, members) in plan.groups.iter().enumerate() {
+            for &k in members {
+                assert_eq!(lane_of[k], usize::MAX, "a mob is in one group");
+                lane_of[k] = lane;
+            }
+        }
+        assert!(lane_of.iter().all(|&l| l < lanes), "every mob has a group");
+        let mut taken: Vec<Vec<Mob>> = plan
+            .groups
+            .iter()
+            .map(|members| Vec::with_capacity(members.len()))
+            .collect();
+        for (m, &lane) in mobs.drain(..).zip(&lane_of) {
+            taken[lane].push(m);
+        }
         let mut groups: Vec<Group> = plan
             .groups
             .into_iter()
+            .zip(taken)
             .enumerate()
-            .map(|(lane, members)| {
-                let group_mobs: Vec<Mob> = members
-                    .iter()
-                    .map(|&k| slots[k].take().expect("a mob is in one group"))
-                    .collect();
+            .map(|(lane, (members, group_mobs))| {
                 // A group reads and writes only its own mobs' bindings and death marks.
                 let bindings = group_mobs
                     .iter()
@@ -334,6 +384,8 @@ impl Islands<'_> {
         #[cfg(test)]
         RAN.with(|r| r.set(lanes));
         let mut board = Board::new(snapshot, &groups, Arc::clone(&draws));
+        drop(setup);
+        let lanes_span = horizon_client::spans::guard("islands_lanes");
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.run_threads(
                 &mut groups,
@@ -343,10 +395,12 @@ impl Islands<'_> {
                 serial.as_ref().map(|s| &s.1),
             )
         }));
+        drop(lanes_span);
         if let Err(payload) = ran {
-            *mobs = in_list_order(groups, n);
+            in_list_order(groups, n, mobs);
             std::panic::resume_unwind(payload);
         }
+        let _merge = horizon_client::spans::guard("islands_merge");
         // Each mob's entries, in list order: the turns' ranges in its group.
         let mut place = vec![(0u32, 0u32); n];
         for (gi, g) in groups.iter().enumerate() {
@@ -357,16 +411,31 @@ impl Islands<'_> {
         let mut keep = Vec::with_capacity(n);
         let (mut dead, mut corpses, mut gone, mut guest_events) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // Moved, not copied: a group's turns come in list order, so its entries are taken in the
+        // order they were made.
+        let mut entries: Vec<_> = groups
+            .iter_mut()
+            .map(|g| {
+                (
+                    std::mem::take(&mut g.events).into_iter(),
+                    std::mem::take(&mut g.dead).into_iter(),
+                    std::mem::take(&mut g.corpses).into_iter(),
+                    std::mem::take(&mut g.gone).into_iter(),
+                    std::mem::take(&mut g.guest_events).into_iter(),
+                )
+            })
+            .collect();
         for &(gi, li) in &place {
-            let (g, li) = (&mut groups[gi as usize], li as usize);
+            let (g, li) = (&groups[gi as usize], li as usize);
             keep.push(g.keep[li]);
             let from = if li == 0 { [0; 5] } else { g.ends[li - 1] };
             let to = g.ends[li];
-            start.events.extend_from_slice(&g.events[from[0]..to[0]]);
-            dead.extend(g.dead[from[1]..to[1]].iter().cloned());
-            corpses.extend(g.corpses[from[2]..to[2]].iter().cloned());
-            gone.extend(g.gone[from[3]..to[3]].iter().cloned());
-            guest_events.extend(g.guest_events[from[4]..to[4]].iter().cloned());
+            let (e, len) = (&mut entries[gi as usize], |k: usize| to[k] - from[k]);
+            start.events.extend(e.0.by_ref().take(len(0)));
+            dead.extend(e.1.by_ref().take(len(1)));
+            corpses.extend(e.2.by_ref().take(len(2)));
+            gone.extend(e.3.by_ref().take(len(3)));
+            guest_events.extend(e.4.by_ref().take(len(4)));
         }
         let mut pushes = horizon_client::mobs::PendingPushes::default();
         let mut credit_expired = Vec::new();
@@ -388,13 +457,14 @@ impl Islands<'_> {
             pushes.append(std::mem::take(&mut g.pushes));
             // A later turn can also update an earlier member's snapshot (brain events), so
             // merge the final group entries rather than only its turn-time publications.
-            for (&at, seen) in g.global.iter().zip(&g.snapshot) {
-                board.frozen[at] = seen.clone();
+            for (&at, seen) in g.global.iter().zip(std::mem::take(&mut g.snapshot)) {
+                board.frozen[at] = seen;
             }
         }
         let Board { frozen, .. } = board;
+        in_list_order(groups, n, mobs);
         let mut merged = Group::new(
-            in_list_order(groups, n),
+            std::mem::take(mobs),
             Vec::new(),
             Start {
                 random: LevelRandom::for_level(draws.finish()),
@@ -413,11 +483,14 @@ impl Islands<'_> {
         merged
     }
 
-    /// Run `groups` at once, one thread each (the first on this one), each with this thread's
-    /// level, `tnt_explodes` rule and tick profiler sampling. Their world is `turns.base` without
-    /// its hooks into the game, which can't leave this thread: native mod effects (no mob carries
-    /// a content mod's effect while mods are loaded) and the UUID lookup ([`LoopLookup`], the same
-    /// answers). The helpers' sampled costs join this thread's sums.
+    /// Run `groups` at once, the first on this thread and each other on a helper of the tick's
+    /// pool (`parallel::helper_scope`: no thread starts), each with this thread's level,
+    /// `tnt_explodes` rule and tick profiler sampling. Their world is `turns.base` without its
+    /// hooks into the game, which can't leave this thread: native mod effects (no mob carries a
+    /// content mod's effect while mods are loaded) and the UUID lookup ([`LoopLookup`], the same
+    /// answers). The helpers' sampled costs join this thread's sums. A lane waits for the lanes
+    /// before it, so each needs a thread while the others run: a plan never has more groups than
+    /// the pool has helpers, plus this thread ([`Plan::fit`]).
     fn run_threads(
         &self,
         groups: &mut [Group],
@@ -464,11 +537,14 @@ impl Islands<'_> {
         let tickings: Vec<_> = groups.iter().map(|_| (self.ticking)()).collect();
         let mut parts = groups.iter_mut().zip(tickings);
         let (first, first_ticking) = parts.next().expect("a plan has groups");
+        // The helpers' sampled costs, added to this thread's once every lane is done.
+        let helped = std::sync::Mutex::new(Vec::new());
         #[cfg(test)]
         let failure = FAIL_THREADS.with(|f| f.borrow().clone());
-        std::thread::scope(|s| {
-            // Guards for every not-yet-started lane live inside the scope's callback. If the
-            // OS refuses a spawn, they drop before scope joins any started, waiting threads.
+        horizon_client::parallel::helper_scope(|s| {
+            // Guards for every lane not yet handed to a helper live inside the scope's callback:
+            // a panic before a lane is handed drops its guard, so the lanes already running stop
+            // waiting for it before the scope waits for them.
             let first_done = first.random.lane_done();
             let pending: Vec<_> = parts
                 .map(|(g, ticking)| {
@@ -476,9 +552,8 @@ impl Islands<'_> {
                     (g, ticking, done)
                 })
                 .collect();
-            let mut handles = Vec::with_capacity(pending.len());
             for (g, ticking, done) in pending {
-                let run = &run;
+                let (run, helped) = (&run, &helped);
                 #[cfg(test)]
                 let failure = failure.clone();
                 #[cfg(test)]
@@ -486,68 +561,108 @@ impl Islands<'_> {
                     && failure.at == FailAt::Spawn
                     && g.global[0] == 2
                 {
-                    // The first worker has reached its RNG request while the server lane and
-                    // this later lane have not started. Fail at the OS-spawn error boundary.
+                    // The first helper has reached its RNG request while the server lane and
+                    // this later lane have not started: fail before this lane is handed out.
                     failure.started.wait();
-                    panic!("injected spawn failure at the OS-spawn error boundary");
+                    panic!("injected failure before a lane is handed to a helper");
                 }
-                let handle = std::thread::Builder::new()
-                    .name("mob-island".into())
-                    .spawn_scoped(s, move || {
-                        let _done = done;
-                        #[cfg(test)]
-                        if let Some(failure) = &failure
-                            && g.global[0] == 1
-                        {
-                            match failure.at {
-                                FailAt::Setup => panic!("injected worker setup failure"),
-                                FailAt::Turn => FAIL_TURN.with(|f| f.set(Some(1))),
-                                FailAt::Spawn => {
-                                    use horizon_core::random::RandomSource;
-                                    g.random.begin_item(1);
-                                    failure.started.wait();
-                                    g.random.next_long();
-                                    g.random.end_item();
-                                }
+                s.spawn(move |_| {
+                    let _done = done;
+                    // The pool's threads outlive a test's injected failure.
+                    #[cfg(test)]
+                    let _clear = ClearFailTurn;
+                    #[cfg(test)]
+                    if let Some(failure) = &failure
+                        && g.global[0] == 1
+                    {
+                        match failure.at {
+                            FailAt::Setup => panic!("injected worker setup failure"),
+                            FailAt::Turn => FAIL_TURN.with(|f| f.set(Some(1))),
+                            FailAt::Spawn => {
+                                use horizon_core::random::RandomSource;
+                                g.random.begin_item(1);
+                                failure.started.wait();
+                                g.random.next_long();
+                                g.random.end_item();
                             }
                         }
-                        horizon_client::mobs::sulfur_cube::set_tnt_explodes(tnt);
-                        super::super::tick_profile::begin_helper(sampling);
-                        horizon_client::block_contact::in_level(level, || run(g, ticking));
-                        super::super::tick_profile::end_helper()
-                    })
-                    .expect("a mob island's thread starts");
-                handles.push(handle);
+                    }
+                    let _lent = OnHelper::take(tnt, sampling);
+                    horizon_client::block_contact::in_level(level, || run(g, ticking));
+                    let costs = super::super::tick_profile::end_helper();
+                    helped
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(costs);
+                });
             }
             run(first, first_ticking);
             drop(first_done);
-            let mut panic = None;
-            for handle in handles {
-                match handle.join() {
-                    Ok(costs) => super::super::tick_profile::merge(costs),
-                    Err(payload) if panic.is_none() => panic = Some(payload),
-                    Err(_) => {}
-                }
-            }
-            if let Some(payload) = panic {
-                std::panic::resume_unwind(payload);
-            }
         });
+        let helped = helped
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for costs in helped {
+            super::super::tick_profile::merge(costs);
+        }
     }
 }
 
-/// Every mob of `groups` back in its place in a list of `n`, as its group's turns left it.
-fn in_list_order(groups: Vec<Group>, n: usize) -> Vec<Mob> {
-    let mut slots: Vec<Option<Mob>> = (0..n).map(|_| None).collect();
-    for g in groups {
-        for (m, &at) in g.mobs.into_iter().zip(&g.global) {
-            slots[at] = Some(m);
+/// Every mob of `groups` back in its place in `list`, empty and `n` long once refilled, as its
+/// group's turns left it: a group's mobs are in list order, so one pass over the list takes each
+/// from its group.
+fn in_list_order(groups: Vec<Group>, n: usize, list: &mut Vec<Mob>) {
+    let mut lane_of = vec![usize::MAX; n];
+    for (lane, g) in groups.iter().enumerate() {
+        for &at in &g.global {
+            lane_of[at] = lane;
         }
     }
-    slots
-        .into_iter()
-        .map(|m| m.expect("every mob comes back from its group"))
-        .collect()
+    let mut mobs: Vec<_> = groups.into_iter().map(|g| g.mobs.into_iter()).collect();
+    list.extend(lane_of.into_iter().map(|lane| {
+        mobs.get_mut(lane)
+            .and_then(Iterator::next)
+            .expect("every mob comes back from its group")
+    }));
+}
+
+/// What a helper of the tick's pool takes from the server thread for a group's turns: the
+/// level's `tnt_explodes` rule and the profiler's sampling. When the group is done, also by a
+/// panic, the helper's own rule comes back and its sampling and sampler context end: the pool's
+/// threads go on to the tick's other phases.
+struct OnHelper {
+    tnt: bool,
+}
+
+impl OnHelper {
+    fn take(tnt: bool, sampling: u8) -> Self {
+        let own = horizon_client::mobs::sulfur_cube::tnt_explodes();
+        horizon_client::mobs::sulfur_cube::set_tnt_explodes(tnt);
+        super::super::tick_profile::begin_helper(sampling);
+        Self { tnt: own }
+    }
+}
+
+impl Drop for OnHelper {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // The group's sampled costs go with its panic.
+            let _ = super::super::tick_profile::end_helper();
+        }
+        horizon_threads::work::clear_work();
+        horizon_client::mobs::sulfur_cube::set_tnt_explodes(self.tnt);
+    }
+}
+
+/// Clears a helper's injected turn failure when its group is done.
+#[cfg(test)]
+struct ClearFailTurn;
+
+#[cfg(test)]
+impl Drop for ClearFailTurn {
+    fn drop(&mut self) {
+        FAIL_TURN.with(|f| f.set(None));
+    }
 }
 
 /// What one mob can reach this tick, for the plan.
@@ -1000,11 +1115,16 @@ struct Cells {
     map: FxHashMap<(i32, i32), Vec<u32>>,
 }
 impl Cells {
-    fn visit(b: Aabb, budget: &mut usize, mut f: impl FnMut((i32, i32))) -> Option<()> {
+    /// How many cells `b` covers; None when that is no count.
+    fn count(b: Aabb) -> Option<usize> {
         let (x0, z0, x1, z1) = cells(b)?;
         let n =
             (i64::from(x1) - i64::from(x0) + 1).checked_mul(i64::from(z1) - i64::from(z0) + 1)?;
-        *budget = budget.checked_sub(usize::try_from(n).ok()?)?;
+        usize::try_from(n).ok()
+    }
+    fn visit(b: Aabb, budget: &mut usize, mut f: impl FnMut((i32, i32))) -> Option<()> {
+        let (x0, z0, x1, z1) = cells(b)?;
+        *budget = budget.checked_sub(Self::count(b)?)?;
         for x in x0..=x1 {
             for z in z0..=z1 {
                 f((x, z));
@@ -1200,8 +1320,9 @@ fn islands_why(
             col.village_reads = widen(col.village_reads, village_reads);
         }
     }
-    // Columns by the cells their boxes cover.
+    // Columns by the cells their boxes cover, and the columns that claim.
     let (mut bodies, mut claims) = (Cells::default(), Cells::default());
+    let mut claiming = Vec::new();
     for (c, col) in columns.iter().enumerate() {
         bodies
             .insert(c as u32, col.body, &mut budget)
@@ -1210,6 +1331,7 @@ fn islands_why(
             claims
                 .insert(c as u32, b, &mut budget)
                 .ok_or(Verdict::OverBudget)?;
+            claiming.push(c as u32);
         }
     }
     for col in &columns {
@@ -1222,14 +1344,24 @@ fn islands_why(
             })
             .ok_or(Verdict::OverBudget)?;
         if let Some(reads) = col.village_reads {
-            claims
-                .query(reads, &mut budget, |j| {
-                    let other = &columns[j as usize];
-                    if other.claims.is_some_and(|b| b.intersects(reads)) {
-                        sets.join(col.first, other.first);
-                    }
-                })
-                .ok_or(Verdict::OverBudget)?;
+            let mut meet = |j: u32| {
+                let other = &columns[j as usize];
+                if other.claims.is_some_and(|b| b.intersects(reads)) {
+                    sets.join(col.first, other.first);
+                }
+            };
+            // A village read covers some four hundred cells, and a level has few claiming
+            // columns: testing each of them finds the same ones for less.
+            if claiming.len() < Cells::count(reads).ok_or(Verdict::OverBudget)? {
+                budget = budget
+                    .checked_sub(claiming.len())
+                    .ok_or(Verdict::OverBudget)?;
+                claiming.iter().copied().for_each(&mut meet);
+            } else {
+                claims
+                    .query(reads, &mut budget, &mut meet)
+                    .ok_or(Verdict::OverBudget)?;
+            }
         }
     }
     let mut raids = FxHashMap::<i32, u32>::default();
@@ -1520,7 +1652,7 @@ mod tests {
             for (at, expected) in [
                 (
                     FailAt::Spawn,
-                    "injected spawn failure at the OS-spawn error boundary",
+                    "injected failure before a lane is handed to a helper",
                 ),
                 (FailAt::Setup, "injected worker setup failure"),
                 (FailAt::Turn, "injected mob turn failure"),
@@ -2252,10 +2384,7 @@ mod tests {
             ));
         }
         assert_eq!(runs[0].3, 0, "one lane runs serially");
-        let available = capped_lanes(
-            3,
-            std::thread::available_parallelism().ok().map(usize::from),
-        );
+        let available = lanes_here(3);
         let grouped = if available > 1 { available } else { 0 };
         assert_eq!(
             runs[1].3, grouped,
@@ -2287,12 +2416,14 @@ mod tests {
         );
     }
 
+    /// The lanes `requested` lanes run on, on this machine.
+    fn lanes_here(requested: usize) -> usize {
+        on_helpers(capped_lanes(requested, hardware()))
+    }
+
     /// The groups a plan of `islands` islands runs in on three requested lanes, on this machine.
     fn groups_for(islands: usize) -> usize {
-        let lanes = capped_lanes(
-            3,
-            std::thread::available_parallelism().ok().map(usize::from),
-        );
+        let lanes = lanes_here(3);
         if lanes > 1 { islands.min(lanes) } else { 0 }
     }
 
@@ -2614,5 +2745,45 @@ mod tests {
         let of = group_of(&plan, list.len());
         assert_ne!(of[0], of[200]);
         assert_eq!(of[200], of[300], "both small herds fill the lighter group");
+    }
+
+    /// A village read meets the same claims whether it tests each claiming column (a wide read
+    /// beside few villagers) or looks them up cell by cell (a narrow one).
+    #[test]
+    fn village_reads_meet_the_same_claims_however_found() {
+        let mut list = herd(0, 150, 0.0, 0.0);
+        list.extend(herd(1000, 150, 1000.0, 0.0));
+        list.extend(herd(2000, 150, 2000.0, 0.0));
+        // A villager of the first herd claims a bed at x 600; one of the second herd a bed at
+        // x 900, which neither read below meets.
+        let bed = |x| point_box([x, 64, 0]);
+        list[3].claims = Some(union_box(grow(list[3].body, POI_CLAIM), bed(600)));
+        list[153].claims = Some(union_box(grow(list[153].body, POI_CLAIM), bed(900)));
+        // One cell, fewer than the two claiming columns; then the hundreds a village read covers.
+        for reads in [bed(600), grow(bed(600), VILLAGE_SENSE)] {
+            let mut list = list.clone();
+            list[300].village_reads = Some(reads);
+            let plan = islands(&list, 3).expect("two islands");
+            let of = group_of(&plan, list.len());
+            assert_eq!(of[0], of[300], "{reads:?}");
+            assert_ne!(of[150], of[300], "{reads:?}");
+            assert_ne!(of[0], of[150], "{reads:?}");
+        }
+    }
+
+    /// A plan of more groups than threads runs in fewer, every mob in one group and each group in
+    /// list order; a plan that fits stays as it is.
+    #[test]
+    fn a_plan_fits_the_threads_it_has() {
+        let groups = vec![vec![0, 5], vec![1, 6], vec![2], vec![3, 4]];
+        let fitted = Plan { groups }.fit(2);
+        assert_eq!(fitted.groups.len(), 2);
+        group_of(&fitted, 7);
+        assert!(fitted.groups.iter().all(|g| g.is_sorted()));
+        let fits = Plan {
+            groups: vec![vec![0, 2], vec![1]],
+        }
+        .fit(3);
+        assert_eq!(fits.groups, vec![vec![0, 2], vec![1]]);
     }
 }

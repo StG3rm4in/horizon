@@ -317,9 +317,64 @@ fn pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// `f` over `items` in parts on the pool, or all on this thread while the parallel tick is off or
-/// for fewer than `min` items: every part's results, in the order of `items`, as one thread would
-/// give them.
+/// How many helper threads the pool has, all of them started with it.
+pub fn helpers() -> usize {
+    pool().current_num_threads()
+}
+
+/// `op` on this thread, in a scope whose jobs run on the pool's helpers: for parts that wait for
+/// each other, which [`par_map`]'s must not (the mob islands' lanes, `OrderedDraws`). Each job
+/// needs a helper of its own while the others run, so `op` spawns at most [`helpers`] jobs, and
+/// none of them shares its work on the pool in turn: a phase that would, on a job's helper or on
+/// this thread, runs its parts where it is asked (`in_helper_scope`), and nothing else may
+/// (rayon's own parallel iterators included). Every job runs to its end before the scope
+/// returns, also after a panic in `op` or in a job, and the first panic then goes on to the
+/// caller. The thread-locals the tick relies on do not follow a job: it sets what it needs, and
+/// puts back what it changed.
+pub fn helper_scope<'scope, R>(op: impl FnOnce(&rayon::Scope<'scope>) -> R) -> R {
+    // One scope at a time: two whose jobs wait for each other could each hold helpers that the
+    // other's jobs need.
+    static ONE: Mutex<()> = Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(PoisonError::into_inner);
+    let _inside = Inside::enter();
+    pool().in_place_scope(op)
+}
+
+/// Helper scopes running now ([`helper_scope`]).
+static SCOPES: AtomicUsize = AtomicUsize::new(0);
+
+std::thread_local! {
+    /// Whether this thread runs a helper scope's `op`.
+    static CALLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A helper scope running on this thread, until dropped.
+struct Inside(bool);
+
+impl Inside {
+    fn enter() -> Self {
+        SCOPES.fetch_add(1, Ordering::SeqCst);
+        Self(CALLER.replace(true))
+    }
+}
+
+impl Drop for Inside {
+    fn drop(&mut self) {
+        CALLER.set(self.0);
+        SCOPES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether this thread runs a helper scope's `op` or, while one runs, is one of the pool's
+/// helpers: the scope's jobs hold the helpers and may wait for this thread, so a phase's parts
+/// stay here instead of waiting for a helper.
+fn in_helper_scope() -> bool {
+    CALLER.get() || (SCOPES.load(Ordering::SeqCst) > 0 && pool().current_thread_index().is_some())
+}
+
+/// `f` over `items` in parts on the pool, or all on this thread while the parallel tick is off,
+/// for fewer than `min` items or inside a [`helper_scope`]: every part's results, in the order of
+/// `items`, as one thread would give them.
 pub fn par_map<T: Sync, R: Send>(
     items: &[T],
     min: usize,
@@ -332,8 +387,9 @@ pub fn par_map<T: Sync, R: Send>(
 /// `horizon_threads::par_chunks_mut`, without starting threads for every call. A chunk runs on
 /// whatever thread takes it, so `f` must not depend on the order. Unlike [`par_map`] it does not
 /// wait for the parallel tick's switch (the phases that use it ran shared out before the pool
-/// existed, #8158): it shares out unless `HORIZON_SERIAL_TICK=all` or one thread is all there is.
-/// The thread-locals the tick relies on do not follow a helper.
+/// existed, #8158): it shares out unless `HORIZON_SERIAL_TICK=all`, one thread is all there is,
+/// or it runs inside a [`helper_scope`]. The thread-locals the tick relies on do not follow a
+/// helper.
 pub fn par_chunks_mut<T: Send>(items: &mut [T], chunk: usize, f: impl Fn(&mut [T]) + Send + Sync) {
     let lanes = if horizon_threads::serial_tick_all() {
         1
@@ -352,7 +408,7 @@ fn par_chunks_mut_on<T: Send>(
 ) {
     let chunk = chunk.max(1);
     let count = items.len().div_ceil(chunk);
-    if lanes <= 1 || count < 2 {
+    if lanes <= 1 || count < 2 || in_helper_scope() {
         for slice in items.chunks_mut(chunk) {
             f(slice);
         }
@@ -389,7 +445,7 @@ pub fn par_map_on<T: Sync, R: Send>(
     lanes: usize,
     f: impl Fn(&[T], &mut Vec<R>) + Sync,
 ) -> Vec<R> {
-    if lanes <= 1 || items.len() < min.max(2) {
+    if lanes <= 1 || items.len() < min.max(2) || in_helper_scope() {
         let mut out = Vec::with_capacity(items.len());
         f(items, &mut out);
         return out;
@@ -555,5 +611,61 @@ mod tests {
             })
         });
         assert!(caught.is_err());
+    }
+
+    /// A helper scope's jobs run at the same time as each other and as the calling thread, as
+    /// many as there are helpers: each waits (bounded, so a scope that ran them in turn fails
+    /// instead of hanging) until all have started.
+    #[test]
+    fn helper_scope_jobs_run_at_once() {
+        use std::time::{Duration, Instant};
+        let jobs = helpers().min(3);
+        let started = AtomicUsize::new(0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let meet = || {
+            started.fetch_add(1, Ordering::SeqCst);
+            while started.load(Ordering::SeqCst) <= jobs && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        helper_scope(|s| {
+            for _ in 0..jobs {
+                s.spawn(|_| meet());
+            }
+            meet();
+        });
+        assert_eq!(started.load(Ordering::SeqCst), jobs + 1);
+        assert!(Instant::now() < deadline, "the jobs ran in turn");
+    }
+
+    /// Inside a helper scope whose jobs hold every helper until the calling thread is done, a
+    /// phase the calling thread shares out runs its parts there, in order, instead of waiting
+    /// (bounded) for a helper.
+    #[test]
+    fn a_phase_inside_a_helper_scope_stays_on_its_thread() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let done = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let items: Vec<u64> = (0..64).collect();
+        let doubled = helper_scope(|s| {
+            for _ in 0..helpers() {
+                s.spawn(|_| {
+                    while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+            }
+            let doubled = par_map_on(&items, 1, 4, |part, out: &mut Vec<u64>| {
+                out.extend(part.iter().map(|x| x * 2));
+            });
+            done.store(true, Ordering::SeqCst);
+            doubled
+        });
+        assert!(
+            Instant::now() < deadline,
+            "the parts waited for a held helper"
+        );
+        assert_eq!(doubled, items.iter().map(|x| x * 2).collect::<Vec<_>>());
     }
 }
