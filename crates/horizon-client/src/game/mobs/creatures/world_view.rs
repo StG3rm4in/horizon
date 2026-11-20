@@ -49,6 +49,7 @@ impl Game<'_> {
             thundering: weather && thunder > 0.9,
             level: self.level_key(),
             block_tags: &self.items().block_tags,
+            hot_tags: horizon_client::mobs::HotTags::of(&self.items().block_tags),
             landing: &self.motion.landing,
             biomes: world_biomes!(self),
             mob_griefing: self

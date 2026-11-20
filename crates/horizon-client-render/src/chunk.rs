@@ -1006,6 +1006,15 @@ impl Chunk {
             .biomes
             .get(((qy & 3) << 4 | ((z & 15) >> 2) << 2 | (x & 15) >> 2) as usize) as u16
     }
+    /// The biome every cell of the section [`Self::biome`] reads for block `y` holds, when the
+    /// section holds that one alone.
+    pub fn uniform_biome(&self, y: i32) -> Option<u16> {
+        let qy = ((y - self.min_y) >> 2).clamp(0, self.sections.len() as i32 * 4 - 1);
+        self.sections[(qy >> 2) as usize]
+            .biomes
+            .uniform()
+            .map(|v| v as u16)
+    }
     /// Sets the biome of one quart cell (`qy` counts from the column's bottom).
     pub fn set_biome_cell(&mut self, qx: i32, qy: i32, qz: i32, biome: u16) {
         let section = Arc::make_mut(&mut self.sections[(qy >> 2) as usize]);

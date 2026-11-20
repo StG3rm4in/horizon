@@ -1244,6 +1244,7 @@ pub fn main() -> horizon_client::Result<()> {
                     thundering: s.thunder,
                     level: horizon_core::LevelKey::OVERWORLD,
                     block_tags: &items.block_tags,
+                    hot_tags: Default::default(),
                     landing: &motion.landing,
                     biomes: &biomes,
                     mob_griefing: true,

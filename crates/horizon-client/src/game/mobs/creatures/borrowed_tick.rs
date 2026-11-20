@@ -450,6 +450,7 @@ impl Game<'_> {
                         player: active_player,
                         player_identity: active_identity,
                         player_selection: selection.as_ref(),
+                        hot_tags: base.hot_tags.clone(),
                         teams: std::sync::Arc::clone(&base.teams),
                         section_writer: None,
                         ..base
