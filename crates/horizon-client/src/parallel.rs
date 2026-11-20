@@ -13,15 +13,29 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// `HORIZON_PARALLEL_TICK`, whatever the setting says: `0` keeps every tick serial, `1` turns the
 /// server tick's parallel phases on, and `verify` does too, also checking the phases that can be
-/// checked against the serial code. Unset, the setting decides.
+/// checked against the serial code. `exact` shares the phases' work as `1` does, but keeps every
+/// draw on vanilla's streams ([`own_random`]): the tick gives vanilla's result. Unset, the setting
+/// decides.
 fn forced() -> Option<u8> {
     static FORCED: OnceLock<Option<u8>> = OnceLock::new();
     *FORCED.get_or_init(|| match std::env::var("HORIZON_PARALLEL_TICK").as_deref() {
         Ok("0" | "off" | "false") => Some(0),
         Ok("1" | "on" | "true") => Some(1),
         Ok("verify") => Some(2),
+        Ok("exact") => Some(EXACT),
         _ => None,
     })
+}
+
+/// [`parallel_tick`] under `HORIZON_PARALLEL_TICK=exact`: shared, on vanilla's streams.
+const EXACT: u8 = 3;
+
+/// Whether the parallel tick lets the villagers' brains and the mobs' turns draw from streams of
+/// their own ([`villagers_own_random`], [`mobs_own_random`]): with it on, but not under
+/// `HORIZON_PARALLEL_TICK=exact`, which shares only the phases whose result doesn't depend on
+/// the order.
+fn own_random() -> bool {
+    matches!(parallel_tick(), 1 | 2)
 }
 
 /// The Parallel Tick setting, as the window last applied it; Off until it does (a dedicated
@@ -34,7 +48,9 @@ static AUTO_STATE: AtomicU8 = AtomicU8::new(0);
 static AUTO: Mutex<Auto> = Mutex::new(Auto::new());
 
 /// Whether this tick's phases share their work: 0 serial, 1 shared, 2 shared and checked against
-/// the serial code (`HORIZON_PARALLEL_TICK=verify`). Each phase gives the serial result either way.
+/// the serial code (`HORIZON_PARALLEL_TICK=verify`), 3 shared with every draw on vanilla's streams
+/// (`HORIZON_PARALLEL_TICK=exact`). Each phase gives the serial result either way; only the
+/// streams of [`own_random`] differ from vanilla's.
 pub fn parallel_tick() -> u8 {
     forced().unwrap_or_else(|| SHARED.load(Ordering::Relaxed))
 }
@@ -236,7 +252,7 @@ impl Auto {
 /// time, so the villager's entity random keeps vanilla's sequence. The serial loop does the same while the parallel
 /// tick is on, so which path a tick takes never changes the result.
 pub fn villagers_own_random() -> bool {
-    OWN_RANDOM_TEST.load(Ordering::Relaxed) || parallel_tick() > 0
+    OWN_RANDOM_TEST.load(Ordering::Relaxed) || own_random()
 }
 
 /// Whether a mob's turn draws the level-random rolls from a stream of its own instead of the level's.
@@ -251,7 +267,7 @@ pub fn villagers_own_random() -> bool {
 /// mob's own entity random keeps vanilla's sequence, and the serial loop draws the same way while
 /// the parallel tick is on, so which path a tick takes never changes the result.
 pub fn mobs_own_random() -> bool {
-    parallel_tick() > 0
+    own_random()
 }
 
 /// The stream a mob's turn draws its level-random rolls from under [`mobs_own_random`]: seeded
