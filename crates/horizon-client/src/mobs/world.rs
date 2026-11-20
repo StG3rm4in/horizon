@@ -619,6 +619,11 @@ impl MobWorld<'_> {
         // 0.25 end).
         crate::screen_effects::lightmap_brightness(self.dimension_type.ambient_light, level)
     }
+    /// `Level.isBrightOutside`: daylight in a dimension whose time moves; never in one with a fixed
+    /// time (the Nether, the End, a datapack's), whatever its sky.
+    pub fn bright_outside(&self) -> bool {
+        self.daylight && !self.dimension_type.has_fixed_time
+    }
     pub fn sky_darken(&self) -> i32 {
         if self.daylight { 0 } else { 11 }
     }
@@ -889,6 +894,30 @@ pub fn visual_clip<W: DynamicCollisionWorld>(
 #[cfg(test)]
 #[path = "end_ambient_light_tests.rs"]
 mod end_ambient_light_tests;
+
+#[cfg(test)]
+mod bright_outside_tests {
+    /// `MobWorld::bright_outside` is the daylight where time moves, and never true in a dimension
+    /// with a fixed time, even with the daylight on.
+    #[test]
+    fn a_fixed_time_dimension_is_never_bright_outside() {
+        super::with_test_world(&[], |w, _| {
+            let mut day = w.clone();
+            day.daylight = true;
+            assert!(day.bright_outside());
+            let mut night = w.clone();
+            night.daylight = false;
+            assert!(!night.bright_outside());
+            for fixed in ["minecraft:the_end", "minecraft:the_nether"] {
+                let mut there = day.clone();
+                there.dimension_type =
+                    horizon_world::dimension_type::DimensionFacts::vanilla(fixed).unwrap();
+                assert!(there.dimension_type.has_fixed_time, "{fixed}");
+                assert!(!there.bright_outside(), "{fixed}");
+            }
+        });
+    }
+}
 
 /// Runs `f` with an empty overworld (`others` its mobs) and the mob types,
 /// both from the extracted vanilla data; false, without running it, when
