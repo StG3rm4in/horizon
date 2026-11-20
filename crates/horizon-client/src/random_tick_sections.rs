@@ -146,6 +146,24 @@ impl RandomTickSections {
         }
         base
     }
+    /// Reads what [`ChunkTicking::next`] reads first for each of the chunks `keys`: its entry
+    /// here and the count of each of its ticking sections' masks. The loop over the chunks then
+    /// finds them in the caches: these reads, which mostly miss, wait for each other here instead
+    /// of each for the one before in the loop. Reads only; the sum is for `black_box`.
+    pub fn read_ahead(&self, keys: &[(i32, i32)]) -> usize {
+        let mut sum = 0usize;
+        for key in keys {
+            if let Some(cached) = self.chunks.get(key) {
+                sum = sum.wrapping_add(cached.chunk.as_ptr() as usize);
+                for i in cached.sections.mask.iter() {
+                    if let Some(Some(mask)) = cached.masks.get(i) {
+                        sum = sum.wrapping_add(Rc::strong_count(mask));
+                    }
+                }
+            }
+        }
+        sum
+    }
     /// For [`ChunkTicking`]: the mask of section `index` of `chunk` as [`Self::next_masked`]
     /// hands it out, built now if it is not yet.
     fn mask_of(
