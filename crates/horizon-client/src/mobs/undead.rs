@@ -1083,6 +1083,14 @@ impl MoveThroughVillage {
         }
     }
 }
+/// Whether night goals (`MoveThroughVillage` with `only_at_night`: zombies, husks and zombie
+/// villagers) give up on a tick of `w`: `Level.isBrightOutside` as they read it, the level's
+/// `daylight`. Vanilla also keeps a fixed-time dimension (the End) dark here, which this doesn't
+/// yet. The mob islands' planner asks the same (`mob_islands::reads_villages`), so a change here
+/// changes which mobs it joins with the villagers.
+pub fn bright_for_night_goals(w: &super::MobWorld) -> bool {
+    w.daylight
+}
 impl Goal for MoveThroughVillage {
     goal_clone!();
     fn flags(&self) -> u8 {
@@ -1097,7 +1105,7 @@ impl Goal for MoveThroughVillage {
         if self.visited.len() > 15 {
             self.visited.remove(0);
         }
-        if self.only_at_night && cx.w.daylight {
+        if self.only_at_night && bright_for_night_goals(cx.w) {
             return false;
         }
         let w = cx.w;

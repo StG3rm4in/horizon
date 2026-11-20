@@ -734,20 +734,20 @@ fn teleport_consumable(m: &Mob, items: &horizon_client::items::Items) -> Option<
         })
         .reduce(|a, b| if a.is_nan() || a > b { a } else { b })
 }
-/// Mobs whose tick reads every villager's points of interest (`village_sections`,
-/// `others_tickets`).
-fn reads_villages(species: Species) -> bool {
-    matches!(
-        species,
-        Species::Villager
-            | Species::IronGolem
-            | Species::Fox
-            | Species::Zombie
-            | Species::ZombieVillager
-            | Species::Husk
-            | Species::Drowned
-            | Species::ZombifiedPiglin
-    )
+/// Mobs whose tick may read every villager's points of interest (`village_sections`,
+/// `others_tickets`) on a tick where night goals give up if `bright`
+/// (`undead::bright_for_night_goals` of the tick's world, the same for every turn): the villagers,
+/// iron golems and foxes always; the zombies, husks and zombie villagers only when not `bright`,
+/// as their one reader, `undead::MoveThroughVillage`, is a night goal whose `can_use` gives up
+/// before it reads (and whose `can_continue`, `start` and `stop` never read). No goal of a drowned
+/// or a zombified piglin reads them: their goal sets have no `MoveThroughVillage`. The audit is in
+/// `docs/mob-islands.md`.
+fn reads_villages(species: Species, bright: bool) -> bool {
+    match species {
+        Species::Villager | Species::IronGolem | Species::Fox => true,
+        Species::Zombie | Species::ZombieVillager | Species::Husk => !bright,
+        _ => false,
+    }
 }
 fn grow(b: Aabb, by: f64) -> Aabb {
     b.inflate(Vec3::new(by, by, by))
@@ -968,6 +968,7 @@ fn reaches_why(
             mob: None,
         });
     }
+    let bright = horizon_client::mobs::undead::bright_for_night_goals(turns.base);
     let mut out = Vec::with_capacity(mobs.len());
     for (m, s) in mobs.iter().zip(snapshot) {
         if !(m.position.x.is_finite() && m.position.y.is_finite() && m.position.z.is_finite())
@@ -1015,7 +1016,7 @@ fn reaches_why(
                 at: (centre(Axis::X), centre(Axis::Z)),
                 body,
                 sense: grow(body, sense_range),
-                village_reads: reads_villages(s.species).then(|| grow(body, VILLAGE_SENSE)),
+                village_reads: reads_villages(s.species, bright).then(|| grow(body, VILLAGE_SENSE)),
             }
         });
         let claims = (s.species == Species::Villager).then(|| {
@@ -1067,7 +1068,7 @@ fn reaches_why(
             ticking: turns.base.world.loaded(bx, bz) && (turns.ticking)(bx, bz),
             body,
             sense: grow(body, sense_range),
-            village_reads: reads_villages(s.species).then(|| grow(body, VILLAGE_SENSE)),
+            village_reads: reads_villages(s.species, bright).then(|| grow(body, VILLAGE_SENSE)),
             claims,
             id: s.id,
             links,
@@ -2071,6 +2072,42 @@ mod tests {
             bad(&mobs, &snapshot[..399]),
             (Verdict::UnboundedLists, None)
         );
+        // Who reads the villages, by day and by night (`reads_villages`), whatever the lanes.
+        let mut day = game.mob_world_base(&[]);
+        day.daylight = true;
+        let mut night = game.mob_world_base(&[]);
+        night.daylight = false;
+        let readers = [
+            (Species::Villager, true, true),
+            (Species::IronGolem, true, true),
+            (Species::Fox, true, true),
+            (Species::Zombie, false, true),
+            (Species::Husk, false, true),
+            (Species::ZombieVillager, false, true),
+            (Species::Drowned, false, false),
+            (Species::ZombifiedPiglin, false, false),
+            (Species::Cow, false, false),
+        ];
+        for (species, by_day, by_night) in readers {
+            let mut seen = snapshot[1..2].to_vec();
+            seen[0].species = species;
+            for (base, reads) in [(&day, by_day), (&night, by_night)] {
+                let turns = Turns {
+                    base,
+                    ticking: &|_, _| true,
+                    nearest: &nearest,
+                    single_player: Some(None),
+                    canceled: &|_| false,
+                    difficulty: &|_| {
+                        horizon_client::mobs::spawning::LocalDifficulty::new(2, 0, 0, 0.0)
+                    },
+                    cached_difficulty: None,
+                };
+                let r = &reaches(&mobs[1..2], &seen, &turns, &[]).unwrap()[0];
+                let by = if base.daylight { "day" } else { "night" };
+                assert_eq!(r.village_reads.is_some(), reads, "{species:?} by {by}");
+            }
+        }
     }
 
     /// A later id is visible frozen without waiting; an earlier id waits for its publication,
@@ -2571,6 +2608,56 @@ mod tests {
         }
         let groups = grouped_as_serial(&mut game, 30, "villagers", |_| {});
         assert_eq!(groups, groups_for(3));
+    }
+
+    /// The plan follows `reads_villages` in a ticking game: by day, zombies and husks within a
+    /// village reader's reach of the villagers' claims tick in a group of their own beside them; by
+    /// night, zombies join them; drowned and zombified piglins don't, by night either. Each way the
+    /// groups leave the mobs and the level random as the serial loop does. The villagers hold no
+    /// point of interest here, so no zombie reads a village either way: this checks the groups that
+    /// ran (on three lanes or more). Each species' reach by day and by night is checked in
+    /// `actual_reaches_cover_links_villages_and_bounded_moves`; that a zombie reads nothing by day
+    /// rests on the audit in `docs/mob-islands.md`.
+    #[test]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
+    fn zombies_read_the_villages_by_night_only() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                horizon_client::parallel::OWN_RANDOM_TEST
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
+        horizon_client::parallel::OWN_RANDOM_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let groups = |kind: &str, time: &str| {
+            let mut game = separated_herds_game();
+            // Peaceful refuses to summon monsters.
+            assert!(game.run_command("difficulty normal"));
+            for k in 0..12 {
+                let x = 4.0 + f64::from(k % 6) * 2.0;
+                let z = 14.0 + f64::from(k / 6) * 2.0;
+                assert!(game.run_command(&format!("summon villager {x:.1} 66 {z:.1}")));
+            }
+            // In the third herd, some 190 blocks from the villagers: a village reader's reach
+            // (`VILLAGE_SENSE`) meets their claims, and the player in the second herd is out of a
+            // zombie's follow range.
+            for k in 0..6 {
+                let x = 196.0 + f64::from(k) * 2.0;
+                assert!(game.run_command(&format!("summon {kind} {x:.1} 66 14.0")));
+            }
+            assert!(game.run_command(&format!("time set {time}")));
+            grouped_as_serial(&mut game, 30, &format!("{kind} at {time}"), |_| {})
+        };
+        assert_eq!(groups("zombie", "noon"), groups_for(3), "zombies by day");
+        assert_eq!(groups("husk", "noon"), groups_for(3), "husks by day");
+        assert_eq!(groups("zombie", "midnight"), groups_for(2), "zombies by night");
+        assert_eq!(groups("drowned", "midnight"), groups_for(3), "drowned");
+        assert_eq!(
+            groups("zombified_piglin", "midnight"),
+            groups_for(3),
+            "zombified piglins"
+        );
     }
 
     /// The level random after three ticks of the herds with four cod among them, each leading a
