@@ -23,7 +23,7 @@ fn feet_exclude_a_leaf_only_touched_by_the_undeflated_box() {
     let mut standing = Vec::new();
     standing_feet(&mut standing, [1.3 - 0.000005, 64.9, 0.5], true, 0.3);
     assert_eq!(standing.len(), 1);
-    assert_eq!(standing[0].0, horizon_core::position::BlockPos::new(1, 64, 0));
+    assert_eq!(standing[0].0, ([1, 64, 0], [1, 64, 0]));
 }
 
 /// The `tilt` of the block at `pos`.
@@ -229,4 +229,120 @@ fn a_leaf_stays_flat_under_an_entity_that_cannot_tilt_it() {
         xs.map(|x| tilt(&game, [x, 64, 8])).to_vec(),
         ["none", "none", "none"]
     );
+}
+
+/// The value of property `name` of the block at `pos`.
+fn property(game: &Game<'_>, pos: [i32; 3], name: &str) -> String {
+    let state = game.world.block(pos[0], pos[1], pos[2]);
+    game.pack
+        .assets
+        .registry
+        .state(state)
+        .and_then(|s| s.properties.get(name).cloned())
+        .unwrap_or_default()
+}
+
+/// The entity sweep passes over a box, or an entity's feet, whose sections
+/// hold no entity-sensing block, or no leaf, in their palettes
+/// (`SweepSections::may_hold`). A scene of two plates under a zombie and an
+/// item, leaves under zombies, and entities where no section holds either
+/// ticks to the same blocks, the same block changes and the same sounds
+/// (whose pitches draw the level's random) as when every cell is read. The
+/// first plate's press sends every later cell through (`now != looked`).
+#[test]
+#[ignore = "daily"]
+fn the_sweep_passes_over_quiet_sections_with_the_same_effects() {
+    let run = |read_every_cell: bool| {
+        let mut resources = None;
+        let mut game = test_game(&mut resources);
+        let registry = game.pack.assets.registry;
+        let state = |name: &str| registry.default_state(name).unwrap();
+        let (stone, clay) = (state("minecraft:stone"), state("minecraft:clay"));
+        let leaf = state("minecraft:big_dripleaf");
+        // A stone plate and an oak plate in chunk (0, 0)'s section 64..80,
+        // the stone one first in (x, y, z) order, with a leaf beside them;
+        // another leaf alone in section 80..96; stone in chunk (-1, -1).
+        let placed = [
+            (2, 63, 2, stone),
+            (2, 64, 2, state("minecraft:stone_pressure_plate")),
+            (12, 63, 12, stone),
+            (12, 64, 12, state("minecraft:oak_pressure_plate")),
+            (6, 63, 12, clay),
+            (6, 64, 12, leaf),
+            (4, 89, 4, clay),
+            (4, 90, 4, leaf),
+            (-9, 63, -9, stone),
+        ];
+        for (x, y, z, block) in placed {
+            game.world.set(x, y, z, block).unwrap();
+        }
+        let zombie = game
+            .res
+            .mob_types()
+            .get("minecraft:zombie")
+            .unwrap()
+            .clone();
+        // On the stone plate, beside it, across a section edge, on each
+        // leaf, and on the stone in chunk (-1, -1).
+        let mobs = [
+            (2.5, 64.0, 2.5),
+            (4.5, 64.0, 2.5),
+            (9.5, 79.0, 3.5),
+            (6.5, 64.9375, 12.5),
+            (4.5, 90.9375, 4.5),
+            (-8.5, 64.0, -8.5),
+        ];
+        for (id, (x, y, z)) in (1..).zip(mobs) {
+            let mut mob = Mob::new(id, zombie.clone(), Vec3::new(x, y, z), 0.0);
+            mob.on_ground = true;
+            game.mobs.push(mob);
+        }
+        // An item on the oak plate, and one on nothing in chunk (1, 1).
+        for (id, x, z) in [(20, 12.5, 12.5), (21, 24.5, 24.5)] {
+            let stack = ItemStack::new("minecraft:stone", 1);
+            let mut item = ItemEntity::new(id, stack, Vec3::new(x, 64.0, z), Vec3::ZERO, 0.0);
+            item.on_ground = true;
+            game.dropped.push(item);
+        }
+        // The player high over chunk (0, 0): its box and its feet reach air.
+        game.player = Some(
+            horizon_client::motion::PlayerMotion::new(game.motion, Vec3::new(8.5, 100.0, 8.5))
+                .unwrap(),
+        );
+        game.update_chunk_tickets();
+        game.tick_scratch.sweep.read_every_cell = read_every_cell;
+        game.audio.capture = Some(Vec::new());
+        tick_blocks(&mut game, 25);
+        let mut blocks = Vec::new();
+        for x in -16..32 {
+            for y in 60..110 {
+                for z in -16..32 {
+                    blocks.push(game.world.block(x, y, z).0);
+                }
+            }
+        }
+        let sounds: Vec<_> = game
+            .audio
+            .capture
+            .take()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.event, s.position, s.volume, s.pitch))
+            .collect();
+        let ends = [
+            property(&game, [2, 64, 2], "powered"),
+            tilt(&game, [6, 64, 12]),
+            tilt(&game, [4, 90, 4]),
+        ];
+        let passed_over = game.tick_scratch.sweep.passed_over;
+        (blocks, game.world.revision, sounds, ends, passed_over)
+    };
+    let shortcut = run(false);
+    let every_cell = run(true);
+    assert!(shortcut.4 > 0, "no box was passed over");
+    assert_eq!(every_cell.4, 0);
+    assert_eq!(shortcut.3, ["true", "full", "full"].map(String::from));
+    assert_eq!(shortcut.0, every_cell.0, "the blocks differ");
+    assert_eq!(shortcut.1, every_cell.1, "the block changes differ");
+    assert_eq!(shortcut.2, every_cell.2, "the sounds differ");
 }

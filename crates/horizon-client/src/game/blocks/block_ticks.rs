@@ -35,6 +35,7 @@ impl Game<'_> {
         // buttons under the players (the host and the LAN guests), the minecarts
         // and the arrows (the mobs and other entities are added in `with_level`
         // below).
+        scratch.inside_boxes.clear();
         scratch.inside.clear();
         let guests = self.lan_block_trigger_boxes();
         let boxes = self
@@ -57,14 +58,9 @@ impl Game<'_> {
                 )
             }))
             .chain(guests);
+        // Their cells are walked in `with_level` below, box by box.
         for (lo, hi) in boxes {
-            for x in (lo[0] + 1e-7).floor() as i32..=(hi[0] - 1e-7).floor() as i32 {
-                for y in (lo[1] + 1e-7).floor() as i32..=(hi[1] - 1e-7).floor() as i32 {
-                    for z in (lo[2] + 1e-7).floor() as i32..=(hi[2] - 1e-7).floor() as i32 {
-                        scratch.inside.push(BlockPos::new(x, y, z));
-                    }
-                }
-            }
+            scratch.inside_boxes.push(box_cells(lo, hi));
         }
         // AbstractArrow.applyEffectsFromBlocks: the blocks every arrow passed
         // through this tick (a wooden button is pressed by one inside it), and
@@ -153,6 +149,9 @@ impl Game<'_> {
         }
         let first_contact_drop = self.next_entity + 1;
         self.with_level(|b, level, ticks| {
+            // The palettes' answers kept from the last tick may be for other
+            // behaviours (a reload) or another level.
+            scratch.sweep.clear();
             // LilyPadBlock.entityInside: a boat inside a lily pad breaks it.
             scratch.boat_cells.clear();
             for bounds in level.boat_trigger_boxes() {
@@ -173,13 +172,8 @@ impl Game<'_> {
             use entity::{Entity as _, for_each_entity};
             let mut touch = |bounds: Aabb| {
                 let (lo, hi) = (bounds.min_position(), bounds.max_position());
-                for x in (lo.x + 1e-7).floor() as i32..=(hi.x - 1e-7).floor() as i32 {
-                    for y in (lo.y + 1e-7).floor() as i32..=(hi.y - 1e-7).floor() as i32 {
-                        for z in (lo.z + 1e-7).floor() as i32..=(hi.z - 1e-7).floor() as i32 {
-                            scratch.touched.push(BlockPos::new(x, y, z));
-                        }
-                    }
-                }
+                let cells = box_cells([lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]);
+                scratch.touched.push(cells);
             };
             for_each_entity!(level.entities(), entity => {
                 if entity.triggers_blocks() && entity.sweeps_blocks_inside() {
@@ -200,6 +194,24 @@ impl Game<'_> {
             for &bounds in &level.trigger_extras {
                 touch(bounds);
             }
+            // The host's, the minecarts' and the LAN guests' boxes, cell by
+            // cell. At a block that senses no entity, `entity_inside` only
+            // reads the state: a box whose sections hold no sensing state in
+            // their palettes when its turn comes changes nothing at any of its
+            // cells, so it is passed over.
+            for &cells in &scratch.inside_boxes {
+                if !scratch.sweep.may_hold(level.world, b, cells, SENSING) {
+                    continue;
+                }
+                let (lo, hi) = cells;
+                for x in lo[0]..=hi[0] {
+                    for y in lo[1]..=hi[1] {
+                        for z in lo[2]..=hi[2] {
+                            b.entity_inside(level, ticks, BlockPos::new(x, y, z));
+                        }
+                    }
+                }
+            }
             for pos in scratch.inside.drain(..) {
                 b.entity_inside(level, ticks, pos);
             }
@@ -208,15 +220,24 @@ impl Game<'_> {
             // passed over while no block has changed since they were looked
             // at (they are still not sensing), and only the few sensing ones
             // are sorted. Once a block changes, every later one goes, as the
-            // whole sorted list would.
+            // whole sorted list would. Looking for the sensing ones changes
+            // nothing, so a box whose sections hold no sensing state in their
+            // palettes has none to find: its cells are not read.
             let key = |p: &BlockPos| (p.x, p.y, p.z);
             scratch.sensing.clear();
-            scratch.rest.clear();
-            for pos in scratch.touched.drain(..) {
-                if b.senses_entities(level.world.block(pos.x, pos.y, pos.z)) {
-                    scratch.sensing.push(pos);
-                } else {
-                    scratch.rest.push(pos);
+            for &cells in &scratch.touched {
+                if !scratch.sweep.may_hold(level.world, b, cells, SENSING) {
+                    continue;
+                }
+                let (lo, hi) = cells;
+                for x in lo[0]..=hi[0] {
+                    for y in lo[1]..=hi[1] {
+                        for z in lo[2]..=hi[2] {
+                            if b.senses_entities(level.world.block(x, y, z)) {
+                                scratch.sensing.push(BlockPos::new(x, y, z));
+                            }
+                        }
+                    }
                 }
             }
             scratch.sensing.sort_unstable_by_key(key);
@@ -235,10 +256,22 @@ impl Game<'_> {
                     level.world.chunks.membership_revision(),
                 );
                 if now != looked {
+                    // Every touched cell after `pos`, sensing or not, as the
+                    // sorted list of them all has it: the sensing ones up to
+                    // `pos` went already.
                     scratch.later.clear();
-                    scratch.later.append(&mut scratch.rest);
-                    scratch.later.extend(scratch.sensing.drain(i..));
-                    scratch.later.retain(|p| key(p) > key(&pos));
+                    for &(lo, hi) in &scratch.touched {
+                        for x in lo[0]..=hi[0] {
+                            for y in lo[1]..=hi[1] {
+                                for z in lo[2]..=hi[2] {
+                                    let cell = BlockPos::new(x, y, z);
+                                    if key(&cell) > key(&pos) {
+                                        scratch.later.push(cell);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     scratch.later.sort_unstable_by_key(key);
                     scratch.later.dedup();
                     for pos in scratch.later.drain(..) {
@@ -247,8 +280,20 @@ impl Game<'_> {
                     break;
                 }
             }
-            for (pos, on_ground, feet_y) in scratch.standing.drain(..) {
-                b.entity_on_big_dripleaf(level, ticks, pos, on_ground, feet_y);
+            // BigDripleafBlock.entityInside at the feet: anywhere but at a
+            // leaf it only reads the state, so a feet layer whose sections
+            // hold no leaf in their palettes when its turn comes (after the
+            // leaves the ones before tilted) is passed over.
+            for ((lo, hi), on_ground, feet_y) in scratch.standing.drain(..) {
+                if !scratch.sweep.may_hold(level.world, b, (lo, hi), LEAF) {
+                    continue;
+                }
+                for x in lo[0]..=hi[0] {
+                    for z in lo[2]..=hi[2] {
+                        let pos = BlockPos::new(x, lo[1], z);
+                        b.entity_on_big_dripleaf(level, ticks, pos, on_ground, feet_y);
+                    }
+                }
             }
         });
         self.process_level_events()?;
@@ -468,22 +513,225 @@ impl Game<'_> {
 }
 
 /// The blocks the feet layer of an entity centred at `at` and `w` wide is
-/// inside, with whether it stands on the ground and how high its feet are:
-/// what `BigDripleafBlock.canEntityTilt` reads. Vanilla's `checkInsideBlocks`
+/// inside, as one layer of cells (walked x first, then z), with whether it
+/// stands on the ground and how high its feet are: what
+/// `BigDripleafBlock.canEntityTilt` reads. Vanilla's `checkInsideBlocks`
 /// sweeps the whole deflated box, but `canEntityTilt` needs the feet above the
 /// leaf's 0.6875 and a box starts at its feet, so only a leaf in the feet
 /// layer can pass it.
 pub(in crate::game) fn standing_feet(
-    out: &mut Vec<(BlockPos, bool, f64)>,
+    out: &mut Vec<(CellBox, bool, f64)>,
     at: [f64; 3],
     on_ground: bool,
     w: f64,
 ) {
     let epsilon = f64::from(1.0e-5_f32);
     let y = (at[1] + epsilon).floor() as i32;
-    for x in (at[0] - w + epsilon).floor() as i32..=(at[0] + w - epsilon).floor() as i32 {
-        for z in (at[2] - w + epsilon).floor() as i32..=(at[2] + w - epsilon).floor() as i32 {
-            out.push((BlockPos::new(x, y, z), on_ground, at[1]));
+    let cell = |v: f64| v.floor() as i32;
+    let (x0, x1) = (cell(at[0] - w + epsilon), cell(at[0] + w - epsilon));
+    let (z0, z1) = (cell(at[2] - w + epsilon), cell(at[2] + w - epsilon));
+    out.push((([x0, y, z0], [x1, y, z1]), on_ground, at[1]));
+}
+
+/// The cells `lo..=hi` of a box, both corners included (none along an axis
+/// where `hi` is below `lo`), walked x first, then y, then z.
+pub(in crate::game) type CellBox = ([i32; 3], [i32; 3]);
+
+/// The cells the sweep of `tick_blocks` walks for a box from `lo` to `hi`:
+/// each corner moved 1e-7 inwards, then floored.
+pub(in crate::game) fn box_cells(lo: [f64; 3], hi: [f64; 3]) -> CellBox {
+    (
+        lo.map(|v| (v + 1e-7).floor() as i32),
+        hi.map(|v| (v - 1e-7).floor() as i32),
+    )
+}
+
+/// [`SweepSections`] bit: a state [`Behaviours::senses_entities`] says yes to,
+/// where `entity_inside` may do anything.
+const SENSING: u8 = 1;
+/// [`SweepSections`] bit: a big dripleaf, which `entity_on_big_dripleaf` may tilt.
+const LEAF: u8 = 2;
+/// [`SweepSections::states`]: the state's bits are known.
+const KNOWN: u8 = 4;
+
+/// `World::may_hold` for the entity sweep of `tick_blocks`, for both of its
+/// questions at once (a block sensing entities, a big dripleaf): each
+/// section's palette is read once, and its answer kept while no block changes
+/// and no chunk comes or goes (the stamp the sweep's sensing blocks are looked
+/// at with), for the boxes of the other entities in that section and for each
+/// entity's feet after its box. Cleared every tick: the behaviours may change.
+#[derive(Default)]
+pub(in crate::game) struct SweepSections {
+    /// Per section, `(chunk x, section index, chunk z)`: the bits a state of
+    /// its palette may answer to.
+    sections: FxHashMap<(i32, i32, i32), u8>,
+    /// Per block state: its bits with [`KNOWN`], or 0 before it is asked.
+    states: Vec<u8>,
+    /// The world's `(revision, membership_revision)` the sections were read at.
+    stamp: Option<(u64, u64)>,
+    /// Every box may hold anything: every cell is read, as before the memo.
+    #[cfg(test)]
+    pub(in crate::game) read_every_cell: bool,
+    /// How many boxes were passed over.
+    #[cfg(test)]
+    pub(in crate::game) passed_over: usize,
+}
+
+impl SweepSections {
+    /// Forgets every answer, for a new tick.
+    fn clear(&mut self) {
+        self.sections.clear();
+        self.states.clear();
+        self.stamp = None;
+    }
+    /// The bits of `state`.
+    fn state(&mut self, b: &Behaviours, state: BlockStateId) -> u8 {
+        let i = state.0 as usize;
+        if i >= self.states.len() {
+            self.states.resize(i + 1, 0);
         }
+        if self.states[i] == 0 {
+            let sensing = if b.senses_entities(state) { SENSING } else { 0 };
+            let leaf = if b.is_big_dripleaf(state) { LEAF } else { 0 };
+            self.states[i] = KNOWN | sensing | leaf;
+        }
+        self.states[i] & !KNOWN
+    }
+    /// The bits of section `s` of the chunk at `(cx, cz)`, as `World::may_hold`
+    /// reads it: a missing chunk is air, a palette of the whole registry may
+    /// hold anything, and an entry no block uses any more still counts.
+    fn section(&mut self, world: &World, b: &Behaviours, (cx, s, cz): (i32, i32, i32)) -> u8 {
+        if let Some(&bits) = self.sections.get(&(cx, s, cz)) {
+            return bits;
+        }
+        let bits = match world.chunks.get(&(cx, cz)) {
+            None => self.state(b, world.air),
+            // The level's chunks hold its column (`World::shape`); one that
+            // did not would have its cells read.
+            Some(chunk) if chunk.layout() != world.layout() => SENSING | LEAF,
+            Some(chunk) => match chunk.sections.get(s as usize) {
+                Some(section) if !section.blocks.is_global() => {
+                    let mut bits = 0;
+                    section.blocks.maybe_has(|v| {
+                        bits |= self.state(b, BlockStateId(v));
+                        bits == SENSING | LEAF
+                    });
+                    bits
+                }
+                _ => SENSING | LEAF,
+            },
+        };
+        self.sections.insert((cx, s, cz), bits);
+        bits
+    }
+    /// Whether a block of the cells `lo..=hi` may answer to `bits`, read now:
+    /// `World::may_hold` of [`Self::state`]'s questions. `false` means that no
+    /// cell holds such a block at this moment.
+    fn may_hold(&mut self, world: &World, b: &Behaviours, (lo, hi): CellBox, bits: u8) -> bool {
+        #[cfg(test)]
+        {
+            if self.read_every_cell {
+                return true;
+            }
+        }
+        // The answers kept are for the world as it was read: once a block is
+        // set (by the sweep itself) or a chunk comes or goes, all are read
+        // again.
+        let now = (world.revision, world.chunks.membership_revision());
+        if self.stamp != Some(now) {
+            self.sections.clear();
+            self.stamp = Some(now);
+        }
+        let layout = world.layout();
+        let (bottom, top) = (layout.min_y(), layout.max_y() - 1);
+        // Heights outside the sections read as state 0, or as air without a chunk.
+        if (lo[1] < bottom || hi[1] > top)
+            && (self.state(b, BlockStateId(0)) | self.state(b, world.air)) & bits != 0
+        {
+            return true;
+        }
+        let sections = (lo[1].max(bottom) - bottom) >> 4..=(hi[1].min(top) - bottom) >> 4;
+        for cx in lo[0] >> 4..=hi[0] >> 4 {
+            for cz in lo[2] >> 4..=hi[2] >> 4 {
+                for s in sections.clone() {
+                    if self.section(world, b, (cx, s, cz)) & bits != 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            self.passed_over += 1;
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod sweep_sections_tests {
+    use super::*;
+
+    /// [`SweepSections::may_hold`] answers as `World::may_hold` does for its
+    /// two questions, over section and chunk edges, above and below the world
+    /// and where no chunk is, and reads a section again once a block is set:
+    /// an answer given before an effect of the sweep is not kept after it.
+    #[test]
+    #[ignore = "daily"]
+    fn sweep_sections_answer_as_world_may_hold() {
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        let registry = game.pack.assets.registry;
+        let plate = registry
+            .default_state("minecraft:stone_pressure_plate")
+            .unwrap();
+        let leaf = registry.default_state("minecraft:big_dripleaf").unwrap();
+        for (x, z) in [(0, 0), (1, 0)] {
+            let chunk = std::sync::Arc::new(horizon_client::chunk::Chunk::empty(x, z));
+            game.world.chunks.insert((x, z), chunk);
+        }
+        // A plate in chunk (0, 0)'s section 64..80, a leaf in chunk (1, 0)'s.
+        game.world.set(3, 64, 3, plate).unwrap();
+        game.world.set(20, 70, 5, leaf).unwrap();
+        let b = game.res.behaviours();
+        let mut sweep = SweepSections::default();
+        let boxes: [CellBox; 10] = [
+            ([2, 63, 2], [3, 65, 3]),
+            ([5, 64, 5], [6, 65, 6]),
+            ([5, 79, 5], [5, 80, 5]),
+            ([2, 40, 2], [3, 41, 3]),
+            ([14, 64, 2], [17, 65, 3]),
+            ([20, 70, 5], [20, 70, 5]),
+            ([-1, 64, -1], [0, 65, 0]),
+            ([40, 64, 0], [41, 65, 1]),
+            ([0, 318, 0], [1, 330, 1]),
+            ([0, -80, 0], [1, -70, 1]),
+        ];
+        for cells in boxes {
+            let (lo, hi) = cells;
+            let sensing = game.world.may_hold(lo, hi, |s| b.senses_entities(s));
+            let leaves = game.world.may_hold(lo, hi, |s| b.is_big_dripleaf(s));
+            assert_eq!(
+                sweep.may_hold(&game.world, b, cells, SENSING),
+                sensing,
+                "{cells:?}"
+            );
+            assert_eq!(
+                sweep.may_hold(&game.world, b, cells, LEAF),
+                leaves,
+                "{cells:?}"
+            );
+        }
+        // Not every answer is yes: the plate's section and the leaf's only.
+        assert!(sweep.may_hold(&game.world, b, boxes[0], SENSING));
+        assert!(!sweep.may_hold(&game.world, b, boxes[0], LEAF));
+        assert!(sweep.may_hold(&game.world, b, boxes[5], LEAF));
+        assert!(!sweep.may_hold(&game.world, b, boxes[3], SENSING));
+        assert!(!sweep.may_hold(&game.world, b, boxes[7], SENSING));
+        // A section answered for is read again once a block is set in it.
+        let high = ([4, 100, 4], [5, 101, 5]);
+        assert!(!sweep.may_hold(&game.world, b, high, SENSING));
+        game.world.set(4, 100, 4, plate).unwrap();
+        assert!(sweep.may_hold(&game.world, b, high, SENSING));
     }
 }

@@ -929,13 +929,18 @@ impl ResizeState {
 #[derive(Default)]
 struct TickScratch {
     ticking: Vec<(i32, i32)>,
+    /// The cells of the host's, the minecarts' and the LAN guests' boxes.
+    inside_boxes: Vec<block_ticks::CellBox>,
     inside: Vec<BlockPos>,
-    standing: Vec<(BlockPos, bool, f64)>,
+    /// The feet layers a big dripleaf may tilt under.
+    standing: Vec<(block_ticks::CellBox, bool, f64)>,
     boat_cells: Vec<BlockPos>,
-    touched: Vec<BlockPos>,
+    /// The cells of the boxes of the mobs and the other entities.
+    touched: Vec<block_ticks::CellBox>,
     sensing: Vec<BlockPos>,
-    rest: Vec<BlockPos>,
     later: Vec<BlockPos>,
+    /// What the palettes of the sections those cells reach may hold.
+    sweep: block_ticks::SweepSections,
 }
 
 struct Game<'a> {
