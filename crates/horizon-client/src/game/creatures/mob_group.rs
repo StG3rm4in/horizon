@@ -368,6 +368,7 @@ impl Group {
             player_identity: active_identity,
             player_selection: None,
             teams: std::sync::Arc::clone(&base.teams),
+            hot_tags: base.hot_tags.clone(),
             section_writer: None,
             ..*base
         };

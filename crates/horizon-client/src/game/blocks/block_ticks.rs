@@ -2,6 +2,9 @@
 //! chunks the tickets simulate, block events and moving pistons (`tick_blocks`).
 use super::*;
 
+/// How many chunks the random tick loop reads ahead of itself.
+const READ_AHEAD: usize = 8;
+
 impl Game<'_> {
     /// ServerLevel.tick block phases: scheduled ticks, random ticks in the
     /// chunks the tickets simulate, block events and moving pistons.
@@ -306,7 +309,19 @@ impl Game<'_> {
                 // changes and no chunk comes or goes; the mask itself is retained by
                 // tick_chunk_random_masked between callback asks.
                 let mut sections = horizon_client::random_tick_sections::ChunkTicking::default();
-                for (x, z) in scratch.ticking.drain(..).filter(|_| !debug) {
+                for (n, &(x, z)) in scratch.ticking.iter().enumerate().filter(|_| !debug) {
+                    // The next chunks' first reads, read together (`RandomTickSections::read_ahead`):
+                    // their entries here and in the chunk map.
+                    if n % READ_AHEAD == 0 {
+                        let ahead = &scratch.ticking[n..(n + READ_AHEAD).min(scratch.ticking.len())];
+                        let chunks = &level.world.chunks;
+                        let read = level.random_tick_sections.read_ahead(ahead);
+                        let found = ahead
+                            .iter()
+                            .filter_map(|key| chunks.get(key))
+                            .fold(0usize, |sum, chunk| sum ^ std::sync::Arc::as_ptr(chunk) as usize);
+                        std::hint::black_box(read ^ found);
+                    }
                     let pos = horizon_core::position::ChunkPos::new(x, z);
                     sections.start((x, z));
                     b.tick_chunk_random_masked(level, ticks, pos, |level, from| {
@@ -325,6 +340,7 @@ impl Game<'_> {
                         )
                     });
                 }
+                scratch.ticking.clear();
             });
         });
         horizon_threads::work::clear_work();

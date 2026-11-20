@@ -434,6 +434,35 @@ impl World {
         let y = y.clamp(self.shape.min_y, self.shape.max_y() - 1);
         Some(self.chunks.get(&(x >> 4, z >> 4))?.biome(x, y, z))
     }
+    /// The biome [`Self::noise_biome`] gives at every combination of `xs`, `ys` and `zs` (block
+    /// coordinates), when the sections they fall in all hold that one biome alone; `None` when they
+    /// don't, or where a chunk isn't loaded.
+    pub fn uniform_noise_biome(&self, xs: [i32; 2], ys: [i32; 2], zs: [i32; 2]) -> Option<u16> {
+        let ys = ys.map(|y| y.clamp(self.shape.min_y, self.shape.max_y() - 1));
+        let xs: &[i32] = if xs[0] >> 4 == xs[1] >> 4 {
+            &xs[..1]
+        } else {
+            &xs
+        };
+        let zs: &[i32] = if zs[0] >> 4 == zs[1] >> 4 {
+            &zs[..1]
+        } else {
+            &zs
+        };
+        let mut found = None;
+        for &x in xs {
+            for &z in zs {
+                let chunk = self.chunks.get(&(x >> 4, z >> 4))?;
+                for &y in &ys {
+                    let biome = chunk.uniform_biome(y)?;
+                    if *found.get_or_insert(biome) != biome {
+                        return None;
+                    }
+                }
+            }
+        }
+        found
+    }
     /// One above the highest block Y the level's chunks hold.
     pub fn top_y(&self) -> i32 {
         self.layout().max_y()
@@ -821,6 +850,59 @@ mod tests {
     use crate::chunk::{Chunk, MIN_Y, SECTIONS};
     use horizon_world::registry::BlockStateId;
     use std::sync::Arc;
+
+    /// Where `uniform_noise_biome` answers, every read it stands for gives that biome; it does not
+    /// answer across a section of two biomes, a border between two biomes or an unloaded chunk.
+    #[test]
+    fn a_uniform_noise_biome_is_what_every_read_gives() {
+        let mut world = World::new(BlockStateId(0), 0);
+        let mut plain = Chunk::empty(0, 0);
+        let mut mixed = Chunk::empty(1, 0);
+        for qy in 0..SECTIONS as i32 * 4 {
+            for q in 0..4 {
+                for r in 0..4 {
+                    plain.set_biome_cell(q, qy, r, 3);
+                    mixed.set_biome_cell(q, qy, r, if qy == 20 && q == 1 { 5 } else { 3 });
+                }
+            }
+        }
+        world.chunks.insert((0, 0), Arc::new(plain));
+        world.chunks.insert((1, 0), Arc::new(mixed));
+        let reads = |xs: [i32; 2], ys: [i32; 2], zs: [i32; 2]| {
+            let mut all = Vec::new();
+            for x in xs {
+                for y in ys {
+                    for z in zs {
+                        all.push(world.noise_biome(x, y, z));
+                    }
+                }
+            }
+            all
+        };
+        let mut answered = 0;
+        for x in [-8, 0, 4, 12, 16, 20, 28, 36] {
+            for y in [MIN_Y - 8, MIN_Y, 0, 12, MIN_Y + 80, 300] {
+                for z in [0, 4, 12] {
+                    let (xs, ys, zs) = ([x, x + 4], [y, y + 4], [z, z + 4]);
+                    if let Some(biome) = world.uniform_noise_biome(xs, ys, zs) {
+                        answered += 1;
+                        assert!(
+                            reads(xs, ys, zs).iter().all(|&b| b == Some(biome)),
+                            "{xs:?} {ys:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(answered > 0);
+        // The section of two biomes, and the unloaded chunk west of the plain one.
+        assert_eq!(
+            world.uniform_noise_biome([20, 24], [MIN_Y + 80, MIN_Y + 84], [0, 4]),
+            None
+        );
+        assert_eq!(world.uniform_noise_biome([-4, 0], [0, 4], [0, 4]), None);
+        assert_eq!(world.uniform_noise_biome([4, 8], [0, 4], [0, 4]), Some(3));
+    }
 
     #[test]
     fn block_entity_neighbor_far_read_keeps_chunk_unloaded() {

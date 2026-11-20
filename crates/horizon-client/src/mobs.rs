@@ -3194,6 +3194,101 @@ pub trait LiveMobs {
     /// Visit each mob in the disjoint loan, without allocating a snapshot.
     fn for_each(&self, visitor: &mut dyn FnMut(&Mob));
 }
+/// The block tags the mobs ask for on every tick, kept by [`HotTags`].
+const HOT_TAGS: [&str; 5] = [
+    "minecraft:walls",
+    "minecraft:fence_gates",
+    "minecraft:fences",
+    "minecraft:climbable",
+    "minecraft:fire",
+];
+/// [`HOT_TAGS`] looked up once in a world view's `block_tags` ([`Self::of`]): their sets, and every
+/// block any of them holds. Asking one of them for a block in none ([`MobWorld::has_tag`]) costs one
+/// Fx hash where the map asks for two SipHashes. A view borrows the map, so it cannot change while
+/// these are kept.
+#[derive(Clone, Default)]
+pub struct HotTags<'a> {
+    /// The map they were looked up in, by address: a view whose `block_tags` was replaced since (a
+    /// test's) is asked from the map.
+    from: usize,
+    sets: [Option<&'a std::collections::HashSet<String>>; HOT_TAGS.len()],
+    any: Arc<crate::fast_hash::FxHashSet<&'a str>>,
+}
+impl<'a> HotTags<'a> {
+    pub fn of(tags: &'a HashMap<String, std::collections::HashSet<String>>) -> Self {
+        let sets = HOT_TAGS.map(|tag| tags.get(tag));
+        let any = (sets.iter().flatten())
+            .flat_map(|set| set.iter().map(String::as_str))
+            .collect();
+        Self {
+            from: std::ptr::from_ref(tags).addr(),
+            sets,
+            any: Arc::new(any),
+        }
+    }
+    /// Whether `tag` of `tags` holds `block`: from the sets kept here when `tags` is the map they
+    /// were looked up in and `tag` one of [`HOT_TAGS`], else from `tags`.
+    pub fn has(
+        &self,
+        tags: &HashMap<String, std::collections::HashSet<String>>,
+        tag: &str,
+        block: &str,
+    ) -> bool {
+        if self.from == std::ptr::from_ref(tags).addr()
+            && let Some(i) = HOT_TAGS.iter().position(|&hot| hot == tag)
+        {
+            return self.any.contains(block) && self.sets[i].is_some_and(|set| set.contains(block));
+        }
+        tags.get(tag).is_some_and(|set| set.contains(block))
+    }
+}
+#[cfg(test)]
+mod hot_tags_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// The kept sets answer as their map does; another map is asked itself.
+    #[test]
+    fn hot_tags_answer_as_their_map() {
+        let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<HashSet<_>>();
+        let tags: HashMap<String, HashSet<String>> = HashMap::from([
+            (
+                "minecraft:walls".to_owned(),
+                set(&["minecraft:stone_wall", "minecraft:stone"]),
+            ),
+            ("minecraft:fences".to_owned(), set(&["minecraft:oak_fence"])),
+            (
+                "minecraft:climbable".to_owned(),
+                set(&["minecraft:ladder", "minecraft:vine"]),
+            ),
+            ("minecraft:logs".to_owned(), set(&["minecraft:oak_log"])),
+        ]);
+        let hot = HotTags::of(&tags);
+        let blocks = [
+            "minecraft:stone_wall",
+            "minecraft:stone",
+            "minecraft:oak_fence",
+            "minecraft:ladder",
+            "minecraft:oak_log",
+            "minecraft:dirt",
+        ];
+        let asked: Vec<&str> = (HOT_TAGS.iter().copied())
+            .chain(["minecraft:logs", "minecraft:missing"])
+            .collect();
+        for tag in asked {
+            for block in blocks {
+                let expected = tags.get(tag).is_some_and(|s| s.contains(block));
+                assert_eq!(hot.has(&tags, tag, block), expected, "{tag} {block}");
+            }
+        }
+        // Another map, whose walls hold the dirt too, answers for itself.
+        let mut other = tags.clone();
+        (other.get_mut("minecraft:walls").unwrap()).insert("minecraft:dirt".to_owned());
+        assert!(hot.has(&other, "minecraft:walls", "minecraft:dirt"));
+        assert!(!hot.has(&tags, "minecraft:walls", "minecraft:dirt"));
+        assert!(HotTags::default().has(&tags, "minecraft:fences", "minecraft:oak_fence"));
+    }
+}
 #[derive(Clone)]
 pub struct MobWorld<'a> {
     pub mob_maps: &'a crate::neoforge_mob_maps::NeoForgeMobMaps,
@@ -3259,6 +3354,9 @@ pub struct MobWorld<'a> {
     pub thundering: bool,
     pub level: horizon_core::LevelKey,
     pub block_tags: &'a HashMap<String, std::collections::HashSet<String>>,
+    /// The tags of `block_tags` asked on every tick, looked up once ([`HotTags::of`]); the default
+    /// asks `block_tags` itself.
+    pub hot_tags: HotTags<'a>,
     /// Each block's `fallOn` rule (the player's landing registry).
     pub landing: &'a horizon_world::block_landing::BlockLandingRegistry,
     pub biomes: &'a crate::biome::Biomes,

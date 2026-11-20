@@ -311,7 +311,7 @@ impl MobWorld<'_> {
             .map(String::as_str)
     }
     pub fn has_tag(&self, tag: &str, block: &str) -> bool {
-        self.block_tags.get(tag).is_some_and(|s| s.contains(block))
+        self.hot_tags.has(self.block_tags, tag, block)
     }
     /// `findBlocksInBoxByManhattanDistance(at, range_xz, range_y).filterState(..).findFirst()`:
     /// the first block `matches` accepts (given its position and name), going
@@ -1086,6 +1086,7 @@ fn run_test_world(
         thundering: false,
         level: horizon_core::LevelKey::OVERWORLD,
         block_tags: &items.block_tags,
+        hot_tags: Default::default(),
         landing: &motion.landing,
         biomes,
         mob_griefing,

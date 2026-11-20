@@ -622,6 +622,16 @@ impl<H: LevelHost> Level<'_, H> {
         [qx << 2, qy << 2, qz << 2]
     }
     fn zoomed_biome(&self, x: i32, y: i32, z: i32) -> Option<&BiomeInfo> {
+        // `BiomeManager.getBiome` reads one of the eight noise cells around the block
+        // (`BiomeZoom::quart_at_block`): where their sections hold one biome alone, it is that one
+        // whichever the zoom picks, so its hashing is skipped.
+        let cells = |v: i32| {
+            let q = v.wrapping_sub(2) >> 2;
+            [q << 2, q.wrapping_add(1) << 2]
+        };
+        if let Some(biome) = (self.w.world).uniform_noise_biome(cells(x), cells(y), cells(z)) {
+            return Some(self.w.biomes.get(biome));
+        }
         let [x, y, z] = self.zoomed(x, y, z);
         self.biome(x, y, z)
     }
