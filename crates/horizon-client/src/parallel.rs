@@ -372,6 +372,47 @@ fn par_chunks_mut_on<T: Send>(
     });
 }
 
+/// `job(i)` for every `i` in `0..count`, on the pool as [`par_chunks_mut`] shares out its chunks
+/// (all on this thread under `HORIZON_SERIAL_TICK=all` or with one thread), this thread taking
+/// its share: the runner of the render crate's clustered relight (`light::set_relight_runner`).
+/// Each index runs once, on whatever thread takes it.
+pub fn run_indexed(count: usize, job: &(dyn Fn(usize) + Sync)) {
+    let lanes = if horizon_threads::serial_tick_all() {
+        1
+    } else {
+        horizon_threads::worker_count().clamp(1, 8)
+    };
+    run_indexed_on(count, lanes, job);
+}
+
+/// [`run_indexed`] on `lanes` threads.
+fn run_indexed_on(count: usize, lanes: usize, job: &(dyn Fn(usize) + Sync)) {
+    if lanes <= 1 || count < 2 {
+        for i in 0..count {
+            job(i);
+        }
+        return;
+    }
+    // One index at a time to whichever thread is free, this one too: a helper the machine is
+    // slow to run holds the others up by one job at most.
+    let next = AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= count {
+                break;
+            }
+            job(i);
+        }
+    };
+    pool().in_place_scope(|s| {
+        for _ in 1..lanes.min(count) {
+            s.spawn(|_| work());
+        }
+        work();
+    });
+}
+
 /// [`par_map`] on `lanes` threads (a test's count, or a caller that caps them).
 ///
 /// The parts are small (four a thread) and go to whichever thread is free, this one too: a helper
@@ -506,6 +547,21 @@ mod tests {
                 }
             });
             assert_eq!(items, (0..n as u64).map(|x| x * 3 + 1).collect::<Vec<_>>());
+        }
+    }
+
+    /// Every index runs exactly once, on several threads, for counts below and above theirs.
+    #[test]
+    fn every_index_runs_once() {
+        for n in [0usize, 1, 2, 7, 100] {
+            let runs: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+            run_indexed_on(n, 4, &|i| {
+                runs[i].fetch_add(1, Ordering::SeqCst);
+            });
+            assert!(
+                runs.iter().all(|r| r.load(Ordering::SeqCst) == 1),
+                "{n} indexes"
+            );
         }
     }
 
