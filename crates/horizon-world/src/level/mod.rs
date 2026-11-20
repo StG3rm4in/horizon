@@ -1852,6 +1852,11 @@ impl Behaviours {
             || data.is(classes::Class::Button)
             || data.is(classes::Class::TripWire)
     }
+    /// Whether [`Self::entity_on_big_dripleaf`] may do anything at a block of
+    /// `state`: a big dripleaf's. At any other block it only reads the state.
+    pub fn is_big_dripleaf(&self, state: BlockStateId) -> bool {
+        self.data(state).is(classes::Class::BigDripleaf)
+    }
     /// `LilyPadBlock.entityInside` for a boat whose box is inside `pos`.
     pub fn boat_inside<L: LevelAccess + ?Sized>(
         &self,

@@ -13,15 +13,29 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// `HORIZON_PARALLEL_TICK`, whatever the setting says: `0` keeps every tick serial, `1` turns the
 /// server tick's parallel phases on, and `verify` does too, also checking the phases that can be
-/// checked against the serial code. Unset, the setting decides.
+/// checked against the serial code. `exact` shares the phases' work as `1` does, but keeps every
+/// draw on vanilla's streams ([`own_random`]): the tick gives vanilla's result. Unset, the setting
+/// decides.
 fn forced() -> Option<u8> {
     static FORCED: OnceLock<Option<u8>> = OnceLock::new();
     *FORCED.get_or_init(|| match std::env::var("HORIZON_PARALLEL_TICK").as_deref() {
         Ok("0" | "off" | "false") => Some(0),
         Ok("1" | "on" | "true") => Some(1),
         Ok("verify") => Some(2),
+        Ok("exact") => Some(EXACT),
         _ => None,
     })
+}
+
+/// [`parallel_tick`] under `HORIZON_PARALLEL_TICK=exact`: shared, on vanilla's streams.
+const EXACT: u8 = 3;
+
+/// Whether the parallel tick lets the villagers' brains and the mobs' turns draw from streams of
+/// their own ([`villagers_own_random`], [`mobs_own_random`]): with it on, but not under
+/// `HORIZON_PARALLEL_TICK=exact`, which shares only the phases whose result doesn't depend on
+/// the order.
+fn own_random() -> bool {
+    matches!(parallel_tick(), 1 | 2)
 }
 
 /// The Parallel Tick setting, as the window last applied it; Off until it does (a dedicated
@@ -34,7 +48,9 @@ static AUTO_STATE: AtomicU8 = AtomicU8::new(0);
 static AUTO: Mutex<Auto> = Mutex::new(Auto::new());
 
 /// Whether this tick's phases share their work: 0 serial, 1 shared, 2 shared and checked against
-/// the serial code (`HORIZON_PARALLEL_TICK=verify`). Each phase gives the serial result either way.
+/// the serial code (`HORIZON_PARALLEL_TICK=verify`), 3 shared with every draw on vanilla's streams
+/// (`HORIZON_PARALLEL_TICK=exact`). Each phase gives the serial result either way; only the
+/// streams of [`own_random`] differ from vanilla's.
 pub fn parallel_tick() -> u8 {
     forced().unwrap_or_else(|| SHARED.load(Ordering::Relaxed))
 }
@@ -236,7 +252,7 @@ impl Auto {
 /// time, so the villager's entity random keeps vanilla's sequence. The serial loop does the same while the parallel
 /// tick is on, so which path a tick takes never changes the result.
 pub fn villagers_own_random() -> bool {
-    OWN_RANDOM_TEST.load(Ordering::Relaxed) || parallel_tick() > 0
+    OWN_RANDOM_TEST.load(Ordering::Relaxed) || own_random()
 }
 
 /// Whether a mob's turn draws the level-random rolls from a stream of its own instead of the level's.
@@ -251,16 +267,24 @@ pub fn villagers_own_random() -> bool {
 /// mob's own entity random keeps vanilla's sequence, and the serial loop draws the same way while
 /// the parallel tick is on, so which path a tick takes never changes the result.
 pub fn mobs_own_random() -> bool {
-    parallel_tick() > 0
+    own_random()
+}
+
+/// Whether the options that give up vanilla's order or draws may run: the mob islands, the
+/// natural spawning in lanes and the planned random ticks. With the parallel tick on, as for the
+/// streams of [`own_random`]; not under `HORIZON_PARALLEL_TICK=exact`, whose tick is vanilla's.
+pub fn may_depart_from_vanilla() -> bool {
+    own_random()
 }
 
 /// Whether a random tick pass draws each chunk's precipitation chances and block positions from a
 /// stream of the chunk's own ([`chunk_tick_random`]) instead of the level's random and position
-/// stream, planned on the tick's helpers first (`random_tick_plan`): with the parallel tick on. The
-/// same odds for every block, not the values a vanilla level would give; as for the mobs below, no
-/// player can rely on those, the level's streams being shared with every chunk.
+/// stream, planned on the tick's helpers first (`random_tick_plan`): with the parallel tick on, not
+/// under `HORIZON_PARALLEL_TICK=exact` ([`may_depart_from_vanilla`]). The same odds for every
+/// block, not the values a vanilla level would give; as for the mobs below, no player can rely on
+/// those, the level's streams being shared with every chunk.
 pub fn random_ticks_own_random() -> bool {
-    parallel_tick() > 0
+    may_depart_from_vanilla()
 }
 
 /// The stream a chunk's random ticks draw from under [`random_ticks_own_random`]: seeded from the
@@ -433,6 +457,48 @@ fn par_chunks_mut_on<T: Send>(
     });
 }
 
+/// `job(i)` for every `i` in `0..count`, on the pool as [`par_chunks_mut`] shares out its chunks
+/// (all on this thread under `HORIZON_SERIAL_TICK=all` or with one thread), this thread taking
+/// its share: the runner of the render crate's clustered relight (`light::set_relight_runner`).
+/// Each index runs once, on whatever thread takes it.
+pub fn run_indexed(count: usize, job: &(dyn Fn(usize) + Sync)) {
+    let lanes = if horizon_threads::serial_tick_all() {
+        1
+    } else {
+        horizon_threads::worker_count().clamp(1, 8)
+    };
+    run_indexed_on(count, lanes, job);
+}
+
+/// [`run_indexed`] on `lanes` threads.
+fn run_indexed_on(count: usize, lanes: usize, job: &(dyn Fn(usize) + Sync)) {
+    // Inside a helper scope the helpers are held: every index runs here, as `par_map`'s parts do.
+    if lanes <= 1 || count < 2 || in_helper_scope() {
+        for i in 0..count {
+            job(i);
+        }
+        return;
+    }
+    // One index at a time to whichever thread is free, this one too: a helper the machine is
+    // slow to run holds the others up by one job at most.
+    let next = AtomicUsize::new(0);
+    let work = || {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= count {
+                break;
+            }
+            job(i);
+        }
+    };
+    pool().in_place_scope(|s| {
+        for _ in 1..lanes.min(count) {
+            s.spawn(|_| work());
+        }
+        work();
+    });
+}
+
 /// [`par_map`] on `lanes` threads (a test's count, or a caller that caps them).
 ///
 /// The parts are small (four a thread) and go to whichever thread is free, this one too: a helper
@@ -567,6 +633,21 @@ mod tests {
                 }
             });
             assert_eq!(items, (0..n as u64).map(|x| x * 3 + 1).collect::<Vec<_>>());
+        }
+    }
+
+    /// Every index runs exactly once, on several threads, for counts below and above theirs.
+    #[test]
+    fn every_index_runs_once() {
+        for n in [0usize, 1, 2, 7, 100] {
+            let runs: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+            run_indexed_on(n, 4, &|i| {
+                runs[i].fetch_add(1, Ordering::SeqCst);
+            });
+            assert!(
+                runs.iter().all(|r| r.load(Ordering::SeqCst) == 1),
+                "{n} indexes"
+            );
         }
     }
 

@@ -207,6 +207,13 @@ impl Game<'_> {
             .extra
             .extend(waiting.into_iter().map(|chunk| (chunk, 0)));
         self.streaming.upload_backlog = self.pending_uploads.len();
+        // A level the server ticks relights the tick's edits in clusters, shared out on the
+        // tick's helper threads (`light::relight_clusters`); the first call hands them over. A
+        // window's own level relights them in one call: the helpers are the server's.
+        self.streaming.share_relight = self.is_logical_server();
+        if self.streaming.share_relight {
+            horizon_client::light::set_relight_runner(horizon_client::parallel::run_indexed);
+        }
         let plan = horizon_client::spans::time("streaming_plan", || {
             let mut step = self.streaming.begin_plan_update(&mut self.world);
             loop {

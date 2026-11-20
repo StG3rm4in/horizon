@@ -25,7 +25,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 const W: usize = 48;
@@ -1090,9 +1090,11 @@ impl<S: std::hash::BuildHasher> LightWorld for HashMap<(i32, i32), Arc<Chunk>, S
 }
 /// The sections one relight touches, held for the whole flood fill so each
 /// cell access is an array index instead of a chunk lookup. Light a section
-/// gets written is copied out on the first write and stored back by `finish`.
+/// gets written is copied out on the first write and handed back by
+/// `changed_sections` for the world to store. It only reads the world, so the
+/// clusters of [`relight_clusters`] each hold one over the same chunks at once.
 struct Region<'w> {
-    world: &'w mut dyn LightWorld,
+    world: &'w dyn LightWorld,
     layout: ColumnLayout,
     slots: Vec<Slot>,
     /// Section key (cx, s, cz) to slot, `NONE` where the chunk isn't lit.
@@ -1107,7 +1109,7 @@ struct Slot {
 }
 const NONE: u32 = u32::MAX;
 impl<'w> Region<'w> {
-    fn new(world: &'w mut dyn LightWorld) -> Self {
+    fn new(world: &'w dyn LightWorld) -> Self {
         Self {
             layout: world.layout(),
             world,
@@ -1200,23 +1202,40 @@ impl<'w> Region<'w> {
         let i = index(x, y, z);
         light[i] = f(light[i]);
     }
-    /// Store back the light of every section whose values changed.
-    fn finish(self) {
+    /// The columns (chunk x, z) whose sections this relight reached, and those whose light it
+    /// copied out to write, each sorted. A copy counts even when its values ended as they were:
+    /// they were something else in between. Chunks not loaded or not lit hold no slot: no
+    /// relight reads or writes light there.
+    fn columns(&self) -> (Vec<(i32, i32)>, Vec<(i32, i32)>) {
+        let column = |slot: &Slot| (slot.key.0, slot.key.2);
+        let mut reached: Vec<_> = self.slots.iter().map(column).collect();
+        let mut written: Vec<_> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.light.is_some())
+            .map(column)
+            .collect();
+        for list in [&mut reached, &mut written] {
+            list.sort_unstable();
+            list.dedup();
+        }
+        (reached, written)
+    }
+    /// The light of every section whose values changed, packed, for the world to store. The
+    /// region's clones of the world's sections are gone by then, so storing it copies none.
+    fn changed_sections(self) -> Vec<(Pos, Light)> {
+        let mut changed = Vec::new();
         for slot in self.slots {
             let Some(light) = slot.light else {
                 continue;
             };
             let mut before = [0; 4096];
             slot.section.light.write_to(&mut before);
-            if before == *light {
-                continue;
+            if before != *light {
+                changed.push((slot.key, Light::packed(light)));
             }
-            // Drop the clone first so the world's section isn't copied.
-            drop(slot.section);
-            let (cx, s, cz) = slot.key;
-            self.world
-                .set_section_light(cx, s as usize, cz, Light::packed(light));
         }
+        changed
     }
 }
 type Pos = (i32, i32, i32);
@@ -1248,6 +1267,13 @@ impl LightChanges {
     /// Cells of section `key` (x, section index, z) in the given classes.
     pub fn add(&mut self, key: Pos, classes: u32) {
         *self.sections.entry(key).or_default() |= classes;
+    }
+    /// The cells `other` holds too (changes keyed to the same layout).
+    pub fn absorb(&mut self, other: &LightChanges) {
+        debug_assert!(other.sections.is_empty() || self.layout == other.layout);
+        for (&key, &classes) in &other.sections {
+            self.add(key, classes);
+        }
     }
     /// The class of a cell in its section: per axis 0 on the low face, 1
     /// inside, 2 on the high face.
@@ -1393,9 +1419,9 @@ pub fn relight(
     if positions.is_empty() {
         return;
     }
-    RELIGHT_SCRATCH.with_borrow_mut(|scratch| {
+    let sections = RELIGHT_SCRATCH.with_borrow_mut(|scratch| {
         scratch.clear();
-        let mut region = Region::new(world);
+        let mut region = Region::new(&*world);
         relight_region(
             &mut region,
             tables,
@@ -1405,9 +1431,419 @@ pub fn relight(
             scratch,
             changed,
         );
-        region.finish();
         scratch.clear();
+        region.changed_sections()
     });
+    for ((cx, s, cz), light) in sections {
+        world.set_section_light(cx, s as usize, cz, light);
+    }
+}
+
+/// What shares out the clusters of [`relight_clusters`]: runs `job(i)` once for every `i` in
+/// `0..count`, on whatever threads it has, and returns once all have run.
+pub type Runner = fn(usize, &(dyn Fn(usize) + Sync));
+
+static RUNNER: OnceLock<Runner> = OnceLock::new();
+
+/// Shares the clusters of [`relight_clusters`] out on `run` from now on: the game hands it its
+/// tick helper threads, instead of threads started for each relight. The first one set stays.
+pub fn set_relight_runner(run: Runner) {
+    let _ = RUNNER.set(run);
+}
+
+/// The runner until the game sets one: every cluster on this thread, one after the other.
+fn serial_runner(count: usize, job: &(dyn Fn(usize) + Sync)) {
+    for i in 0..count {
+        job(i);
+    }
+}
+
+/// Fewer edits than this are relit in one call: handing clusters to other threads takes longer
+/// than relighting them.
+const MIN_SPLIT_EDITS: usize = 32;
+
+/// Edits whose chunks are at most this many chunks apart on both axes share a cluster, so two
+/// clusters are at least `CLUSTER_GAP + 1` apart. On light as light jobs leave it (the fixed
+/// point, which relighting keeps), relighting an edit writes light at most 15 blocks from it and
+/// reads it at most 16 away, so within the chunks next to the edit's own: clusters 3 chunks
+/// apart never reach a common chunk. Light that isn't the fixed point can carry a relight up to
+/// 29 blocks away, into the chunks two away; `independent` catches that.
+const CLUSTER_GAP: i32 = 2;
+
+/// How [`relight_clusters`] relit a batch of edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clustered {
+    /// The clusters the edits fell into; fewer than 2 means one [`relight`] call.
+    pub clusters: usize,
+    /// The edits of the largest cluster.
+    pub largest: usize,
+    /// One cluster wrote light in a column another one reached, so their relights may have
+    /// depended on each other: every edit was relit again in one call.
+    pub fallback: bool,
+    /// `HORIZON_RELIGHT_CLUSTERS=verify` found the clusters' light differing from one relight's
+    /// (which then went in instead): a bug.
+    pub mismatch: bool,
+}
+
+/// [`relight`] of a tick's edits (`force` off) split into clusters of edits far apart, relit at
+/// the same time on the runner the game set ([`set_relight_runner`]) and stored in the order of
+/// their first edits. The light stored and the changes reported are those of one [`relight`] of
+/// every edit, cell for cell:
+///
+/// - a cluster's relight reads and writes light only through its own `Region`, over the same
+///   world, with its edits in their order. In one relight of every edit, the steps coming from a
+///   cluster's edits (seeding them, then each entry its queues take, first in first out) run in
+///   the order they run in the cluster's own relight, other clusters' steps in between;
+/// - when no cluster wrote light in a column another one reached (`independent`, checked on
+///   what their regions held), each of those steps reads the same values in both, by induction
+///   over the steps, so it writes and queues the same. Blocks and `dynamic_light` answers don't
+///   change while edits are relit, and a column's lowest sky source depends on its blocks alone;
+/// - every cell then ends as the one cluster that wrote it left it, and the changes reported
+///   are the union of what each cluster pushed.
+///
+/// When the check fails, the edits are relit in one call, as they were before clusters, and so
+/// are those of a single cluster. `HORIZON_RELIGHT_CLUSTERS=0` keeps every relight in one call;
+/// `stats` logs how the relights split, every 1200 of them; `verify` also relights the edits in
+/// one call and logs any difference, keeping that call's light.
+pub fn relight_clusters<W: LightWorld + Sync>(
+    world: &mut W,
+    tables: &LightTables,
+    sky_light: bool,
+    positions: &[Pos],
+    changed: &mut LightChanges,
+) -> Clustered {
+    let mode = cluster_mode();
+    if mode == ClusterMode::Off || positions.len() < MIN_SPLIT_EDITS {
+        relight(world, tables, sky_light, positions, false, changed);
+        return Clustered {
+            clusters: 1,
+            largest: positions.len(),
+            fallback: false,
+            mismatch: false,
+        };
+    }
+    let run = RUNNER.get().copied().unwrap_or(serial_runner);
+    let started = std::time::Instant::now();
+    let outcome = relight_split(
+        world,
+        tables,
+        sky_light,
+        positions,
+        changed,
+        CLUSTER_GAP,
+        run,
+        mode == ClusterMode::Verify,
+    );
+    if mode != ClusterMode::Split {
+        ClusterStats::note(outcome, positions.len(), started.elapsed());
+    }
+    outcome
+}
+
+/// `HORIZON_RELIGHT_CLUSTERS`, read once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClusterMode {
+    /// `0`, `off`, `false` or `no`: every relight in one call, the reference to time clusters
+    /// against.
+    Off,
+    /// Unset, `1`, `on` or `true` (and, with a warning, anything else): clusters.
+    Split,
+    /// `stats`: clusters, and a log line of how they split every 1200 relights.
+    Stats,
+    /// `verify`: `stats`, and every split relight checked against one relight of its edits.
+    Verify,
+}
+fn cluster_mode() -> ClusterMode {
+    static MODE: OnceLock<ClusterMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let value = std::env::var("HORIZON_RELIGHT_CLUSTERS").unwrap_or_default();
+        match value.to_ascii_lowercase().as_str() {
+            "0" | "off" | "false" | "no" => ClusterMode::Off,
+            "" | "1" | "on" | "true" => ClusterMode::Split,
+            "stats" => ClusterMode::Stats,
+            "verify" => ClusterMode::Verify,
+            _ => {
+                log::warn!(
+                    "Horizon: HORIZON_RELIGHT_CLUSTERS={value} is none of 0, 1, stats or verify: \
+                     relighting in clusters"
+                );
+                ClusterMode::Split
+            }
+        }
+    })
+}
+
+/// What `HORIZON_RELIGHT_CLUSTERS=stats` counts between two log lines.
+struct ClusterStats {
+    relights: u64,
+    edits: u64,
+    /// Relights split into clusters, their edits and clusters, and the edits of each one's
+    /// largest cluster (what the other threads end up waiting for, roughly).
+    split: u64,
+    split_edits: u64,
+    clusters: u64,
+    largest: u64,
+    /// The most clusters one relight had.
+    most: u64,
+    fallbacks: u64,
+    mismatches: u64,
+    /// Time in the relights, in microseconds.
+    micros: u64,
+}
+static CLUSTER_STATS: std::sync::Mutex<ClusterStats> = std::sync::Mutex::new(ClusterStats::ZERO);
+impl ClusterStats {
+    const ZERO: Self = Self {
+        relights: 0,
+        edits: 0,
+        split: 0,
+        split_edits: 0,
+        clusters: 0,
+        largest: 0,
+        most: 0,
+        fallbacks: 0,
+        mismatches: 0,
+        micros: 0,
+    };
+    /// Counts one relight of `edits` edits, and logs the counts every 1200 relights (a minute
+    /// of ticks).
+    fn note(outcome: Clustered, edits: usize, took: std::time::Duration) {
+        let mut stats = CLUSTER_STATS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.relights += 1;
+        stats.edits += edits as u64;
+        if outcome.clusters > 1 {
+            stats.split += 1;
+            stats.split_edits += edits as u64;
+            stats.clusters += outcome.clusters as u64;
+            stats.largest += outcome.largest as u64;
+            stats.most = stats.most.max(outcome.clusters as u64);
+        }
+        stats.fallbacks += u64::from(outcome.fallback);
+        stats.mismatches += u64::from(outcome.mismatch);
+        stats.micros += took.as_micros() as u64;
+        if stats.relights < 1200 {
+            return;
+        }
+        let n = stats.relights as f64;
+        log::info!(
+            "Horizon: {} relights, {:.1} edits and {:.0} us each; {:.0}% split, into {:.1} \
+             clusters ({} at most), the largest with {:.0}% of the edits; {} relit again in one \
+             call, {} differing",
+            stats.relights,
+            stats.edits as f64 / n,
+            stats.micros as f64 / n,
+            100.0 * stats.split as f64 / n,
+            stats.clusters as f64 / stats.split.max(1) as f64,
+            stats.most,
+            100.0 * stats.largest as f64 / stats.split_edits.max(1) as f64,
+            stats.fallbacks,
+            stats.mismatches,
+        );
+        *stats = Self::ZERO;
+    }
+}
+
+/// One cluster's relight, for [`relight_split`] to check and store.
+struct ClusterLight {
+    /// The sections (x, section index, z) whose light it changed, with their light.
+    sections: Vec<(Pos, Light)>,
+    changed: LightChanges,
+    /// The columns whose sections it reached, and those it wrote light in ([`Region::columns`]).
+    reached: Vec<(i32, i32)>,
+    written: Vec<(i32, i32)>,
+}
+
+/// [`relight_clusters`] with its gap, its runner and whether it checks itself: the tests choose.
+fn relight_split<W: LightWorld + Sync>(
+    world: &mut W,
+    tables: &LightTables,
+    sky_light: bool,
+    positions: &[Pos],
+    changed: &mut LightChanges,
+    gap: i32,
+    run: Runner,
+    verify: bool,
+) -> Clustered {
+    let clusters = clusters(positions, gap);
+    let mut outcome = Clustered {
+        clusters: clusters.len(),
+        largest: clusters.iter().map(Vec::len).max().unwrap_or(0),
+        fallback: false,
+        mismatch: false,
+    };
+    if clusters.len() < 2 {
+        relight(world, tables, sky_light, positions, false, changed);
+        return outcome;
+    }
+    // Every cluster relit over the same world, the largest first so that the last one a thread
+    // takes is a small one; which thread relights a cluster changes nothing in what it gives.
+    let mut order: Vec<usize> = (0..clusters.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(clusters[i].len()));
+    let slots: Vec<OnceLock<ClusterLight>> = clusters.iter().map(|_| OnceLock::new()).collect();
+    let view: &W = world;
+    run(order.len(), &|k| {
+        let i = order[k];
+        let _ = slots[i].set(relight_cluster(view, tables, sky_light, &clusters[i]));
+    });
+    let lights: Vec<ClusterLight> = slots
+        .into_iter()
+        .map(|slot| slot.into_inner().expect("every cluster is relit"))
+        .collect();
+    if !independent(&lights) {
+        // Their relights may have depended on each other: relit together, as before clusters.
+        outcome.fallback = true;
+        relight(world, tables, sky_light, positions, false, changed);
+        return outcome;
+    }
+    let mut sections = Vec::new();
+    let mut found = LightChanges::default();
+    found.keyed(world.layout());
+    // In the order of the clusters' first edits, though no two of them wrote in one column.
+    for light in lights {
+        sections.extend(light.sections);
+        found.absorb(&light.changed);
+    }
+    if verify {
+        let one = relight_cluster(&*world, tables, sky_light, positions);
+        if !same_light(&sections, &one.sections) || found != one.changed {
+            log::error!(
+                "Horizon: the light of {} clusters differs from one relight of their {} edits",
+                outcome.clusters,
+                positions.len()
+            );
+            outcome.mismatch = true;
+            (sections, found) = (one.sections, one.changed);
+        }
+    }
+    for ((cx, s, cz), light) in sections {
+        world.set_section_light(cx, s as usize, cz, light);
+    }
+    changed.keyed(world.layout());
+    changed.absorb(&found);
+    outcome
+}
+
+/// One cluster's relight over a world it only reads.
+fn relight_cluster(
+    world: &dyn LightWorld,
+    tables: &LightTables,
+    sky_light: bool,
+    positions: &[Pos],
+) -> ClusterLight {
+    let mut changed = LightChanges::default();
+    changed.keyed(world.layout());
+    RELIGHT_SCRATCH.with_borrow_mut(|scratch| {
+        scratch.clear();
+        let mut region = Region::new(world);
+        relight_region(
+            &mut region,
+            tables,
+            sky_light,
+            positions,
+            false,
+            scratch,
+            &mut changed,
+        );
+        scratch.clear();
+        let (reached, written) = region.columns();
+        ClusterLight {
+            sections: region.changed_sections(),
+            changed,
+            reached,
+            written,
+        }
+    })
+}
+
+/// `positions` in clusters: edits whose chunks are at most `gap` chunks apart on both axes share
+/// one, and so, link by link, do the edits near those. Clusters come in the order of their first
+/// edit, each with its edits in their order.
+fn clusters(positions: &[Pos], gap: i32) -> Vec<Vec<Pos>> {
+    // The chunks holding edits, in the order of their first edit, and each edit's chunk.
+    let mut chunks: FxHashMap<(i32, i32), usize> = FxHashMap::default();
+    let mut keys: Vec<(i32, i32)> = Vec::new();
+    let mut nodes = Vec::with_capacity(positions.len());
+    for &(x, _, z) in positions {
+        let key = (x >> 4, z >> 4);
+        let node = *chunks.entry(key).or_insert(keys.len());
+        if node == keys.len() {
+            keys.push(key);
+        }
+        nodes.push(node);
+    }
+    // Union-find over those chunks, each pair within `gap` of each other looked at once.
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut parent: Vec<usize> = (0..keys.len()).collect();
+    for (i, &(cx, cz)) in keys.iter().enumerate() {
+        for dz in 0..=gap {
+            for dx in -gap..=gap {
+                if dz == 0 && dx <= 0 {
+                    continue;
+                }
+                if let Some(&j) = chunks.get(&(cx + dx, cz + dz)) {
+                    let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                    parent[a.max(b)] = a.min(b);
+                }
+            }
+        }
+    }
+    let mut label = vec![usize::MAX; keys.len()];
+    let mut out: Vec<Vec<Pos>> = Vec::new();
+    for (&p, &node) in positions.iter().zip(&nodes) {
+        let r = root(&mut parent, node);
+        if label[r] == usize::MAX {
+            label[r] = out.len();
+            out.push(Vec::new());
+        }
+        out[label[r]].push(p);
+    }
+    out
+}
+
+/// Whether no cluster wrote light in a column another one reached: what makes their relights
+/// those of one relight of all their edits ([`relight_clusters`]). Columns are coarser than the
+/// cells read and written, so it may turn down clusters that were independent, never let
+/// through ones that were not.
+fn independent(lights: &[ClusterLight]) -> bool {
+    let mut writer: FxHashMap<(i32, i32), usize> = FxHashMap::default();
+    for (i, light) in lights.iter().enumerate() {
+        for &column in &light.written {
+            if writer.insert(column, i).is_some() {
+                return false;
+            }
+        }
+    }
+    for (i, light) in lights.iter().enumerate() {
+        for column in &light.reached {
+            if writer.get(column).is_some_and(|&w| w != i) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether two lists of changed sections hold the same sections with the same light.
+fn same_light(a: &[(Pos, Light)], b: &[(Pos, Light)]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut b: FxHashMap<Pos, &Light> = b.iter().map(|(key, light)| (*key, light)).collect();
+    let (mut x, mut y) = ([0; 4096], [0; 4096]);
+    a.iter().all(|(key, light)| {
+        b.remove(key).is_some_and(|other| {
+            light.write_to(&mut x);
+            other.write_to(&mut y);
+            x == y
+        })
+    })
 }
 /// The columns `changed` touched that border a loaded column not lit yet
 /// (`unlit`). `relight` reads and writes only lit columns, so an edit's
@@ -2551,6 +2987,224 @@ pub(crate) mod tests {
             "fixture heap payload {payload} bytes; old worker clones it plus 24 section Arcs; old application clones current payload and 98304 returned light bytes. New worker clones zero section payload; new application clones current payload only when shared."
         );
     }
+    /// Chunks x -8 to 8 and z -1 to 1, 64 blocks high (y -32 to 31) with stone below y 0, each
+    /// lit from its 3x3 as a light job lights it: room for clusters of edits far apart. Built
+    /// once, handed out as copies.
+    fn wide_world() -> HashMap<(i32, i32), Arc<Chunk>> {
+        static WORLD: OnceLock<HashMap<(i32, i32), Arc<Chunk>>> = OnceLock::new();
+        WORLD.get_or_init(build_wide_world).clone()
+    }
+    fn build_wide_world() -> HashMap<(i32, i32), Arc<Chunk>> {
+        let layout = ColumnLayout::new(-32, 64).unwrap();
+        let tables = tables();
+        let mut chunks = HashMap::new();
+        for z in -1..=1 {
+            for x in -8..=8 {
+                let mut c = Chunk::with_layout(x, z, layout);
+                for y in layout.min_y()..0 {
+                    for i in 0..256 {
+                        c.set(i & 15, y, i >> 4, STONE);
+                    }
+                }
+                chunks.insert((x, z), c);
+            }
+        }
+        let lit = |&(x, z): &(i32, i32)| {
+            let region: [[Option<&Chunk>; 3]; 3] = std::array::from_fn(|dz| {
+                std::array::from_fn(|dx| chunks.get(&(x + dx as i32 - 1, z + dz as i32 - 1)))
+            });
+            let mut c = chunks[&(x, z)].clone();
+            apply_lighting(&mut c, light_chunk(&region, &tables, true));
+            c.lit = true;
+            ((x, z), Arc::new(c))
+        };
+        chunks.keys().map(lit).collect()
+    }
+    /// Sets the block at `p`, in whichever chunk holds it.
+    fn put(w: &mut HashMap<(i32, i32), Arc<Chunk>>, (x, y, z): Pos, state: u32) {
+        Arc::make_mut(w.get_mut(&(x >> 4, z >> 4)).unwrap()).set(x & 15, y, z & 15, state);
+    }
+    /// A runner giving every job a thread of its own, so that clusters really run at once.
+    fn on_threads(count: usize, job: &(dyn Fn(usize) + Sync)) {
+        std::thread::scope(|s| {
+            for i in 0..count {
+                s.spawn(move || job(i));
+            }
+        });
+    }
+    /// Every cell of `a` and `b` holds the same light.
+    fn assert_same_light(
+        a: &HashMap<(i32, i32), Arc<Chunk>>,
+        b: &HashMap<(i32, i32), Arc<Chunk>>,
+        what: &str,
+    ) {
+        for (key, chunk) in a {
+            for (si, (x, y)) in chunk.sections.iter().zip(&b[key].sections).enumerate() {
+                if Arc::ptr_eq(x, y) {
+                    continue;
+                }
+                assert!(
+                    (0..4096).all(|i| x.light(i) == y.light(i)),
+                    "{what}: chunk {key:?} section {si}"
+                );
+            }
+        }
+    }
+
+    /// Edits cluster by chunk: those within the gap of each other on both axes, link by link,
+    /// the clusters in the order of their first edit and the edits in theirs.
+    #[test]
+    fn edits_cluster_by_chunk() {
+        let p = |cx: i32, cz: i32| (cx * 16 + 5, 0, cz * 16 + 9);
+        let positions = [p(5, 0), p(0, 0), p(20, 20), p(2, -2), p(7, 1), p(0, 0)];
+        assert_eq!(
+            clusters(&positions, 2),
+            vec![
+                vec![p(5, 0), p(7, 1)],
+                vec![p(0, 0), p(2, -2), p(0, 0)],
+                vec![p(20, 20)],
+            ]
+        );
+        assert_eq!(
+            clusters(&positions, 3),
+            vec![
+                vec![p(5, 0), p(0, 0), p(2, -2), p(7, 1), p(0, 0)],
+                vec![p(20, 20)],
+            ]
+        );
+        assert_eq!(clusters(&positions, 0).len(), 5);
+        // Blocks below 0 are in the chunks below 0: -1 and 2 are 3 apart, -1 and 1 are 2.
+        assert_eq!(clusters(&[(-1, 0, 0), (32, 0, 0)], 2).len(), 2);
+        assert_eq!(clusters(&[(-1, 0, 0), (31, 0, 0)], 2).len(), 1);
+    }
+
+    /// Edits in three zones five chunks apart, each zone's cluster relit on a thread of its own,
+    /// give every cell and every change reported exactly as one relight of all of them. With a
+    /// gap of 0 the edits of neighbouring chunks are clusters too: when one writes where
+    /// another reads, the check must see it and relight them in one call, and when it lets them
+    /// through, the light must still be one relight's.
+    #[test]
+    fn clustered_relights_match_one_relight() {
+        let tables = tables();
+        let mut rng = 0x6d2b_79f5_u32;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng as usize % n
+        };
+        for gap in [CLUSTER_GAP, 0] {
+            let mut w = wide_world();
+            let (mut split, mut fallbacks) = (0, 0);
+            for round in 0..40 {
+                let mut positions = Vec::new();
+                for _ in 0..1 + next(3) {
+                    let zone = [-5, 0, 5][next(3)] * 16;
+                    for _ in 0..1 + next(4) {
+                        let x = zone + [-1, 0, 1, 7, 14, 15, 16][next(7)];
+                        let y = [-12, -3, -1, 0, 1, 2, 9, 30][next(8)];
+                        let z = [0, 1, 8, 14, 15][next(5)];
+                        put(&mut w, (x, y, z), [TORCH, SLAB, AIR, STONE][next(4)]);
+                        positions.push((x, y, z));
+                    }
+                }
+                let mut one = w.clone();
+                let mut expected = LightChanges::default();
+                relight(&mut one, &tables, true, &positions, false, &mut expected);
+                let mut changed = LightChanges::default();
+                let outcome = relight_split(
+                    &mut w,
+                    &tables,
+                    true,
+                    &positions,
+                    &mut changed,
+                    gap,
+                    on_threads,
+                    false,
+                );
+                let what = format!("gap {gap}, round {round}, {outcome:?}");
+                assert_eq!(changed, expected, "{what}");
+                assert_same_light(&one, &w, &what);
+                split += usize::from(outcome.clusters > 1 && !outcome.fallback);
+                fallbacks += usize::from(outcome.fallback);
+            }
+            assert!(split > 0, "gap {gap}: no relight was split");
+            if gap == CLUSTER_GAP {
+                assert_eq!(
+                    fallbacks, 0,
+                    "relights of the fixed point reached past the chunks next to their edits"
+                );
+            } else {
+                assert!(fallbacks > 0, "gap 0: no clusters met");
+            }
+        }
+    }
+
+    /// Two clusters as close as clusters get, `CLUSTER_GAP + 1` chunks apart, with their edits
+    /// on the borders facing each other so that both reach into the chunks between them: relit
+    /// at once (and checked against one relight), they give one relight's light. With a gap of
+    /// 0, torches in neighbouring chunks are two clusters that meet: the check sees it.
+    #[test]
+    fn clusters_at_the_gap_match_one_relight() {
+        let tables = tables();
+        let base = wide_world();
+        let relit = |gap: i32, edits: &[(Pos, u32)]| {
+            let mut w = base.clone();
+            for &(p, state) in edits {
+                put(&mut w, p, state);
+            }
+            let positions: Vec<Pos> = edits.iter().map(|&(p, _)| p).collect();
+            let mut one = w.clone();
+            let mut expected = LightChanges::default();
+            relight(&mut one, &tables, true, &positions, false, &mut expected);
+            let mut changed = LightChanges::default();
+            let outcome = relight_split(
+                &mut w,
+                &tables,
+                true,
+                &positions,
+                &mut changed,
+                gap,
+                on_threads,
+                true,
+            );
+            assert_eq!(changed, expected, "gap {gap}");
+            assert_same_light(&one, &w, &format!("gap {gap}"));
+            (outcome, changed)
+        };
+        // A torch on the high x border of chunk 0 and one on the low border of chunk 3, a hole
+        // under each and a block shading the sky beside each.
+        let far = (CLUSTER_GAP + 1) * 16;
+        let (outcome, changed) = relit(
+            CLUSTER_GAP,
+            &[
+                ((15, 0, 8), TORCH),
+                ((15, -1, 8), AIR),
+                ((14, 1, 8), STONE),
+                ((far, 0, 9), TORCH),
+                ((far, -1, 8), AIR),
+                ((far + 1, 9, 8), STONE),
+            ],
+        );
+        let expected = Clustered {
+            clusters: 2,
+            largest: 3,
+            fallback: false,
+            mismatch: false,
+        };
+        assert_eq!(outcome, expected);
+        // Each relight wrote into the chunk next to its own, on the side of the other.
+        let columns: Vec<i32> = changed.sections().map(|(x, _, _)| x).collect();
+        assert!(
+            columns.contains(&1) && columns.contains(&(far / 16 - 1)),
+            "{columns:?}"
+        );
+        // Torches on either side of the border of chunks 0 and 1, as clusters of their own: the
+        // first lights cells of the second's chunk.
+        let (outcome, _) = relit(0, &[((15, 0, 8), TORCH), ((16, 0, 9), TORCH)]);
+        assert!(outcome.clusters == 2 && outcome.fallback, "{outcome:?}");
+    }
+
     /// Relight cost for torches placed and removed near chunk borders with
     /// slabs flickering around them (fluids next to lava, in the game).
     /// `cargo test --profile fast -p horizon-client relight_bench -- --ignored --nocapture`

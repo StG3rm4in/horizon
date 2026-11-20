@@ -109,7 +109,9 @@ fn capped_lanes(requested: usize, hardware: Option<usize>) -> usize {
     requested.clamp(1, 8).min(hardware.unwrap_or(1).max(1))
 }
 
-/// Whether the loop may run in groups at all: more than one lane (the parallel tick is on).
+/// Whether the loop may run in groups at all: more than one lane (the parallel tick is on, not
+/// under `HORIZON_PARALLEL_TICK=exact`: `verify` checks the groups against the serial loop with
+/// the mobs' own streams only).
 pub(super) fn may_group() -> bool {
     lanes() > 1
 }
@@ -120,6 +122,9 @@ fn lanes() -> usize {
     #[cfg(test)]
     if let Some(lanes) = LANES.with(Cell::get) {
         return on_helpers(capped_lanes(lanes, hardware()));
+    }
+    if !horizon_client::parallel::may_depart_from_vanilla() {
+        return 1;
     }
     on_helpers(capped_lanes(horizon_client::parallel::lanes(), hardware()))
 }

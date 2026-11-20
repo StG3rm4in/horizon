@@ -680,6 +680,10 @@ pub struct Streaming {
     /// Finished meshes the renderer has not taken yet (the game's pending
     /// uploads): they count against the meshing room as the jobs do.
     pub upload_backlog: usize,
+    /// Whether the tick's edits are relit in clusters on the tick's helper threads
+    /// (`light::relight_clusters`): the game turns it on for a level the server ticks, so that a
+    /// window's own level never takes the helpers from the server's.
+    pub share_relight: bool,
     /// Dimension flags: sky light, Nether face shading.
     pub sky_light: bool,
     pub nether_shading: bool,
@@ -1447,6 +1451,7 @@ impl Streaming {
             mod_tickets: ModTickets::default(),
             paused: false,
             upload_backlog: 0,
+            share_relight: false,
             sky_light: true,
             nether_shading: false,
             shader_pack_lighting: false,
@@ -2037,6 +2042,7 @@ impl Streaming {
             self.scan_age = self.scan_age.saturating_add(1);
         }
         self.requeue();
+        hz_laps.lap("st_requeue");
         self.relight_edits(world);
         hz_laps.lap("st_relight_edits");
         let deferred = std::mem::take(&mut self.deferred).into_iter();
@@ -2622,14 +2628,26 @@ impl Streaming {
             return;
         }
         let mut changed = LightChanges::default();
-        crate::light::relight(
-            &mut world.chunks,
-            &self.light_tables,
-            self.sky_light,
-            &positions,
-            false,
-            &mut changed,
-        );
+        // On a level the server ticks, edits far apart are relit at the same time, into the
+        // light one relight of them all gives (`light::relight_clusters`).
+        if self.share_relight {
+            crate::light::relight_clusters(
+                &mut world.chunks,
+                &self.light_tables,
+                self.sky_light,
+                &positions,
+                &mut changed,
+            );
+        } else {
+            crate::light::relight(
+                &mut world.chunks,
+                &self.light_tables,
+                self.sky_light,
+                &positions,
+                false,
+                &mut changed,
+            );
+        }
         Self::mark_light_changes(world, &changed);
         Self::relight_beside_unlit(world, &changed);
         if !self.light_snapshots.is_empty() {
@@ -2702,7 +2720,11 @@ impl Streaming {
     /// chunk unsaved): an edit's light reaches up to 15 blocks into columns
     /// the edit itself did not mark, which may already have been saved.
     fn mark_light_changes(world: &mut World, changed: &LightChanges) {
-        for (x, sy, z) in changed.sections() {
+        // In the sections' own order: the columns queued for saving first (`ModifiedChunks`)
+        // don't depend on the order a relight met them in (one call, or clusters at once).
+        let mut sections: Vec<_> = changed.sections().collect();
+        sections.sort_unstable();
+        for (x, sy, z) in sections {
             world.modified.insert((x, z));
             if let Some(log) = &mut world.light_log {
                 log.entry((x, z)).or_default().insert(sy as usize);

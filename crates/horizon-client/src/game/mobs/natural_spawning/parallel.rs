@@ -22,7 +22,8 @@ thread_local! {
     pub(super) static LANES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/// The lanes the pass runs in, or none for the serial pass: the parallel tick is on with two
+/// The lanes the pass runs in, or none for the serial pass: the parallel tick is on (not under
+/// `HORIZON_PARALLEL_TICK=exact`: the lanes count against the caps as the pass found them) with two
 /// lanes or more, the chunks are many, nothing keeps the draws on one thread (a replayed seed
 /// sequence) and no mod hears the spawns (its hooks run on the server thread).
 pub(super) fn lanes_for<H: LevelHost>(
@@ -36,7 +37,7 @@ pub(super) fn lanes_for<H: LevelHost>(
     let tested = None;
     let lanes = match tested {
         Some(lanes) => lanes,
-        None if horizon_client::parallel::parallel_tick() > 0 && chunks >= MIN_CHUNKS => {
+        None if horizon_client::parallel::may_depart_from_vanilla() && chunks >= MIN_CHUNKS => {
             horizon_client::parallel::lanes()
         }
         None => return None,
