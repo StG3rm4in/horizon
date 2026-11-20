@@ -2046,6 +2046,23 @@ impl Behaviours {
             from = min_y + 16;
         }
     }
+    /// One tick a random tick pass planned ahead ([`PlannedTick`]), run as
+    /// [`Self::tick_chunk_random_masked`] runs it: a precipitation draw that hit, or a drawn block.
+    pub fn run_planned_random_tick<L: LevelAccess + ?Sized>(
+        &self,
+        level: &mut L,
+        ticks: &mut Ticks,
+        planned: PlannedTick,
+    ) {
+        match planned {
+            PlannedTick::Precipitation(pos) => {
+                if let Some(info) = level.precipitation(pos) {
+                    self.sim(level, ticks).precipitation_tick(info);
+                }
+            }
+            PlannedTick::Block(pos) => self.sim(level, ticks).random_tick_at(pos),
+        }
+    }
     /// Whether a random tick at a block of `state` can do anything: what
     /// [`Self::tick_chunk_random_masked`]'s masks hold. `random_tick_at`
     /// ticks a randomly ticking block, then lava's fluid.
@@ -2104,6 +2121,16 @@ impl Behaviours {
     ) {
         self.sim(level, ticks).fluid_tick(pos);
     }
+}
+
+/// What a random tick pass planned ahead of running it (the parallel tick's, whose chunks draw from
+/// streams of their own), run in order by [`Behaviours::run_planned_random_tick`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlannedTick {
+    /// A precipitation draw that hit, at the column of the position.
+    Precipitation(BlockPos),
+    /// A drawn block whose state can random-tick.
+    Block(BlockPos),
 }
 
 /// How [`Behaviours::tick_chunk_random_masked`] should update the current

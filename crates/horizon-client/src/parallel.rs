@@ -254,6 +254,27 @@ pub fn mobs_own_random() -> bool {
     parallel_tick() > 0
 }
 
+/// Whether a random tick pass draws each chunk's precipitation chances and block positions from a
+/// stream of the chunk's own ([`chunk_tick_random`]) instead of the level's random and position
+/// stream, planned on the tick's helpers first (`random_tick_plan`): with the parallel tick on. The
+/// same odds for every block, not the values a vanilla level would give; as for the mobs below, no
+/// player can rely on those, the level's streams being shared with every chunk.
+pub fn random_ticks_own_random() -> bool {
+    parallel_tick() > 0
+}
+
+/// The stream a chunk's random ticks draw from under [`random_ticks_own_random`]: seeded from the
+/// chunk and the game time (a splitmix64 mix), not from a draw.
+pub fn chunk_tick_random(x: i32, z: i32, game_time: i64) -> horizon_core::random::LegacyRandom {
+    let mut v = (u64::from(x as u32) << 32 | u64::from(z as u32))
+        ^ (game_time as u64).rotate_left(29)
+        ^ 0x7261_6e64_5f74_6963;
+    v = v.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    v = (v ^ (v >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    v = (v ^ (v >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    horizon_core::random::LegacyRandom::new((v ^ (v >> 31)) as i64)
+}
+
 /// The stream a mob's turn draws its level-random rolls from under [`mobs_own_random`]: seeded
 /// from the mob's id and the game time (a splitmix64 mix), not from a draw.
 pub fn mob_turn_random(id: u32, game_time: i64) -> horizon_core::random::LegacyRandom {

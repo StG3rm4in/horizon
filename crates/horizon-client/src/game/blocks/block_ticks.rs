@@ -293,7 +293,10 @@ impl Game<'_> {
         self.with_level(|b, level, ticks| {
             // The masks the random ticks will read, built on helper threads first while the
             // parallel tick is on (`HORIZON_PARALLEL_TICK`): the draws and ticks don't depend on them.
-            if !debug && horizon_client::parallel::lanes() > 1 {
+            // With the parallel tick on, the chunks draw on streams of their own and the pass is
+            // planned on the helpers instead (`horizon_client::random_tick_plan`).
+            let planned = !debug && horizon_client::parallel::random_ticks_own_random();
+            if !debug && !planned && horizon_client::parallel::lanes() > 1 {
                 horizon_client::spans::time("random_tick_masks", || {
                     let chunks = &level.world.chunks;
                     level.random_tick_sections.prepare_masks(
@@ -308,6 +311,36 @@ impl Game<'_> {
                 // Each chunk's ticking sections, read once and answered from while no block
                 // changes and no chunk comes or goes; the mask itself is retained by
                 // tick_chunk_random_masked between callback asks.
+                if planned {
+                    let speed = level.game_rules().random_tick_speed;
+                    if speed > 0 {
+                        let chunks = &level.world.chunks;
+                        let columns: Vec<_> = (scratch.ticking.iter())
+                            .map(|&key| (key, chunks.get(&key).cloned()))
+                            .collect();
+                        let facts = level.facts;
+                        let range = (level.min_y(), level.max_y());
+                        let plan = horizon_client::random_tick_plan::plan(
+                            &columns,
+                            level.game_time(),
+                            speed,
+                            range,
+                            &|id| facts.get(BlockStateId(id)).random_ticks,
+                            &|id| b.random_tick_candidate(BlockStateId(id)),
+                        );
+                        drop(columns);
+                        let mut chunk = None;
+                        for (key, planned) in plan {
+                            if chunk != Some(key) {
+                                horizon_threads::work::set_chunk(key.0, key.1);
+                                chunk = Some(key);
+                            }
+                            b.run_planned_random_tick(level, ticks, planned);
+                        }
+                    }
+                    scratch.ticking.clear();
+                    return;
+                }
                 let mut sections = horizon_client::random_tick_sections::ChunkTicking::default();
                 for (n, &(x, z)) in scratch.ticking.iter().enumerate().filter(|_| !debug) {
                     // The next chunks' first reads, read together (`RandomTickSections::read_ahead`):
