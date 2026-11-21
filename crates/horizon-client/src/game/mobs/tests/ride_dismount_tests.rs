@@ -194,7 +194,7 @@ fn a_mob_that_boards_a_happy_ghast_after_its_player_takes_the_next_seat() {
         .iter()
         .position(|m| m.species() == Species::Pig)
         .expect("the pig");
-    game.mobs[pig].extra.mount = Some(id);
+    game.mobs[pig].mount = Some(id);
     game.position_riders();
     let (at, seat) = (game.mobs[pig].position, riders::happy_ghast_attachment(1));
     let ghast = game.mobs.iter().find(|m| m.id == id).unwrap().position;

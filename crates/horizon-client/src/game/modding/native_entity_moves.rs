@@ -336,7 +336,7 @@ mod tests {
                 dist_to_target: 0.0,
                 reached: true,
             });
-            mob.extra.mount = Some(42);
+            mob.mount = Some(42);
             mob.extra.passenger = true;
             mob.fall_distance = 5.0;
             mob.velocity.y = -2.0;
@@ -345,7 +345,7 @@ mod tests {
             assert!(entity.teleport_to(game, [5.0, 70.0, -3.0], Some([90.0, 120.0])));
             let mob = &game.mobs[0];
             assert!(mob.ai.nav.path.is_none());
-            assert!(mob.extra.mount.is_none());
+            assert!(mob.mount.is_none());
             assert!(!mob.extra.passenger);
             assert_eq!(mob.fall_distance, 5.0);
             assert_eq!(mob.velocity.y, 0.0);

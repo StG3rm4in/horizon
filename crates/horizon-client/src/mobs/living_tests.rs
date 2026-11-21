@@ -1244,7 +1244,7 @@ fn a_mob_in_a_boat_on_water_is_not_in_the_water() {
         let kind = std::sync::Arc::new(types.types["minecraft:drowned"].clone());
         let wet = |mount: Option<u32>, ridden: Option<crate::motion::RiddenBoat>| {
             let mut m = Mob::new(1, kind.clone(), Vec3::new(2.5, 3.5, 2.5), 0.0);
-            m.extra.mount = mount;
+            m.mount = mount;
             m.fluids.boat = ridden.map(|b| (7, b));
             m.update_fluids(w, &mut Vec::new());
             (m.fluids.in_water, m.fluids.water)

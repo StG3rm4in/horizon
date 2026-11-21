@@ -240,7 +240,6 @@ impl Game<'_> {
             }
         });
         let vehicle = m
-            .extra
             .mount
             .and_then(|id| self.mobs.iter().find(|o| o.id == id))
             .map(|o| LootEntity::new(&o.kind.id));

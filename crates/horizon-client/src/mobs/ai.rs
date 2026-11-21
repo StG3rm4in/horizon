@@ -2631,7 +2631,7 @@ fn push_entities(
     {
         targets.push((Who::Player, p.position, p.passenger, false, false));
     }
-    let root = root_vehicle(w, m.id, m.extra.mount);
+    let root = root_vehicle(w, m.id, m.mount);
     for o in w.others_near(bounds) {
         if o.id != m.id && o.alive && o.pushable && o.bounds.intersects(bounds) {
             let same = root_vehicle(w, o.id, o.vehicle) == root;
@@ -4988,7 +4988,7 @@ mod same_vehicle_push_tests {
                     let mut camel = mob(1, "minecraft:camel", Vec3::new(0.5, 64.0, 0.5));
                     let mut husk = mob(2, "minecraft:husk", Vec3::new(0.5, 65.5, 1.0));
                     camel.extra.rider = Some(husk.id);
-                    husk.extra.mount = Some(camel.id);
+                    husk.mount = Some(camel.id);
                     riders.push(husk.seen(None, &crate::items::Items::empty()));
                     if zombie_too {
                         riders.push(

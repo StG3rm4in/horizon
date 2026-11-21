@@ -186,7 +186,7 @@ impl Game<'_> {
             .passenger_slots
             .keys()
             .copied()
-            .chain(self.mobs.iter().filter_map(|m| m.extra.mount))
+            .chain(self.mobs.iter().filter_map(|m| m.mount))
             .collect();
         vehicles.sort_unstable();
         vehicles.dedup();

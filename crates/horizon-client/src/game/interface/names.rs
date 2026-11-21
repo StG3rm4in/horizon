@@ -865,7 +865,7 @@ fn collect_vehicle_ids(
 ) -> std::collections::HashSet<u32> {
     let mut ridden: std::collections::HashSet<u32> = mobs
         .iter()
-        .filter_map(|o| o.extra.mount)
+        .filter_map(|o| o.mount)
         .chain(mobs.iter().filter_map(|m| m.extra.rider.map(|_| m.id)))
         .chain(passenger_vehicles)
         .collect();

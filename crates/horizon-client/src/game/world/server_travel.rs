@@ -1715,7 +1715,7 @@ mod tests {
                 ));
                 let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
                 let mut child = Mob::new(base + 10, kind, Vec3::ZERO, 0.0);
-                child.extra.mount = Some(base + 1);
+                child.mount = Some(base + 1);
                 game.persist
                     .off_level
                     .insert(base + 10, super::super::persist::OffLevel::Mob(child));
@@ -1824,9 +1824,9 @@ mod tests {
                     if let Some(owner) = owner {
                         assert!(game.entity(owner).is_some());
                     }
-                    assert_eq!(game.mob_object(held).unwrap().extra.mount, Some(root));
-                    assert_eq!(game.mob_object(leaf).unwrap().extra.mount, Some(held));
-                    assert_eq!(game.mob_object(sibling).unwrap().extra.mount, Some(root));
+                    assert_eq!(game.mob_object(held).unwrap().mount, Some(root));
+                    assert_eq!(game.mob_object(leaf).unwrap().mount, Some(held));
+                    assert_eq!(game.mob_object(sibling).unwrap().mount, Some(root));
                     assert_eq!(game.mob_object(root).unwrap().position, destination);
                     assert_eq!(
                         game.mob_object(held).unwrap().position,
@@ -1909,8 +1909,8 @@ mod tests {
                 assert!(game.boats.iter().all(|b| b.id != root));
                 assert!(game.carts.iter().all(|c| c.id != root));
                 assert!(game.boat_object(root).is_some() || game.cart_object(root).is_some());
-                assert_eq!(game.mob_object(pig).unwrap().extra.mount, Some(root));
-                assert_eq!(game.mob_object(chicken).unwrap().extra.mount, Some(pig));
+                assert_eq!(game.mob_object(pig).unwrap().mount, Some(root));
+                assert_eq!(game.mob_object(chicken).unwrap().mount, Some(pig));
                 assert!(game.mobs_below_off_level().contains(&pig));
                 assert!(game.mobs_below_off_level().contains(&chicken));
                 game.enter_level(source).unwrap();
@@ -1980,7 +1980,7 @@ mod tests {
             game.arrive_vehicle(source, held, Vec3::new(32.0, 90.0, 48.0), 0.0);
             assert!(game.mob_object(root).is_some());
             assert!(game.mob_object(held).is_some());
-            assert_eq!(game.mob_object(held).unwrap().extra.mount, Some(root));
+            assert_eq!(game.mob_object(held).unwrap().mount, Some(root));
             assert_eq!(game.lan.as_ref().unwrap().hub.guests[0].vehicle, Some(held));
         });
     }

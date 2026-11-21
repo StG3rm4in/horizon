@@ -247,7 +247,7 @@ pub fn link(mobs: &mut JoinList<Mob>, rider: u32, vehicle: u32) {
     }
     if let Some(m) = mobs.iter_mut().find(|m| m.id == rider) {
         super::shulker::on_start_riding(m);
-        m.extra.mount = Some(vehicle);
+        m.mount = Some(vehicle);
         m.extra.passenger = true;
     }
     if let Some(m) = mobs.iter_mut().find(|m| m.id == vehicle)
@@ -300,14 +300,14 @@ pub fn start_riding(mobs: &mut JoinList<Mob>, rider: u32, vehicle: u32) -> bool 
     } else {
         vehicle
     };
-    if rider == vehicle || r.extra.mount == Some(vehicle) {
+    if rider == vehicle || r.mount == Some(vehicle) {
         return false;
     }
     // Nothing that rides the rider (through any number of vehicles) can be
     // its vehicle.
     let mut up = Some(vehicle);
     while let Some(v) = up {
-        up = mobs.iter().find(|m| m.id == v).and_then(|m| m.extra.mount);
+        up = mobs.iter().find(|m| m.id == v).and_then(|m| m.mount);
         if up == Some(rider) {
             return false;
         }
@@ -318,7 +318,7 @@ pub fn start_riding(mobs: &mut JoinList<Mob>, rider: u32, vehicle: u32) -> bool 
     let count = usize::from(v.rider.is_some())
         + mobs
             .iter()
-            .filter(|m| m.extra.mount == Some(vehicle))
+            .filter(|m| m.mount == Some(vehicle))
             .count()
             .max(usize::from(v.extra.rider.is_some()));
     if r.extra.boarding_cooldown > 0 || !can_add_passenger(v, count) {
@@ -363,7 +363,7 @@ pub fn start_riding_event(
 /// ticks (`Entity.removePassenger`) and is set down at `at`, where
 /// `dismountVehicle` puts it (`dismountTo`), or stays where it is.
 pub fn stop_riding(m: &mut Mob, at: Option<Vec3>) {
-    if m.extra.mount.take().is_none() {
+    if m.mount.take().is_none() {
         return;
     }
     m.extra.passenger = false;
@@ -570,7 +570,7 @@ impl<'a> NavigationLoan<'a> {
             own: std::mem::take(&mut vehicle.ai.nav),
             body,
             follow_range: vehicle.attrs.follow_range as f32,
-            passenger: vehicle.extra.mount.is_some(),
+            passenger: vehicle.mount.is_some(),
             in_liquid: vehicle.is_in_liquid(),
         }));
         Self { rider, vehicle }
@@ -669,7 +669,6 @@ fn tick_with<R>(
     if !mobs[index].no_ai {
         for _ in 0..mobs.len() {
             let Some(vehicle) = mobs[owner]
-                .extra
                 .mount
                 .and_then(|id| mobs.iter().position(|m| m.id == id))
             else {
@@ -721,7 +720,7 @@ fn tick_with<R>(
 }
 /// `Mob.requiresCustomPersistence`: a passenger never despawns.
 pub fn keeps_alive(m: &Mob) -> bool {
-    m.extra.mount.is_some()
+    m.mount.is_some()
 }
 
 /// `IsChickenJockey`, `SkeletonTrap` and `SkeletonTrapTime`.
@@ -801,7 +800,7 @@ mod tests {
         kind.species = Species::Zombie;
         kind.id = "minecraft:zombie".into();
         let mut rider = Mob::new(72, Arc::new(kind), Vec3::new(2.0, 80.0, 0.5), 0.0);
-        rider.extra.mount = Some(71);
+        rider.mount = Some(71);
         rider.on_ground = true;
         rider.ai.nav.speed_modifier = 3.75;
         rider.ai.nav.target_pos = Some([1, 2, 3]);
@@ -861,7 +860,7 @@ mod tests {
     fn retained_controller_disables_goals_without_becoming_a_target() {
         let mut vehicle = of(71, Species::Spider);
         let mut rider = of(72, Species::Skeleton);
-        rider.extra.mount = Some(vehicle.id);
+        rider.mount = Some(vehicle.id);
         vehicle.extra.rider = Some(rider.id);
         let retained = [rider.seen(None, &crate::items::Items::empty())];
         let root = std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required");
@@ -1009,7 +1008,7 @@ mod tests {
         m.previous_body_yaw = 0.0;
         m.head_yaw = 100.0;
         m.previous_head_yaw = 100.0;
-        m.extra.mount = Some(7);
+        m.mount = Some(7);
         m.extra.vehicle_body = Some((7, 30.0, 50.0));
         let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
         // Halfway, the vehicle's body is at 40: the head is 60 off, so the
@@ -1017,9 +1016,9 @@ mod tests {
         assert!(close(super::super::anim::body_rot(&m, 0.5), 52.0));
         assert!(close(super::super::anim::state(&m, 0.5).y_rot, 48.0));
         // Off that vehicle (or onto a boat), its own body again.
-        m.extra.mount = Some(8);
+        m.mount = Some(8);
         assert!(close(super::super::anim::body_rot(&m, 0.5), 0.0));
-        m.extra.mount = None;
+        m.mount = None;
         assert!(close(super::super::anim::body_rot(&m, 0.5), 0.0));
     }
     fn npc(scale: f32) -> Mob {
@@ -1178,7 +1177,7 @@ mod tests {
         refused[1].extra.rider = Some(9);
         assert!(!start_riding(&mut refused, 1, 2));
         assert_eq!(refused[0].extra.variant3, 0);
-        assert_eq!(refused[0].extra.mount, None);
+        assert_eq!(refused[0].mount, None);
 
         // `Entity.startRiding` for anything else leaves the data alone.
         let mut others: JoinList<_> = [
@@ -1204,11 +1203,11 @@ mod tests {
         assert!(start_riding(&mut camel_ride, 1, 10), "first rider boards");
         assert_eq!(camel_ride[4].extra.rider, Some(1), "first rider is driver");
         assert!(start_riding(&mut camel_ride, 2, 10), "second rider boards");
-        assert_eq!(camel_ride[1].extra.mount, Some(10));
+        assert_eq!(camel_ride[1].mount, Some(10));
         assert_eq!(camel_ride[4].extra.rider, Some(1), "driver stays");
         assert!(start_riding(&mut camel_ride, 3, 10), "a third still fits");
         assert!(!start_riding(&mut camel_ride, 4, 10), "a fourth is refused");
-        assert_eq!(camel_ride[3].extra.mount, None);
+        assert_eq!(camel_ride[3].mount, None);
 
         // Any other mob carries one.
         let mut single: JoinList<_> = [

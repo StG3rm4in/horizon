@@ -514,7 +514,7 @@ fn mixed_riders_keep_load_order_and_offlevel_descendants_through_chunk_reload() 
             assert_eq!(child_uuids(&children[2]), [985]);
             let rejected = game.mob_passenger_ids(root)[0];
             assert!(game.persist.off_level.contains_key(&rejected));
-            assert_eq!(game.mob_object(rejected).unwrap().extra.mount, Some(root));
+            assert_eq!(game.mob_object(rejected).unwrap().mount, Some(root));
             assert_eq!(game.passenger_vehicle(id(game, 983).unwrap()), Some(rejected));
             assert_eq!(game.passenger_tree(root).len(), 7, "no duplicate riders");
             assert_eq!(

@@ -733,9 +733,9 @@ impl Mob {
     /// `Entity.isPassengerOfSameVehicle` toward the entity `id` riding
     /// `vehicle`: one rides the other, or both ride the same one.
     fn passenger_of_same_vehicle(&self, id: u32, vehicle: Option<u32>) -> bool {
-        self.extra.mount == Some(id)
+        self.mount == Some(id)
             || vehicle == Some(self.id)
-            || (self.extra.mount.is_some() && vehicle == self.extra.mount)
+            || (self.mount.is_some() && vehicle == self.mount)
     }
     pub fn do_move(
         &mut self,
@@ -1034,10 +1034,7 @@ impl Mob {
     /// resets the fall and entering it (after the first tick) splashes.
     pub(super) fn update_fluids(&mut self, w: &MobWorld, events: &mut Vec<MobEvent>) {
         let was_touching_water = self.fluids.in_water;
-        let boat = self
-            .fluids
-            .boat
-            .filter(|(id, _)| self.extra.mount == Some(*id));
+        let boat = self.fluids.boat.filter(|(id, _)| self.mount == Some(*id));
         self.fluids = self.fluid_interaction(w, boat.map(|(_, b)| b));
         self.fluids.boat = boat;
         // EntityFluidInteraction.applyCurrentTo: the flow pushes the mob.
@@ -1064,7 +1061,7 @@ impl Mob {
         moved: Vec3,
         events: &mut Vec<MobEvent>,
     ) {
-        if !super::ai::emits_movement(self) || self.extra.mount.is_some() {
+        if !super::ai::emits_movement(self) || self.mount.is_some() {
             return;
         }
         let full = (moved.length() * f64::from(0.6_f32)) as f32;

@@ -119,7 +119,7 @@ fn a_villager_in_a_one_by_one_cell_is_stuck_and_one_in_the_open_is_not() {
 #[test]
 #[ignore = "daily"]
 fn a_rider_is_stuck_in_the_open_and_a_sleeper_is_not_in_a_cell() {
-    let Some(rider) = stuck_in(false, None, None, |m| m.extra.mount = Some(7)) else {
+    let Some(rider) = stuck_in(false, None, None, |m| m.mount = Some(7)) else {
         return;
     };
     assert!(rider);

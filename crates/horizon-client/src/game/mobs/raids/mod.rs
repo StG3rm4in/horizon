@@ -888,7 +888,7 @@ impl Game<'_> {
             if let (Some(id), true) = (s.raid_id, s.patrol_leader) {
                 leaders.insert((id, s.wave));
             }
-            if let Some(v) = m.extra.mount {
+            if let Some(v) = m.mount {
                 ridden.insert(v);
             }
             positions.push((m.id, m.position, s.active_raid));

@@ -488,7 +488,7 @@ impl Game<'_> {
         if let Some(cart) = self.carts.iter().find(|c| c.id as i32 == id) {
             use super::super::minecarts::CartKind;
             let ridden = self.riding == Some(cart.id)
-                || self.mobs.iter().any(|m| m.extra.mount == Some(cart.id));
+                || self.mobs.iter().any(|m| m.mount == Some(cart.id));
             let game_master = self.can_use_game_master_blocks();
             return match cart.kind {
                 _ if cart.kind.interact_passes(sneaking, ridden, game_master) => None,

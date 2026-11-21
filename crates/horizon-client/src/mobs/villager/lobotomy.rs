@@ -41,7 +41,7 @@ pub const MAX_ROOM: usize = 6;
 /// villager is never stuck: the brain has to wake it. A trapdoor or slab over its head does not
 /// matter; only the room around it does.
 pub fn is_stuck(m: &Mob, w: &MobWorld) -> bool {
-    if m.extra.mount.is_some() {
+    if m.mount.is_some() {
         return true;
     }
     !super::sleeping(m) && !room_exceeds(m, w, MAX_ROOM)

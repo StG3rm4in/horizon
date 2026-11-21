@@ -243,7 +243,7 @@ impl Game<'_> {
             self.break_leash(mob, true, false);
             self.mobs[i].extra.leash = None;
         }
-        self.mobs[i].extra.mount = None;
+        self.mobs[i].mount = None;
         let tag = self.mob_tree_nbt(i);
         let flower = bee::get(&self.mobs[i]).and_then(|b| b.flower);
         let Some((lease, BlockEntity::Beehive(mut hive))) = self.world.block_entities.take(&key)

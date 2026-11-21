@@ -460,7 +460,7 @@ mod off_level_tests {
                     &mut Vec::new(),
                 );
             }
-            m.extra.mount = Some(72);
+            m.mount = Some(72);
             game.mobs.push(m);
             let ghost = Mob::new(72, kind, Vec3::ZERO, 0.0);
             game.persist

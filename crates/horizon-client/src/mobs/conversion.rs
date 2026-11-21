@@ -86,7 +86,7 @@ pub fn single(from: &Mob, to: &mut Mob, params: Params) {
     to.head_pitch = from.head_pitch;
     to.previous_head_pitch = from.head_pitch;
     to.velocity = from.velocity;
-    to.extra.mount = from.extra.mount;
+    to.mount = from.mount;
     to.extra.passenger = from.extra.passenger;
     if params.keep_equipment {
         // Every slot, copyAndClear, and setDropChance from the old mob.
@@ -248,7 +248,7 @@ mod tests {
                 armor.data_mut().custom_name = Some(horizon_core::nbt::Tag::String("kept".into()));
                 s.extra.set_body_stack(Some(armor));
                 s.extra.leash = Some(crate::mobs::leash::Holder::Knot([3, 71, -3]));
-                s.extra.mount = Some(7);
+                s.mount = Some(7);
                 s.extra.passenger = true;
                 let mut st = mob(2, "minecraft:stray");
                 single(&s, &mut st, Params::KEEP_ALL);
@@ -268,7 +268,7 @@ mod tests {
                     st.extra.leash,
                     Some(crate::mobs::leash::Holder::Knot([3, 71, -3]))
                 );
-                assert_eq!(st.extra.mount, Some(7));
+                assert_eq!(st.mount, Some(7));
                 assert_eq!(st.extra.body_id(), Some("minecraft:wolf_armor"));
                 assert_eq!(st.extra.body_damage(), 7);
                 assert_eq!(st.equipment_stacks()[1], Some(offhand));

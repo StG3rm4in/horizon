@@ -4483,7 +4483,7 @@ mod teleport_rider_tests {
             ));
             let mut rider =
                 horizon_client::mobs::Mob::new(43, villager, Vec3::new(3.0, 64.5, 5.0), 30.0);
-            rider.extra.mount = Some(42);
+            rider.mount = Some(42);
             game.mobs.push(rider);
             // Entity.teleportPassengers: the rider keeps its offset from the
             // vehicle and turns by what the vehicle turned.
@@ -4500,7 +4500,7 @@ mod teleport_rider_tests {
             assert_eq!(rider.position, Vec3::new(10.0, 70.5, -4.0));
             assert_eq!(rider.yaw, 120.0, "the rider keeps its angle to the vehicle");
             assert_eq!(
-                rider.extra.mount,
+                rider.mount,
                 Some(42),
                 "a teleported vehicle keeps its riders"
             );
@@ -4532,7 +4532,7 @@ mod teleport_rider_tests {
             // leaves its vehicle, or the next sync seats it where it was.
             game.teleport_to_in_level(Target::Mob(43), [0.0, 64.0, 0.0], None, [false; 3], false);
             let rider = game.mobs.iter().find(|m| m.id == 43).unwrap();
-            assert_eq!(rider.extra.mount, None, "the teleported rider dismounted");
+            assert_eq!(rider.mount, None, "the teleported rider dismounted");
             assert_eq!(rider.position, Vec3::new(0.0, 64.0, 0.0));
             // #9335 (2): a rider keeps its angle to the vehicle through an
             // absolute turn, and a relative turn adds the delta: a villager 30
@@ -4552,7 +4552,7 @@ mod teleport_rider_tests {
             ));
             let mut rider2 =
                 horizon_client::mobs::Mob::new(51, villager2, Vec3::new(10.0, 64.5, 10.0), 30.0);
-            rider2.extra.mount = Some(50);
+            rider2.mount = Some(50);
             game.mobs.push(rider2);
             // Absolute turn: vehicle 0 -> 40, rider keeps its 30-degree offset.
             game.teleport_to_in_level(

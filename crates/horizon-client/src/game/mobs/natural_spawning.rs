@@ -1180,7 +1180,7 @@ impl<'a> Game<'a> {
         }
         for group in groups.iter_mut() {
             for mob in group.iter_mut() {
-                if let Some(m) = mob.extra.mount.as_mut()
+                if let Some(m) = mob.mount.as_mut()
                     && let Some(&id) = links.get(m)
                 {
                     *m = id;

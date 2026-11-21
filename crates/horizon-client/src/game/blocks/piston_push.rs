@@ -999,7 +999,7 @@ impl Game<'_> {
             (!self.options.execution_role.is_client()
                 && self.remote.is_none()
                 && !m.extra.passenger
-                && m.extra.mount.is_none()
+                && m.mount.is_none()
                 && m.rider.is_none()
                 && m.extra.rider.is_none()
                 && self.riding != Some(m.id)
@@ -2133,7 +2133,7 @@ mod h255_mob_piston_ground_tests {
             assert!(game.riding.is_none());
             assert!(game.mobs[i].rider.is_none());
             assert!(game.mobs[i].extra.rider.is_none());
-            assert!(game.mobs[i].extra.mount.is_none());
+            assert!(game.mobs[i].mount.is_none());
             assert!(!game.mobs[i].extra.passenger);
             let before = game.mobs[i].position;
             added_push(game, i, Vec3::new(0.25, 0.0, 0.0));
@@ -2377,7 +2377,7 @@ mod lid_push_tests {
             assert!(game.run_command("summon minecraft:oak_boat 2.5 200 6.5"));
             let boat = game.boats[0].id;
             let i = game.mobs.iter().position(|m| m.id == shulker).unwrap();
-            game.mobs[i].extra.mount = Some(boat);
+            game.mobs[i].mount = Some(boat);
             game.riding = Some(boat);
             let (around, lift) = (area(1.0, 1.0, 4.0, 8.0), Vec3::new(0.0, 0.25, 0.0));
             game.lid_push(Lid::Shulker(shulker), around, lift);
@@ -2389,7 +2389,7 @@ mod lid_push_tests {
             assert_eq!(player_y(game), 200.0, "its fellow passenger stays");
             game.lid_push_local(Lid::Shulker(shulker), around, lift);
             assert_eq!(player_y(game), 200.0, "a client's own player stays too");
-            game.mobs[i].extra.mount = None;
+            game.mobs[i].mount = None;
             game.lid_push_local(Lid::Shulker(shulker), around, lift);
             assert_eq!(player_y(game), 200.25, "nothing shared: the lid lifts it");
         });

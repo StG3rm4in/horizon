@@ -487,7 +487,7 @@ impl Game<'_> {
                     let old = horizon_client::join_seq::store_back(slot, new);
                     // Entity.load does not replace the live passenger graph or
                     // the runtime seating state, even for an off-level vehicle.
-                    slot.extra.mount = old.extra.mount;
+                    slot.mount = old.mount;
                     slot.extra.rider = old.extra.rider;
                     slot.extra.passenger = old.extra.passenger;
                     slot.extra.vehicle_order = old.extra.vehicle_order;
@@ -1853,7 +1853,7 @@ mod boat_passenger_tree_tests {
             );
             game.ride_mount(Target::Mob(child), Target::Boat(bid))
                 .unwrap();
-            assert_eq!(game.mobs[ci].extra.mount, Some(bid));
+            assert_eq!(game.mobs[ci].mount, Some(bid));
             let clock = game.world.game_time;
             let chunks = game.world.chunks.len();
             let raw = game.persist.raw.get(&bid).cloned();
@@ -1932,7 +1932,7 @@ mod boat_passenger_tree_tests {
                 }
                 assert_eq!(game.persist.uuids.len(), stable);
                 assert_eq!(game.mobs[ci].extra.anger_end, -1);
-                assert_eq!(game.mobs[ci].extra.mount, Some(bid));
+                assert_eq!(game.mobs[ci].mount, Some(bid));
             }
             assert!(game.run_command("scoreboard objectives add h151 dummy"));
             assert!(game.run_command("scoreboard players set #r h151 91"));

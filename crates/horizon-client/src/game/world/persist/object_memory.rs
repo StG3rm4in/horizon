@@ -548,7 +548,7 @@ impl Game<'_> {
         // vanilla behavior and makes loading depend on mod subscriptions.
         let restore_target =
             neutral && self.is_logical_server() && self.native_lifecycle.epoch().is_some();
-        m.extra.mount = mount;
+        m.mount = mount;
         m.extra.passenger = mount.is_some();
         // The object id preserves load order even when some passengers are
         // retained in the off-level store rather than the resident list.
@@ -602,7 +602,7 @@ impl Game<'_> {
             .mobs
             .iter()
             .enumerate()
-            .filter(|(_, mob)| mob.extra.mount == Some(id) && !mob.removed)
+            .filter(|(_, mob)| mob.mount == Some(id) && !mob.removed)
             .map(|(index, mob)| (mob.extra.vehicle_order, mob.id, MobObject::Resident(index)))
             .chain(
                 self.persist
@@ -610,7 +610,7 @@ impl Game<'_> {
                     .iter()
                     .filter_map(|(&object_id, object)| {
                         let mob = object.as_mob()?;
-                        (mob.extra.mount == Some(id) && !mob.removed).then_some((
+                        (mob.mount == Some(id) && !mob.removed).then_some((
                             mob.extra.vehicle_order,
                             mob.id,
                             MobObject::OffLevel(object_id),
@@ -932,7 +932,7 @@ impl Game<'_> {
     pub(super) fn retain_off_level_objects(&mut self, retained: &mut HashSet<u32>) {
         let mut links: HashMap<u32, Vec<u32>> = HashMap::new();
         for mob in self.mob_objects() {
-            if let Some(vehicle) = mob.extra.mount
+            if let Some(vehicle) = mob.mount
                 && (self.persist.off_level.contains_key(&mob.id)
                     || self.persist.off_level.contains_key(&vehicle)
                     || self.persist.removed_vehicles.contains_key(&vehicle))

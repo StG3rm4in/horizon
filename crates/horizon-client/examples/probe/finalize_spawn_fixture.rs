@@ -278,7 +278,6 @@ fn variant(m: &Mob, regs: &SpawnRegistries, v: &mut Vec<String>) {
 fn describe(m: &Mob, all: &[Mob], regs: &SpawnRegistries) -> String {
     let mut t = vec![m.kind.id.clone()];
     let vehicle = m
-        .extra
         .mount
         .and_then(|v| all.iter().position(|o| o.id == v))
         .map_or("-".to_owned(), |i| i.to_string());

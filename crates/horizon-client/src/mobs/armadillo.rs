@@ -247,7 +247,7 @@ fn can_stay_rolled_up(m: &Mob) -> bool {
         && !m.fluids.in_water
         && !m.fluids.in_lava
         && m.extra.leash.is_none()
-        && m.extra.mount.is_none()
+        && m.mount.is_none()
         && m.extra.rider.is_none()
 }
 /// `Entity.playSound(sound)`.

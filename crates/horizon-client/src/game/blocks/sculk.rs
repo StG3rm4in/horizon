@@ -2256,7 +2256,7 @@ impl Game<'_> {
                     m.fluids.in_water,
                     m.species(),
                     m.last_damage.map(|(_, t)| t),
-                    m.extra.mount,
+                    m.mount,
                     m.age,
                     m.species() == Species::Bat && horizon_client::mobs::bat::resting(m),
                 )

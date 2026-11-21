@@ -1038,7 +1038,7 @@ impl Game<'_> {
                         .and_then(persist::OffLevel::as_mob)
                 })
                 .filter(|m| !m.removed);
-            if let Some(parent) = mob.and_then(|m| m.extra.mount) {
+            if let Some(parent) = mob.and_then(|m| m.mount) {
                 id = parent;
                 continue;
             }
@@ -1070,7 +1070,7 @@ impl Game<'_> {
                     .filter_map(persist::OffLevel::as_mob),
             )
             .filter(|mob| !mob.removed)
-            .map(|mob| (mob.extra.mount, mob.extra.vehicle_order, mob.id))
+            .map(|mob| (mob.mount, mob.extra.vehicle_order, mob.id))
             .collect();
         edges.sort_by_key(|&(_, order, id)| (order, id));
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();

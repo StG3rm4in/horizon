@@ -43,7 +43,7 @@ impl Game<'_> {
     pub(super) fn passenger_object_vehicle(&self, id: u32) -> Option<u32> {
         if let Some(mob) = self.mob_object(id) {
             return (!mob.removed)
-                .then_some(mob.extra.mount)
+                .then_some(mob.mount)
                 .flatten()
                 .filter(|vehicle| self.passenger_object_present(*vehicle));
         }
@@ -218,7 +218,7 @@ impl Game<'_> {
     pub(in crate::game) fn link_loaded_passenger(&mut self, id: u32, vehicle: u32) {
         self.unlink_passenger(id);
         if let Some(m) = self.mob_object_mut(id) {
-            m.extra.mount = Some(vehicle);
+            m.mount = Some(vehicle);
             m.extra.passenger = true;
             // The object id keeps load order, including refused resident copies.
             m.extra.vehicle_order = i64::from(m.id);

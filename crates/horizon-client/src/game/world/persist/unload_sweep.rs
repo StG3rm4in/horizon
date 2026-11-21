@@ -98,7 +98,7 @@ impl Game<'_> {
             .mob_object_slots()
             .filter(|&object| {
                 let root = self.mob_at(self.mob_root(object));
-                match root.extra.mount {
+                match root.mount {
                     Some(v) if removed.contains(&v) => true,
                     Some(v) if self.boats.iter().any(|b| b.id == v) => false,
                     _ => gone(root.position),
@@ -125,7 +125,7 @@ impl Game<'_> {
             // it lives only while a passenger or player still rides it.
             let ridden: HashSet<u32> = self
                 .mob_objects()
-                .filter_map(|m| m.extra.mount)
+                .filter_map(|m| m.mount)
                 .chain(riding)
                 .collect();
             self.persist.off_level.retain(|id, object| {

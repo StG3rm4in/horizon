@@ -377,7 +377,7 @@ mod tests {
                 assert!(game.boats.iter().any(|b| b.id == boat_id));
                 assert_eq!(*observer.0.lock().unwrap(), vec![(boat_id, true)]);
                 assert_eq!(game.entity_vehicle(mob), None);
-                assert!(!game.mobs.iter().any(|m| m.extra.mount == Some(boat_id)));
+                assert!(!game.mobs.iter().any(|m| m.mount == Some(boat_id)));
 
                 game.native_leaves_flush();
                 assert!(!game.boats.iter().any(|b| b.id == boat_id));

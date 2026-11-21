@@ -115,7 +115,7 @@ fn candidates(m: &Mob, w: &MobWorld) -> Vec<Candidate> {
     let r = 6.0;
     let area = m.bounds().inflate(Vec3::new(r, r, r));
     for s in w.others_near(area) {
-        if s.id == m.id || !s.alive || m.extra.mount == Some(s.id) || m.extra.rider == Some(s.id) {
+        if s.id == m.id || !s.alive || m.mount == Some(s.id) || m.extra.rider == Some(s.id) {
             continue;
         }
         out.push(Candidate {
@@ -143,8 +143,7 @@ fn head_look_angle(m: &Mob) -> Vec3 {
 /// `KineticWeapon.getMotion`: the known speed per second of the attacker, or
 /// of the mount it rides.
 fn motion(m: &Mob, w: &MobWorld, known_speed: Vec3) -> Vec3 {
-    m.extra
-        .mount
+    m.mount
         .and_then(|id| w.seen(id))
         .map_or(known_speed, |s| s.known_speed)
         .scale(20.0)
@@ -332,7 +331,7 @@ fn cause_extra_knockback(
 /// `Mob.chargeSpeedModifier` of the mount: a zombie horse runs 1.4 times as
 /// fast with a charging rider, a camel husk 4 times.
 fn charge_speed_modifier(m: &Mob, w: &MobWorld) -> f32 {
-    match m.extra.mount.and_then(|id| w.seen(id)).map(|s| s.species) {
+    match m.mount.and_then(|id| w.seen(id)).map(|s| s.species) {
         Some(Species::ZombieHorse) => 1.4,
         Some(Species::CamelHusk) => 4.0,
         _ => 1.0,
@@ -341,7 +340,7 @@ fn charge_speed_modifier(m: &Mob, w: &MobWorld) -> f32 {
 
 /// `Entity.isPassenger` as the 2 blocks it adds to the charge distances.
 fn passenger_distance(m: &Mob) -> i32 {
-    if m.extra.mount.is_some() { 2 } else { 0 }
+    if m.mount.is_some() { 2 } else { 0 }
 }
 
 /// `ableToAttack` of `SpearUseGoal` and the spear behaviours: a target and a

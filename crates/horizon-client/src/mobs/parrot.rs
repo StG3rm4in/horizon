@@ -220,7 +220,7 @@ pub fn register(m: &mut Mob) {
 /// decays, and `flap` turns by it. A client runs it for the parrots it only
 /// displays.
 pub fn flap(m: &mut Mob) {
-    let grounded = m.on_ground || m.extra.mount.is_some();
+    let grounded = m.on_ground || m.mount.is_some();
     let a = &mut m.anim;
     a.flap_o = a.flap;
     a.flap_speed_o = a.flap_speed;
@@ -385,10 +385,10 @@ mod tests {
         assert_eq!(m.velocity.y, 0.2);
         assert_eq!(m.anim.flap_o, 1.8);
         // On a shoulder (a passenger), flapSpeed falls by 0.3 a tick.
-        m.extra.mount = Some(7);
+        m.mount = Some(7);
         calculate_flapping(&mut m);
         assert!((m.anim.flap_speed - 0.7).abs() < 1.0e-6);
-        m.extra.mount = None;
+        m.mount = None;
         m.on_ground = true;
         m.velocity = Vec3::new(0.0, -0.0784, 0.0);
         calculate_flapping(&mut m);

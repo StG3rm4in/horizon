@@ -913,8 +913,8 @@ impl Game<'_> {
         let transformed_kind = from_kind.as_ref().map(|_| transformed.kind.id.clone());
         // Only move passengers once the new mob's join has succeeded.
         for rider in self.mobs.iter_mut() {
-            if rider.extra.mount == Some(from.id) {
-                rider.extra.mount = Some(id);
+            if rider.mount == Some(from.id) {
+                rider.mount = Some(id);
             }
         }
         if let (Some(from_kind), Some(transformed_kind)) = (from_kind, transformed_kind) {
@@ -978,7 +978,7 @@ impl Game<'_> {
                     "target": m.ai.target.map(|t| format!("{t:?}")),
                     "goals": m.ai.goals.running_names(),
                     "held": m.extra.main_hand_id(),
-                    "mount": m.extra.mount,
+                    "mount": m.mount,
                     "rider": m.extra.rider,
                     // A player's input this tick, and whether it steers.
                     "ridden": m.rider.map(|r| r.steer),
@@ -1022,7 +1022,7 @@ impl Game<'_> {
                     "leader": s.patrol_leader,
                     "patrolling": s.patrolling,
                     "patrol_target": s.patrol_target,
-                    "vehicle": m.extra.mount,
+                    "vehicle": m.mount,
                 })));
                 // Drawn seated (Entity.isPassenger).
                 state["passenger"] = m.extra.passenger.into();

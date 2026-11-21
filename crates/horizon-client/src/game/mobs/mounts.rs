@@ -160,7 +160,7 @@ impl Game<'_> {
             || self
                 .mobs
                 .iter()
-                .any(|r| r.alive() && !r.removed && r.extra.mount == Some(id))
+                .any(|r| r.alive() && !r.removed && r.mount == Some(id))
         {
             // !canShearEquipment (isVehicle): the click goes on to mobInteract. A
             // ridden pig or strider has nothing more to give, but a camel takes a
@@ -311,7 +311,7 @@ impl Game<'_> {
             && self
                 .mobs
                 .iter()
-                .any(|p| p.extra.mount == Some(id) && !p.removed && p.alive())
+                .any(|p| p.mount == Some(id) && !p.removed && p.alive())
         {
             return false;
         }
@@ -639,7 +639,7 @@ impl Game<'_> {
             .iter()
             .filter(|m| !blocked.contains(&m.id) && m.alive() && m.fluids.eye_in_water)
             .filter_map(|m| {
-                let mount = m.extra.mount?;
+                let mount = m.mount?;
                 let under = self.mobs.iter().find(|v| v.id == mount)?;
                 dismounts_underwater(under.species()).then_some(m.id)
             })
@@ -887,7 +887,7 @@ impl Game<'_> {
                 let riders: Vec<u32> = self
                     .mobs
                     .iter()
-                    .filter(|m| m.extra.mount == Some(mob))
+                    .filter(|m| m.mount == Some(mob))
                     .map(|m| m.id)
                     .collect();
                 for rider in riders {
@@ -928,7 +928,7 @@ impl Game<'_> {
         let riders: Vec<u32> = self
             .mobs
             .iter()
-            .filter(|m| m.extra.mount == Some(mob))
+            .filter(|m| m.mount == Some(mob))
             .map(|m| m.id)
             .collect();
         for rider in riders {
@@ -2160,7 +2160,7 @@ mod off_level_tests {
             let pig = game.res.mob_types().get("minecraft:pig").unwrap().clone();
             for (id, mount) in [(73, Some(72)), (74, Some(73)), (75, None), (76, Some(75))] {
                 let mut m = horizon_client::mobs::Mob::new(id, pig.clone(), Vec3::ZERO, 0.0);
-                m.extra.mount = mount;
+                m.mount = mount;
                 m.fluids.eye_in_water = true;
                 game.mobs.push(m);
             }
@@ -2169,8 +2169,8 @@ mod off_level_tests {
                 .off_level
                 .insert(72, crate::game::persist::OffLevel::Mob(ghost));
             game.dismount_underwater_mob_riders();
-            assert_eq!(game.mob_object(74).unwrap().extra.mount, Some(73));
-            assert_eq!(game.mob_object(76).unwrap().extra.mount, None);
+            assert_eq!(game.mob_object(74).unwrap().mount, Some(73));
+            assert_eq!(game.mob_object(76).unwrap().mount, None);
         });
     }
 }

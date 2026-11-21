@@ -89,7 +89,7 @@ fn a_mob_rides_a_minecart() {
     game.ride_mount(Target::Mob(1), Target::Cart(7))
         .expect("a minecart takes a mob as its passenger");
     assert_eq!(
-        game.mobs[0].extra.mount,
+        game.mobs[0].mount,
         Some(7),
         "the zombie rides the cart"
     );

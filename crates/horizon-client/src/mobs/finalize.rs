@@ -1634,13 +1634,13 @@ impl<L: FinalizeLevel + ?Sized, R: RandomSource> Ctx<'_, L, R> {
     }
     /// `startRiding`: the rider leaves the vehicle it was on.
     fn ride(&mut self, rider: &mut Mob, vehicle: &mut Mob) {
-        if let Some(old) = rider.extra.mount
+        if let Some(old) = rider.mount
             && let Some(v) = self.created.iter_mut().find(|c| c.id == old)
             && v.extra.rider == Some(rider.id)
         {
             v.extra.rider = None;
         }
-        rider.extra.mount = Some(vehicle.id);
+        rider.mount = Some(vehicle.id);
         rider.extra.passenger = true;
         if vehicle.extra.rider.is_none() {
             vehicle.extra.rider = Some(rider.id);
@@ -1672,7 +1672,7 @@ impl<L: FinalizeLevel + ?Sized, R: RandomSource> Ctx<'_, L, R> {
                             .inflate(horizon_core::geometry::Vec3::new(5.0, 3.0, 5.0));
                         if let Some(chicken) = self.level.free_chicken(search) {
                             self.level.ride_chicken(chicken, m.id);
-                            m.extra.mount = Some(chicken);
+                            m.mount = Some(chicken);
                             m.extra.passenger = true;
                         }
                     } else if f64::from(self.float()) < 0.05

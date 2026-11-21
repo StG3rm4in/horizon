@@ -169,7 +169,7 @@ fn discarded_mob_leaves_selectors_and_saves_while_frozen() {
     let kind = game.res.mob_types().get("minecraft:blaze").unwrap().clone();
     game.mobs
         .push(Mob::new(45, kind, Vec3::new(0.5, 65.0, 2.5), 0.0));
-    game.mobs[3].extra.mount = Some(44);
+    game.mobs[3].mount = Some(44);
     saved.clear();
     game.save_every_entity(&keys, &mut saved);
     let root = &saved[&(0, 0)][0].2;

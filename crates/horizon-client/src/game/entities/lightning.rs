@@ -1186,7 +1186,7 @@ mod tests {
             game.next_entity += 1;
             let rider_id = game.next_entity;
             let mut rider = Mob::new(rider_id, pig_type, Vec3::new(15.0, 64.0, 0.0), 0.0);
-            rider.extra.mount = Some(old_id);
+            rider.mount = Some(old_id);
             game.mobs.push(rider);
             assert!(
                 game.convert_to(
@@ -1203,7 +1203,6 @@ mod tests {
                     .iter()
                     .find(|m| m.id == rider_id)
                     .unwrap()
-                    .extra
                     .mount,
                 Some(old_id)
             );

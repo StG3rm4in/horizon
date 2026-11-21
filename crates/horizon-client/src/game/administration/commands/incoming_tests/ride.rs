@@ -147,7 +147,7 @@ fn a_selector_matching_two_entities_mounts_nothing() {
             "{said:?}"
         );
         assert!(
-            game.mobs.iter().all(|m| m.extra.mount.is_none()),
+            game.mobs.iter().all(|m| m.mount.is_none()),
             "no pig rides"
         );
         // A selector that matches one entity still mounts it: the near pig
@@ -158,7 +158,7 @@ fn a_selector_matching_two_entities_mounts_nothing() {
         );
         assert!(ok, "{said:?}");
         assert_eq!(
-            game.mobs.iter().filter(|m| m.extra.mount.is_some()).count(),
+            game.mobs.iter().filter(|m| m.mount.is_some()).count(),
             1,
             "one pig rides the other"
         );
@@ -183,7 +183,7 @@ fn a_mounting_mob_drops_its_lead() {
         assert!(ok, "{said:?}");
         // Mob.startRiding: the pig rides the cow, and its lead is dropped
         // (`dropLeash()`: the lead falls as an item at the pig's feet).
-        assert_eq!(game.mobs[pig].extra.mount, Some(game.mobs[cow].id));
+        assert_eq!(game.mobs[pig].mount, Some(game.mobs[cow].id));
         assert_eq!(game.mobs[pig].extra.leash, None, "the lead went");
         let leads: Vec<_> = game
             .dropped
@@ -248,7 +248,7 @@ fn a_brain_boarding_mob_drops_its_lead() {
             "the piglin sits on the hoglin"
         );
         game.handle_mob_events(events).unwrap();
-        assert_eq!(game.mobs[piglin].extra.mount, Some(game.mobs[hoglin].id));
+        assert_eq!(game.mobs[piglin].mount, Some(game.mobs[hoglin].id));
         assert_eq!(game.mobs[piglin].extra.leash, None, "the lead went");
         let leads: Vec<_> = game
             .dropped

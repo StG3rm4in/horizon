@@ -759,7 +759,7 @@ impl Mob {
         // getVehicle().getBoundingBox() now: a mob vehicle's box as the
         // snapshot has it after its own tick, else the box positionRider
         // left for this same vehicle (a boat, a minecart, primed TNT).
-        let vehicle = self.extra.mount.and_then(|v| {
+        let vehicle = self.mount.and_then(|v| {
             w.seen(v)
                 .map(|s| s.bounds)
                 .or_else(|| self.extra.seat.filter(|s| s.0 == v).map(|s| s.2))
@@ -2299,7 +2299,7 @@ impl Goal for Breed {
                 || m.is_baby()
                 || m.rider.is_some()
                 || m.extra.rider.is_some()
-                || m.extra.mount.is_some()
+                || m.mount.is_some()
                 || m.health < m.attrs.max_health)
         {
             return false;
@@ -4145,7 +4145,7 @@ mod melee_range_tests {
         // the zombie alone (about 0.83), within it from the horse's side.
         let target = target(&rider, 0.9);
         assert!(!rider.melee_reaches_beside(None, target));
-        rider.extra.mount = Some(9);
+        rider.mount = Some(9);
         rider.seated(9, 0.7, horse);
         assert!(rider.melee_reaches_beside(Some(horse), target));
         // Its own box keeps its height: the horse's lower box adds nothing.
@@ -4157,9 +4157,9 @@ mod melee_range_tests {
 
         assert_eq!(rider.hitbox().min_position().y, at.y + 0.7);
         // A seat left from another vehicle is not this one's.
-        rider.extra.mount = Some(10);
+        rider.mount = Some(10);
         assert_eq!(rider.hitbox().min_position().y, at.y);
-        rider.extra.mount = None;
+        rider.mount = None;
         assert_eq!(rider.hitbox().min_position().y, at.y);
     }
 }

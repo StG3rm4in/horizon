@@ -96,7 +96,7 @@ impl Game<'_> {
                 m.extra.saddled()
                     && !sneaking
                     && self.riding != Some(m.id)
-                    && !self.mobs.iter().any(|o| o.extra.mount == Some(m.id))
+                    && !self.mobs.iter().any(|o| o.mount == Some(m.id))
             }
             // HappyGhast.mobInteract: a harnessed adult is ridden.
             Species::HappyGhast => !baby && m.extra.body_id().is_some(),

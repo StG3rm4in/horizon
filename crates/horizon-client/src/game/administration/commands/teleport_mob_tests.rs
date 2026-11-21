@@ -20,7 +20,7 @@ fn command_stops_navigation_and_dismounts() {
             dist_to_target: 0.0,
             reached: true,
         });
-        mob.extra.mount = Some(42);
+        mob.mount = Some(42);
         mob.extra.passenger = true;
         mob.velocity = Vec3::new(1.0, -2.0, 3.0);
         mob.fall_distance = 7.0;
@@ -39,7 +39,7 @@ fn command_stops_navigation_and_dismounts() {
         let mob = &game.mobs[0];
         assert_eq!(mob.position, Vec3::new(10.5, 70.0, 10.5));
         assert!(mob.ai.nav.path.is_none());
-        assert!(mob.extra.mount.is_none());
+        assert!(mob.mount.is_none());
         assert!(!mob.extra.passenger);
         assert_eq!(mob.fall_distance, 7.0);
         assert_eq!(mob.velocity, Vec3::ZERO);

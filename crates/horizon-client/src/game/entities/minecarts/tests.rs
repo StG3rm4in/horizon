@@ -151,7 +151,7 @@ fn cart_index_finds_the_mobs_a_scan_finds() {
                 let scan: Vec<u32> = (0..game.mobs.len() as u32)
                     .filter(|&j| area.intersects(game.mobs[j as usize].bounds()))
                     .collect();
-                let ridden = game.mobs.iter().any(|m| m.extra.mount == Some(c.id));
+                let ridden = game.mobs.iter().any(|m| m.mount == Some(c.id));
                 let mounted = index.mobs_near(&game.mobs, c.id, area, &mut near);
                 assert_eq!(mounted, Some(ridden), "{what}: cart {}", c.id);
                 near.retain(|&j| area.intersects(game.mobs[j as usize].bounds()));
@@ -160,7 +160,7 @@ fn cart_index_finds_the_mobs_a_scan_finds() {
         };
         check(game, "as placed");
         game.mobs[10].position = carts[3].position;
-        game.mobs[11].extra.mount = Some(carts[4].id);
+        game.mobs[11].mount = Some(carts[4].id);
         check(game, "one moved, one boarded");
         let kind = kinds[0].clone();
         game.mobs

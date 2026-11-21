@@ -60,7 +60,7 @@ impl GoalCx<'_, '_> {
         let host = self.w.goal_host?;
         let mut seats = host.player_passenger_seats(entity.id());
         let mut add_mob = |mob: &crate::mobs::Mob| {
-            if mob.extra.mount == Some(entity.id()) && !mob.removed && mob.alive() {
+            if mob.mount == Some(entity.id()) && !mob.removed && mob.alive() {
                 seats.push((mob.extra.vehicle_order, mob.id));
             }
         };

@@ -1467,7 +1467,6 @@ mod passenger_relation_tests {
                         .iter()
                         .find(|m| m.id == ids[child - 1])
                         .unwrap()
-                        .extra
                         .mount,
                     Some(ids[parent - 1])
                 );
@@ -1534,7 +1533,6 @@ mod passenger_relation_tests {
                     .iter()
                     .find(|m| m.id == ids[1])
                     .unwrap()
-                    .extra
                     .mount,
                 None
             );

@@ -962,14 +962,14 @@ impl Game<'_> {
     /// carrying the players this side does.
     pub(super) fn mob_portal_eligible(&self, m: &horizon_client::mobs::Mob) -> bool {
         horizon_client::mobs::mob_can_use_portal(m)
-            && m.extra.mount.is_none()
+            && m.mount.is_none()
             && self.riding != Some(m.id)
             && (!self.guest_rides(m.id) || self.carries_riders())
     }
     /// `Entity.canUsePortal(false)` for a primed TNT: it carries no mob.
     pub(super) fn tnt_can_use_portal(&self, id: u32) -> bool {
         // Id 0: not tracked yet, nothing to key its portal state by.
-        id != 0 && !self.mobs.iter().any(|m| m.extra.mount == Some(id))
+        id != 0 && !self.mobs.iter().any(|m| m.mount == Some(id))
     }
     /// `canUsePortal(false)` of a boat or minecart: it is nobody's passenger;
     /// the mobs riding it, and on a server the players, cross with it.
@@ -1895,7 +1895,7 @@ mod tests {
             assert!(game.portals.arrivals.is_empty());
             let new_root = game
                 .mob_objects()
-                .find(|m| m.extra.mount.is_none())
+                .find(|m| m.mount.is_none())
                 .unwrap()
                 .id;
             let new_child = game.mob_passenger_ids(new_root)[0];
@@ -2054,7 +2054,7 @@ mod tests {
                         g.vehicle = player.then_some(vehicle);
                         g.vehicle_order = 0;
                     });
-                    game.mobs[0].extra.mount = mob_order.map(|_| vehicle);
+                    game.mobs[0].mount = mob_order.map(|_| vehicle);
                     game.mobs[0].extra.vehicle_order = mob_order.unwrap_or_default();
                     assert_eq!(
                         game.dimension_changing_delay(vehicle),
@@ -2231,7 +2231,7 @@ mod tests {
                     0.0,
                 );
                 if id != 101 {
-                    mob.extra.mount = Some(101);
+                    mob.mount = Some(101);
                 }
                 game.mobs.push(mob);
             }
@@ -2239,7 +2239,7 @@ mod tests {
             game.send_through_portal(101, BlockPos::new(0, 64, 0));
             assert_eq!(game.portals.arrivals.len(), 1);
             assert_eq!(game.mobs.iter().map(|m| m.id).collect::<Vec<_>>(), [102]);
-            assert_eq!(game.mobs[0].extra.mount, None);
+            assert_eq!(game.mobs[0].mount, None);
             assert_eq!(
                 heard
                     .lock()
@@ -2266,7 +2266,7 @@ mod tests {
                         0.0,
                     );
                     if id != 101 {
-                        mob.extra.mount = Some(101);
+                        mob.mount = Some(101);
                     }
                     game.mobs.push(mob);
                 }
@@ -2282,8 +2282,8 @@ mod tests {
                     }
                 );
                 assert!(
-                    !(game.mobs[0].extra.mount == Some(102)
-                        && game.mobs[1].extra.mount == Some(101))
+                    !(game.mobs[0].mount == Some(102)
+                        && game.mobs[1].mount == Some(101))
                 );
             });
         }
@@ -2307,7 +2307,7 @@ mod tests {
                     0.0,
                 );
                 if id == 102 {
-                    mob.extra.mount = Some(101);
+                    mob.mount = Some(101);
                     mob.extra.vehicle_order = 20;
                 }
                 game.mobs.push(mob);

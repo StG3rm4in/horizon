@@ -1833,13 +1833,13 @@ mod tests {
                     Vec3::new(5.0, 190.0, 6.0),
                     0.0,
                 );
-                rider.extra.mount = Some(71);
+                rider.mount = Some(71);
                 rider.extra.passenger = true;
                 game.persist
                     .off_level
                     .insert(72, super::super::persist::OffLevel::Mob(rider));
                 let mut child = horizon_client::mobs::Mob::new(73, kind, Vec3::ZERO, 0.0);
-                child.extra.mount = Some(72);
+                child.mount = Some(72);
                 child.age = 19;
                 game.mobs.push(child);
                 if broken {
@@ -1851,7 +1851,7 @@ mod tests {
                     assert_eq!(game.boats.len(), 1);
                 }
                 let rider = game.mob_object(72).unwrap();
-                assert_eq!(rider.extra.mount, None);
+                assert_eq!(rider.mount, None);
                 assert!(!rider.extra.passenger);
                 assert_eq!(rider.extra.boarding_cooldown, 60);
                 // Removed vehicle: retain x/z and clamp y to the boat's y.
@@ -1868,7 +1868,7 @@ mod tests {
                 assert!((child.position.y - expected.y - 0.86875).abs() < 1e-6);
                 assert_eq!(child.previous, child.position);
                 assert_eq!(child.age, 19);
-                assert_eq!(child.extra.mount, Some(72));
+                assert_eq!(child.mount, Some(72));
             });
         }
     }

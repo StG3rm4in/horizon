@@ -35,7 +35,7 @@ impl Game<'_> {
     ) {
         if self.riding == Some(id)
             || self.ridden_by_guest(id)
-            || self.mob_objects().any(|mob| mob.extra.mount == Some(id))
+            || self.mob_objects().any(|mob| mob.mount == Some(id))
         {
             vehicle.retire_attachment_registration();
             self.persist.removed_vehicles.insert(id, vehicle);
@@ -47,7 +47,7 @@ impl Game<'_> {
         if self.persist.removed_vehicles.contains_key(&id)
             && self.riding != Some(id)
             && !self.ridden_by_guest(id)
-            && !self.mob_objects().any(|mob| mob.extra.mount == Some(id))
+            && !self.mob_objects().any(|mob| mob.mount == Some(id))
         {
             self.persist.removed_vehicles.remove(&id);
             self.forget_entity(id);
@@ -60,11 +60,11 @@ impl Game<'_> {
         if self.persist.off_level.is_empty() {
             return Default::default();
         }
-        let mounts: HashMap<_, _> = self.mob_objects().map(|m| (m.id, m.extra.mount)).collect();
+        let mounts: HashMap<_, _> = self.mob_objects().map(|m| (m.id, m.mount)).collect();
         self.mobs
             .iter()
             .filter_map(|m| {
-                let mut mount = m.extra.mount;
+                let mut mount = m.mount;
                 for _ in 0..mounts.len() {
                     let id = mount?;
                     if self.persist.off_level.contains_key(&id) {
@@ -155,7 +155,7 @@ impl Game<'_> {
             .collect();
         let mut riding: HashMap<u32, (i64, u32)> = HashMap::new();
         for i in 0..self.mobs.len() {
-            let Some(v) = self.mobs[i].extra.mount else {
+            let Some(v) = self.mobs[i].mount else {
                 continue;
             };
             // Not a text display: a server's display mounts come through
@@ -176,7 +176,7 @@ impl Game<'_> {
                     .or_insert(place);
             } else {
                 let m = &mut self.mobs[i];
-                m.extra.mount = None;
+                m.mount = None;
                 m.extra.passenger = false;
             }
         }
@@ -192,7 +192,7 @@ impl Game<'_> {
         let invalid: Vec<_> = self
             .mob_objects()
             .filter_map(|m| {
-                let v = m.extra.mount?;
+                let v = m.mount?;
                 // Removed vehicles are retried only in the passenger's own
                 // eligible entity tick, after its cancellable Pre event.
                 if self.persist.removed_vehicles.contains_key(&v) {
@@ -210,7 +210,7 @@ impl Game<'_> {
             })
             .collect();
         for (id, vehicle) in invalid {
-            if self.mob_object(id).and_then(|m| m.extra.mount) != Some(vehicle) {
+            if self.mob_object(id).and_then(|m| m.mount) != Some(vehicle) {
                 continue;
             }
             // Dismount supplies positioning, descendant snapping and the
@@ -219,7 +219,7 @@ impl Game<'_> {
         }
         let mut first: HashMap<u32, (i64, u32)> = HashMap::new();
         for m in self.mob_objects() {
-            if let Some(v) = m.extra.mount {
+            if let Some(v) = m.mount {
                 let place = (m.extra.vehicle_order, m.id);
                 first
                     .entry(v)
@@ -274,7 +274,7 @@ impl Game<'_> {
             if blocked.contains(&m.id) {
                 continue;
             }
-            if let Some(v) = m.extra.mount {
+            if let Some(v) = m.mount {
                 riders.entry(v).or_default().push(j);
             }
         }
@@ -639,7 +639,7 @@ mod off_level_tests {
                     let kind = game.res.mob_types().get("minecraft:cow").unwrap().clone();
                     let mut vehicle = Mob::new(161, kind.clone(), Vec3::ZERO, 0.0);
                     let mut rider = Mob::new(162, kind.clone(), Vec3::ZERO, 0.0);
-                    rider.extra.mount = Some(161);
+                    rider.mount = Some(161);
                     if dying_vehicle {
                         vehicle.health = 0.0;
                     } else {
@@ -660,7 +660,7 @@ mod off_level_tests {
                     }
                     game.sync_riders();
                     assert_eq!(
-                        game.mob_object(162).unwrap().extra.mount,
+                        game.mob_object(162).unwrap().mount,
                         Some(161),
                         "retained={retained}, dying_vehicle={dying_vehicle}"
                     );
@@ -680,7 +680,7 @@ mod off_level_tests {
                 game.mobs.push(vehicle);
                 for (id, order) in [(172, 1), (173, 0)] {
                     let mut rider = Mob::new(id, kind.clone(), Vec3::ZERO, 0.0);
-                    rider.extra.mount = Some(171);
+                    rider.mount = Some(171);
                     rider.extra.vehicle_order = order;
                     game.mobs.push(rider);
                 }
@@ -714,13 +714,13 @@ mod off_level_tests {
                 0.0,
             ));
             let mut held = Mob::new(102, kind.clone(), Vec3::ZERO, 0.0);
-            held.extra.mount = Some(101);
+            held.mount = Some(101);
             held.extra.vehicle_order = 0;
             game.persist
                 .off_level
                 .insert(102, crate::game::persist::OffLevel::Mob(held));
             let mut resident = Mob::new(103, kind, Vec3::ZERO, 0.0);
-            resident.extra.mount = Some(101);
+            resident.mount = Some(101);
             resident.extra.vehicle_order = 1;
             game.mobs.push(resident);
             game.position_riders();
@@ -741,7 +741,7 @@ mod off_level_tests {
                 let mut root = Mob::new(70, pig.clone(), Vec3::new(10.0, 200.0, 20.0), 0.0);
                 root.removed = true;
                 let mut vehicle = Mob::new(71, kind, root.position, 0.0);
-                vehicle.extra.mount = Some(70);
+                vehicle.mount = Some(70);
                 game.mobs.push(root);
                 game.persist
                     .off_level
@@ -758,14 +758,14 @@ mod off_level_tests {
                     let id = 72 + seat as u32;
                     let mut rider = Mob::new(id, pig.clone(), Vec3::ZERO, 0.0);
                     rider.age = 19;
-                    rider.extra.mount = Some(71);
+                    rider.mount = Some(71);
                     rider.extra.vehicle_order = seat as i64;
                     if name == "minecraft:happy_ghast" && seat == 2 {
                         game.persist
                             .off_level
                             .insert(id, crate::game::persist::OffLevel::Mob(rider));
                         let mut child = Mob::new(80, pig.clone(), Vec3::ZERO, 0.0);
-                        child.extra.mount = Some(id);
+                        child.mount = Some(id);
                         child.age = 23;
                         game.mobs.push(child);
                     } else {
@@ -776,7 +776,7 @@ mod off_level_tests {
                 // The normal pass must not overwrite the one-time snap of frozen descendants.
                 game.position_riders();
                 let vehicle = game.mob_object(71).unwrap();
-                assert_eq!(vehicle.extra.mount, None);
+                assert_eq!(vehicle.mount, None);
                 for (seat, &(x, z)) in expected.iter().enumerate() {
                     let rider = game.mob_object(72 + seat as u32).unwrap();
                     assert!((rider.position.x - vehicle.position.x - x).abs() < 1e-6);
@@ -842,12 +842,12 @@ mod off_level_tests {
                     }
                     let pig = game.res.mob_types().get("minecraft:pig").unwrap().clone();
                     let mut rider = Mob::new(72, pig.clone(), Vec3::new(5.0, 190.0, 6.0), 0.0);
-                    rider.extra.mount = Some(71);
+                    rider.mount = Some(71);
                     game.persist
                         .off_level
                         .insert(72, super::super::persist::OffLevel::Mob(rider));
                     let mut child = Mob::new(73, pig, Vec3::ZERO, 0.0);
-                    child.extra.mount = Some(72);
+                    child.mount = Some(72);
                     child.age = 19;
                     game.mobs.push(child);
                     if cart {
@@ -864,7 +864,7 @@ mod off_level_tests {
                     assert_eq!(cancel.load(Ordering::Relaxed), 1);
                     game.sync_riders();
                     let rider = game.mob_object(72).unwrap();
-                    assert_eq!(rider.extra.mount, Some(71));
+                    assert_eq!(rider.mount, Some(71));
                     assert_eq!(rider.position, Vec3::new(5.0, 190.0, 6.0));
                     let child = game.mob_object(73).unwrap();
                     assert_eq!(child.position, Vec3::ZERO);
@@ -914,10 +914,10 @@ mod off_level_tests {
                     root.removed = true;
                     root.extra.rider = Some(72);
                     let mut rider = Mob::new(72, pig.clone(), Vec3::new(1.0, 190.0, 0.5), 0.0);
-                    rider.extra.mount = Some(71);
+                    rider.mount = Some(71);
                     rider.extra.passenger = true;
                     let mut child = Mob::new(73, pig, rider.position, 0.0);
-                    child.extra.mount = Some(72);
+                    child.mount = Some(72);
                     child.age = 19;
                     game.mobs.push(child);
                     game.mobs.push(root);
@@ -927,13 +927,13 @@ mod off_level_tests {
                     game.sync_riders();
                     let rider = game.mob_object(72).unwrap();
                     if cancel {
-                        assert_eq!(rider.extra.mount, Some(71));
+                        assert_eq!(rider.mount, Some(71));
                         assert!(rider.extra.passenger);
                         assert_eq!(rider.position.y, 190.0);
                         assert_eq!(game.mob_object(71).unwrap().extra.rider, Some(72));
                         assert_eq!(game.mob_object(73).unwrap().position.y, 190.0);
                     } else {
-                        assert_eq!(rider.extra.mount, None);
+                        assert_eq!(rider.mount, None);
                         assert!(!rider.extra.passenger);
                         assert_eq!(
                             rider.extra.boarding_cooldown,
@@ -945,7 +945,7 @@ mod off_level_tests {
                     }
                     let child = game.mob_object(73).unwrap();
                     assert_eq!(child.age, 19);
-                    assert_eq!(child.extra.mount, Some(72));
+                    assert_eq!(child.mount, Some(72));
                 });
             });
         }
@@ -959,9 +959,9 @@ mod off_level_tests {
             let mut root = Mob::new(71, pig.clone(), Vec3::new(1.0, 200.0, 0.5), 0.0);
             root.health = 0.0;
             let mut parent = Mob::new(72, pig.clone(), root.position, 0.0);
-            parent.extra.mount = Some(71);
+            parent.mount = Some(71);
             let mut child = Mob::new(73, pig, root.position, 0.0);
-            child.extra.mount = Some(72);
+            child.mount = Some(72);
             game.mobs.push(root);
             game.mobs.push(child);
             game.persist
@@ -972,9 +972,9 @@ mod off_level_tests {
                     game.mob_object_mut(72).unwrap().health = 0.0;
                 }
                 game.sync_riders();
-                assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                 assert_eq!(game.mob_object(71).unwrap().extra.rider, Some(72));
-                assert_eq!(game.mob_object(73).unwrap().extra.mount, Some(72));
+                assert_eq!(game.mob_object(73).unwrap().mount, Some(72));
                 assert_eq!(game.mob_object(72).unwrap().extra.rider, Some(73));
                 assert_eq!(game.mob_object(73).unwrap().position.y, 200.0);
             }
@@ -989,10 +989,10 @@ mod off_level_tests {
             let mut root = Mob::new(71, pig.clone(), Vec3::new(1.0, 80.0, 0.5), 0.0);
             root.extra.rider = Some(72);
             let mut parent = Mob::new(72, pig.clone(), root.position, 0.0);
-            parent.extra.mount = Some(71);
+            parent.mount = Some(71);
             parent.extra.rider = Some(73);
             let mut child = Mob::new(73, pig, Vec3::new(7.0, 90.0, 4.0), 0.0);
-            child.extra.mount = Some(72);
+            child.mount = Some(72);
             child.extra.passenger = true;
             child.extra.boarding_cooldown = 12;
             let before = child.position;
@@ -1005,7 +1005,7 @@ mod off_level_tests {
             assert_eq!(game.mob_object(71).unwrap().extra.rider, Some(72));
             assert_eq!(game.mob_object(72).unwrap().extra.rider, Some(73));
             let child = game.mob_object(73).unwrap();
-            assert_eq!(child.extra.mount, Some(72));
+            assert_eq!(child.mount, Some(72));
             assert!(child.extra.passenger);
             assert_eq!(child.extra.boarding_cooldown, 12);
             assert_eq!(child.position, before);
@@ -1064,10 +1064,10 @@ mod nested_vehicle_discard_tests {
                 }
                 let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
                 let mut rider = Mob::new(72, kind.clone(), Vec3::new(2.0, 190.0, 3.0), 0.0);
-                rider.extra.mount = Some(71);
+                rider.mount = Some(71);
                 game.mobs.push(rider);
                 let mut child = Mob::new(73, kind, Vec3::ZERO, 0.0);
-                child.extra.mount = Some(72);
+                child.mount = Some(72);
                 child.age = 19;
                 game.persist
                     .off_level
@@ -1079,13 +1079,13 @@ mod nested_vehicle_discard_tests {
                     1,
                     "nested removal must not dispatch the same in-flight dismount twice"
                 );
-                assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                 assert_eq!(
                     game.mob_object(72).unwrap().position,
                     Vec3::new(2.0, 190.0, 3.0)
                 );
                 let child = game.mob_object(73).unwrap();
-                assert_eq!(child.extra.mount, Some(72));
+                assert_eq!(child.mount, Some(72));
                 assert_eq!(child.position, Vec3::ZERO);
                 assert_eq!(child.age, 19);
                 assert!(game.entity(73).is_none());
@@ -1096,7 +1096,7 @@ mod nested_vehicle_discard_tests {
                     "deferred sweep must not notify again"
                 );
                 assert!(game.entity(71).is_none());
-                assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                 assert!(game.persist.removed_vehicles.contains_key(&71));
             });
         });
@@ -1132,7 +1132,7 @@ mod nested_vehicle_discard_tests {
             }
             let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
             let mut rider = Mob::new(72, kind.clone(), Vec3::new(2.0, 190.0, 3.0), 0.0);
-            rider.extra.mount = Some(71);
+            rider.mount = Some(71);
             if rejected {
                 game.persist
                     .off_level
@@ -1141,7 +1141,7 @@ mod nested_vehicle_discard_tests {
                 game.mobs.push(rider);
             }
             let mut child = Mob::new(73, kind, Vec3::ZERO, 0.0);
-            child.extra.mount = Some(72);
+            child.mount = Some(72);
             child.age = 19;
             game.mobs.push(child);
             // These manually installed owners bypass the normal allocator.
@@ -1256,7 +1256,7 @@ mod nested_vehicle_discard_tests {
                         1,
                         "non-ticking resident must not retry"
                     );
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                    assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                     game.mob_object_mut(72).unwrap().position = Vec3::new(2.0, 190.0, 3.0);
                     game.tick_creature_entities().unwrap();
                     assert_eq!(
@@ -1264,12 +1264,12 @@ mod nested_vehicle_discard_tests {
                         1,
                         "canceled Pre must suppress retry"
                     );
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                    assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                     assert!(game.persist.removed_vehicles.contains_key(&71));
                     cancel_tick.store(false, Ordering::Relaxed);
                     game.tick_creature_entities().unwrap();
                     assert_eq!(calls.load(Ordering::Relaxed), 2);
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, None);
+                    assert_eq!(game.mob_object(72).unwrap().mount, None);
                     assert!(!game.persist.removed_vehicles.contains_key(&71));
                     game.tick_creature_entities().unwrap();
                     assert_eq!(
@@ -1461,14 +1461,14 @@ mod nested_vehicle_discard_tests {
                         assert!(game.hurt_boat(0, 5.0, false));
                     }
                     assert_eq!(calls.load(Ordering::Relaxed), 1);
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                    assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                     assert_eq!(
                         game.mob_object(72).unwrap().position,
                         Vec3::new(30.5, 180.0, 40.5)
                     );
                     game.dismount_mob(72);
                     assert_eq!(calls.load(Ordering::Relaxed), 2);
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, None);
+                    assert_eq!(game.mob_object(72).unwrap().mount, None);
                     assert_eq!(
                         game.mob_object(72).unwrap().position,
                         Vec3::new(30.5, 200.0, 40.5)
@@ -1681,7 +1681,7 @@ mod nested_vehicle_discard_tests {
                         assert_eq!(leaves.load(Ordering::Relaxed), 1);
                         assert_eq!(destroys.load(Ordering::Relaxed), usize::from(mode < 2));
                         assert!(game.persist.removed_vehicles.contains_key(&71));
-                        assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                        assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                         assert!(game.persist.mount_notifications.is_empty());
                         game.prune_entity_memory();
                         assert_eq!(
@@ -1710,7 +1710,7 @@ mod nested_vehicle_discard_tests {
                     cancel.store(false, Ordering::Relaxed);
                     game.dismount_mob(72);
                     assert_eq!(mounts.load(Ordering::Relaxed), 2);
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, None);
+                    assert_eq!(game.mob_object(72).unwrap().mount, None);
                     assert!(!game.persist.removed_vehicles.contains_key(&71));
                     assert!(!game.persist.uuids.contains_key(&71));
                     assert!(!game.entity_attachments.contains_key(&71));
@@ -1911,7 +1911,7 @@ mod nested_vehicle_discard_tests {
                         assert!(game.hurt_boat(0, 5.0, false));
                     }
                     assert_eq!(calls.load(Ordering::Relaxed), 1);
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                    assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                 });
             });
         }
@@ -2014,7 +2014,7 @@ mod nested_vehicle_discard_tests {
                         game.score.board.score(&holder, "retained").map(|s| s.value),
                         Some(11)
                     );
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                    assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                     assert_eq!(game.mob_object(73).unwrap().position, Vec3::ZERO);
                     game.sync_riders();
                     assert_eq!(
@@ -2026,13 +2026,13 @@ mod nested_vehicle_discard_tests {
                     cancel.store(false, Ordering::Relaxed);
                     game.dismount_mob(72);
                     assert_eq!(calls.load(Ordering::Relaxed), 2);
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, None);
+                    assert_eq!(game.mob_object(72).unwrap().mount, None);
                     assert_eq!(
                         game.mob_object(72).unwrap().position,
                         Vec3::new(2.0, 200.0, 3.0)
                     );
                     let child = game.mob_object(73).unwrap();
-                    assert_eq!(child.extra.mount, Some(72));
+                    assert_eq!(child.mount, Some(72));
                     assert_eq!(child.position.x, 2.0);
                     assert_eq!(child.position.z, 3.0);
                     assert!((child.position.y - 200.86875).abs() < 1e-6);
@@ -2061,17 +2061,17 @@ mod nested_vehicle_discard_tests {
                     let camel = game.res.mob_types().get("minecraft:camel").unwrap().clone();
                     let pig = game.res.mob_types().get("minecraft:pig").unwrap().clone();
                     let mut parent = Mob::new(72, camel, Vec3::new(2.0, 190.0, 3.0), 0.0);
-                    parent.extra.mount = Some(71);
+                    parent.mount = Some(71);
                     game.persist
                         .off_level
                         .insert(72, super::super::persist::OffLevel::Mob(parent));
                     game.mob_object_mut(73).unwrap().extra.vehicle_order = 1;
                     let mut front = Mob::new(74, pig.clone(), Vec3::ZERO, 0.0);
-                    front.extra.mount = Some(72);
+                    front.mount = Some(72);
                     front.extra.vehicle_order = 0;
                     game.mobs.push(front);
                     let mut grandchild = Mob::new(75, pig, Vec3::ZERO, 0.0);
-                    grandchild.extra.mount = Some(73);
+                    grandchild.mount = Some(73);
                     game.mobs.push(grandchild);
                     if cart {
                         game.hurt_cart(
@@ -2200,7 +2200,7 @@ mod nested_vehicle_discard_tests {
                         game.native_removals_flush();
                         assert_eq!(count.load(Ordering::Relaxed), 1);
                         assert!(game.entity(71).is_none());
-                        assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                        assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                         assert_eq!(
                             game.mob_object(72).unwrap().position,
                             Vec3::new(2.0, 190.0, 3.0)
@@ -2209,7 +2209,7 @@ mod nested_vehicle_discard_tests {
                         assert!(game.entity(72).is_none());
                         assert!(game.persist.off_level.contains_key(&72));
                         let child = game.mob_object(73).unwrap();
-                        assert_eq!(child.extra.mount, Some(72));
+                        assert_eq!(child.mount, Some(72));
                         assert_eq!(child.position, Vec3::ZERO);
                         assert_eq!(child.age, 19);
                         assert!(game.entity(73).is_some());
@@ -2256,7 +2256,7 @@ mod nested_vehicle_discard_tests {
                 with_vehicle_tree(cart, false, |game| {
                     game.mob_object_mut(72).unwrap().extra.vehicle_order = 1;
                     let later = game.mob_object_mut(73).unwrap();
-                    later.extra.mount = Some(71);
+                    later.mount = Some(71);
                     later.extra.vehicle_order = 2;
                     let kind = game.res.mob_types().get("minecraft:cow").unwrap().clone();
                     game.mobs.push(Mob::new(74, kind, Vec3::ZERO, 0.0));
@@ -2280,15 +2280,15 @@ mod nested_vehicle_discard_tests {
                             game.arrow_hits_cart(0, 1.0, Vec3::ZERO, true, false, None, None);
                         }
                     }
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
-                    assert_eq!(game.mob_object(73).unwrap().extra.mount, Some(74));
+                    assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
+                    assert_eq!(game.mob_object(73).unwrap().mount, Some(74));
                     assert_eq!(
                         count.load(Ordering::Relaxed),
                         1,
                         "only deliberate reparenting dismounts the later rider"
                     );
                     game.native_removals_flush();
-                    assert_eq!(game.mob_object(73).unwrap().extra.mount, Some(74));
+                    assert_eq!(game.mob_object(73).unwrap().mount, Some(74));
                     assert_eq!(count.load(Ordering::Relaxed), 1);
                     assert!(game.persist.mount_notifications.is_empty());
                 });
@@ -2318,7 +2318,7 @@ mod nested_vehicle_discard_tests {
                 for n in 1..=2 {
                     assert!(!game.entity_stop_riding(rider));
                     assert_eq!(count.load(Ordering::Relaxed), n);
-                    assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                    assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                     assert_eq!(
                         game.mob_object(72).unwrap().position,
                         Vec3::new(2.0, 190.0, 3.0)
@@ -2359,7 +2359,7 @@ mod nested_vehicle_discard_tests {
         with_vehicle_tree(false, true, |game| {
             let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
             game.mobs.push(Mob::new(74, kind, Vec3::ZERO, 0.0));
-            game.mob_object_mut(72).unwrap().extra.mount = Some(74);
+            game.mob_object_mut(72).unwrap().mount = Some(74);
             assert!(
                 !game.start_riding_target(
                     super::super::commands::Target::Mob(74),
@@ -2402,7 +2402,7 @@ mod nested_vehicle_discard_tests {
                 let kind = game.res.mob_types().get("minecraft:cow").unwrap().clone();
                 game.mobs.push(Mob::new(74, kind, Vec3::ZERO, 0.0));
                 game.dismount_mob(72);
-                assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(74));
+                assert_eq!(game.mob_object(72).unwrap().mount, Some(74));
                 assert_eq!(game.mob_passenger_ids(74), vec![72]);
                 assert!(
                     !game
@@ -2439,14 +2439,14 @@ mod nested_vehicle_discard_tests {
         .into();
         mod_platform::testing::with_mods(mods, || {
             with_vehicle_tree(false, false, |game| {
-                game.mob_object_mut(72).unwrap().extra.mount = None;
+                game.mob_object_mut(72).unwrap().mount = None;
                 let ok = game.start_riding_target(
                     super::super::commands::Target::Mob(72),
                     super::super::commands::Target::Boat(71),
                     true,
                 );
                 assert!(!ok, "mount must refuse when callback removes vehicle");
-                assert_eq!(game.mob_object(72).unwrap().extra.mount, None);
+                assert_eq!(game.mob_object(72).unwrap().mount, None);
             })
         });
     }

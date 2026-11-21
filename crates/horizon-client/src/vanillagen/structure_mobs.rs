@@ -228,7 +228,7 @@ fn tree(mobs: &[(Mob, Option<Tag>)], i: usize, dimension: &str) -> Compound {
     }
     crate::mobs::brain::put_brain(&mut c, m, dimension);
     let riders: Vec<Tag> = (0..mobs.len())
-        .filter(|&j| mobs[j].0.extra.mount == Some(m.id))
+        .filter(|&j| mobs[j].0.mount == Some(m.id))
         .map(|j| Tag::Compound(tree(mobs, j, dimension)))
         .collect();
     if !riders.is_empty() {
@@ -353,7 +353,7 @@ impl StructureMobFinalizer {
         mobs.extend(created.into_iter().map(|c| (c, None)));
         let root = mobs
             .iter()
-            .position(|(m, _)| m.extra.mount.is_none())
+            .position(|(m, _)| m.mount.is_none())
             .unwrap_or(0);
         Some(tree(&mobs, root, &self.dimension))
     }
