@@ -1667,7 +1667,7 @@ impl Entities {
             })
             .collect();
         let (pairs, is_moved, synced_ranges) = (&*pairs, &*is_moved, &*synced_ranges);
-        horizon_threads::par_chunks_mut(&mut made, 64, |part| {
+        crate::parallel::par_chunks_mut(&mut made, 64, |part| {
             let mut packets = Vec::new();
             for m in part {
                 let (s, e) = (&mut *m.state, entities[m.index]);
@@ -1703,7 +1703,7 @@ impl Entities {
         made.retain(|m| !m.changes.all.is_empty() || m.pairing.is_some());
         let made = &made;
         let mut clients: Vec<(&mut Viewer, &Vec<u8>)> = viewers.iter_mut().zip(&*flags).collect();
-        horizon_threads::par_chunks_mut(&mut clients, 4, |part| {
+        crate::parallel::par_chunks_mut(&mut clients, 4, |part| {
             for (v, flags) in part {
                 for m in made {
                     let f = flags[m.index];
