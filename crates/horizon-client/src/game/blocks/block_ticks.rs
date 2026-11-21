@@ -343,7 +343,7 @@ impl Game<'_> {
                     let chunks = &level.world.chunks;
                     level.random_tick_sections.prepare_masks(
                         &scratch.ticking,
-                        |key| chunks.get(&key).cloned(),
+                        |key| chunks.get(&key),
                         level.facts,
                         &|id| b.random_tick_candidate(BlockStateId(id)),
                     );

@@ -280,10 +280,15 @@ impl RandomTickSections {
     /// blocks now (`chunk_of`), so the random tick loop finds them built. A mask only tells the loop
     /// which drawn blocks to read: the draws and the ticks are the same either way, and an edit
     /// before the loop reaches a section drops its mask as usual.
-    pub fn prepare_masks(
+    ///
+    /// `chunk_of` lends each chunk from the caller's map, which does not change while this runs.
+    /// A clone of each one's `Arc` was a locked count up and down on the chunk's own cache line
+    /// for every ticking chunk of every tick, most of them with every mask built already (their
+    /// blocks are not read here then), and each locked count held up the reads after it.
+    pub fn prepare_masks<'c>(
         &mut self,
         keys: &[(i32, i32)],
-        chunk_of: impl Fn((i32, i32)) -> Option<Arc<Chunk>>,
+        chunk_of: impl Fn((i32, i32)) -> Option<&'c Arc<Chunk>>,
         facts: &BlockFacts,
         candidate: &(impl Fn(u32) -> bool + Sync),
     ) {
@@ -291,22 +296,23 @@ impl RandomTickSections {
         self.prepare_masks_with(keys, chunk_of, random, candidate);
     }
     /// [`Self::prepare_masks`], `random` telling the states that tick randomly.
-    fn prepare_masks_with(
+    fn prepare_masks_with<'c>(
         &mut self,
         keys: &[(i32, i32)],
-        chunk_of: impl Fn((i32, i32)) -> Option<Arc<Chunk>>,
+        chunk_of: impl Fn((i32, i32)) -> Option<&'c Arc<Chunk>>,
         mut random: impl FnMut(u32) -> bool,
         candidate: &(impl Fn(u32) -> bool + Sync),
     ) {
-        let mut todo: Vec<((i32, i32), usize, Arc<Chunk>)> = Vec::new();
+        // The sections without a mask, each with its chunk as lent.
+        let mut todo: Vec<((i32, i32), usize, &'c Chunk)> = Vec::new();
         for &key in keys {
             let Some(chunk) = chunk_of(key) else {
                 continue;
             };
-            let cached = Self::refresh(&mut self.chunks, key, &chunk, &mut random);
+            let cached = Self::refresh(&mut self.chunks, key, chunk, &mut random);
             for i in cached.sections.mask.iter() {
                 if !cached.masks.built.contains(i) {
-                    todo.push((key, i, Arc::clone(&chunk)));
+                    todo.push((key, i, &**chunk));
                 }
             }
         }
@@ -819,7 +825,7 @@ mod tests {
         assert_eq!(held.map(|m| m.may_tick(hole)), Some(true));
         // Built ahead, all at once; a chunk that is not there is passed over.
         let mut ahead = RandomTickSections::default();
-        let chunk_of = |key: (i32, i32)| (key == (0, 0)).then(|| chunk.clone());
+        let chunk_of = |key: (i32, i32)| (key == (0, 0)).then_some(&chunk);
         ahead.prepare_masks_with(&[(0, 0), (5, 5)], chunk_of, ticks, &ticks);
         assert_eq!(layout(&ahead, &chunk), (vec![1, 4, 6, 9], true));
         for y in ticking {
@@ -845,6 +851,77 @@ mod tests {
             from = y + 16;
         }
         assert_eq!(ys, ticking);
+    }
+
+    /// Masks prepared from lent chunks are the ones a walk of each chunk builds, and only the
+    /// sections without one are built: over new chunks, a chunk walked already (its table is
+    /// kept as it was), one edited since its walk and a key with no chunk, each key is asked for
+    /// once, and every chunk is still counted by its map alone.
+    #[test]
+    fn masks_prepared_from_lent_chunks_are_the_ones_a_walk_builds() {
+        let ticks = |id: u32| id % 3 == 1;
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut chunks: FxHashMap<(i32, i32), Arc<Chunk>> = FxHashMap::default();
+        for cx in 0..4 {
+            let shift = cx as usize;
+            let scattered: [u32; 4096] = std::array::from_fn(|_| next() % 8);
+            let layer: [u32; 4096] = std::array::from_fn(|i| if i >> 8 == 3 { 4 } else { 3 });
+            let global: [u32; 4096] = std::array::from_fn(|i| (i % 300) as u32);
+            let mut chunk = Chunk::empty(cx, 0);
+            // A list palette, a ticking layer, one ticking state, one that does not tick and a
+            // global palette, the first two and the last in other sections in each chunk.
+            for (i, states) in [
+                (1 + shift, &scattered),
+                (5 + shift, &layer),
+                (9, &[1; 4096]),
+                (10, &[3; 4096]),
+                (12 + shift, &global),
+            ] {
+                Arc::make_mut(&mut chunk.sections[i]).blocks = Section::from_blocks(states);
+            }
+            chunks.insert((cx, 0), Arc::new(chunk));
+        }
+        // Every ticking section's mask, built at its first ask from the bottom up.
+        let walk = |cache: &mut RandomTickSections, key: (i32, i32), chunk: &Arc<Chunk>| {
+            let mut from = MIN_Y;
+            while let Some((y, mask)) = cache.next_masked_with(key, chunk, ticks, ticks, from) {
+                assert!(mask.is_some(), "a mask at {y} of {key:?}");
+                from = y + 16;
+            }
+        };
+        let mut ahead = RandomTickSections::default();
+        walk(&mut ahead, (1, 0), &chunks[&(1, 0)]);
+        walk(&mut ahead, (2, 0), &chunks[&(2, 0)]);
+        let kept = ahead.chunks[&(1, 0)].masks.table.clone();
+        // Chunk 2's empty section 20 gets a ticking block after its walk.
+        let edited = chunks.get_mut(&(2, 0)).unwrap();
+        Arc::make_mut(edited).set(5, MIN_Y + 20 * 16 + 3, 9, 1);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let keys = [(0, 0), (1, 0), (2, 0), (3, 0), (7, 7)];
+        let chunk_of = |key: (i32, i32)| {
+            asked.borrow_mut().push(key);
+            chunks.get(&key)
+        };
+        ahead.prepare_masks_with(&keys, chunk_of, ticks, &ticks);
+        assert_eq!(*asked.borrow(), keys);
+        let table = ahead.chunks[&(1, 0)].masks.table.clone();
+        assert!(matches!((&kept, &table), (Some(a), Some(b)) if Rc::ptr_eq(a, b)));
+        assert!(!ahead.chunks.contains_key(&(7, 7)));
+        assert!(ahead.chunks[&(2, 0)].masks.built.contains(20));
+        for (key, chunk) in &chunks {
+            let mut walked = RandomTickSections::default();
+            walk(&mut walked, *key, chunk);
+            let (prepared, built) = (&ahead.chunks[key].masks, &walked.chunks[key].masks);
+            assert_eq!(prepared.built, built.built, "{key:?}");
+            assert_eq!(prepared.table.as_deref(), built.table.as_deref(), "{key:?}");
+            assert_eq!(Arc::strong_count(chunk), 1, "{key:?}");
+        }
     }
 }
 
@@ -1129,12 +1206,7 @@ mod tick_parity {
             }
             let keys = lit(&prepared);
             let candidate = |id| behaviours.random_tick_candidate(BlockStateId(id));
-            prep_cache.prepare_masks(
-                &keys,
-                |key| prepared.chunks.get(&key).cloned(),
-                &facts,
-                &candidate,
-            );
+            prep_cache.prepare_masks(&keys, |key| prepared.chunks.get(&key), &facts, &candidate);
             for &(x, z) in &keys {
                 // Every ticking section's mask is there before the tick asks.
                 let now = prepared.chunks[&(x, z)].clone();
