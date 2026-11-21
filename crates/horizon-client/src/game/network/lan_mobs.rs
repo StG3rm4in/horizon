@@ -195,6 +195,10 @@ impl Game<'_> {
                 (g.conn, g.uuid, moved)
             })
             .collect();
+        // Each guest's turn starts from the other players' bodies (`enter_guest_at`): built once
+        // for these turns and refreshed as each ends, as `tick_guests` keeps them for its own,
+        // rather than built afresh from every guest for each turn.
+        let _bodies = super::lan_actions::building_cache_for_turns(self.lan.as_ref());
         let mut views = Vec::new();
         for (conn, uuid, moved) in conns {
             if let Some(Some(v)) = self.as_guest(conn, |g| g.player_view()) {

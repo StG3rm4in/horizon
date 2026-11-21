@@ -1542,6 +1542,15 @@ struct Game<'a> {
     /// The yaw and pitch a native mod's camera drew the last frame from (`native_camera_pose`),
     /// none when it drew from vanilla's.
     posed_rotation: Option<(f32, f32)>,
+    /// The roll, in degrees, a native mod's camera drew the last frame with (`native_camera_roll`),
+    /// 0 when none rolled it.
+    posed_roll: f32,
+    /// Roll already resolved by `render_sequence_frame` for the next `render_frame` call so
+    /// sequence validation and rendering share one `camera_roll` dispatch.
+    sequence_frame_roll: Option<f32>,
+    /// Set by `render_sequence_frame` for its `sequence_scene` call: the frame about to be
+    /// drawn, and whether mods are asked for its roll.
+    sequence_frame_asks: Option<bool>,
     /// `LocalPlayer.postEffects`: the chains the server has the screen run
     /// (`ClientboundPostEffectsPacket`), in order.
     post_effects: Vec<String>,
@@ -1688,7 +1697,7 @@ struct Game<'a> {
     /// This play session's frame and tick times, for opt-in performance statistics.
     perf: horizon_client::telemetry::Session,
     /// Control replies waiting for a rendered frame or a benchmark deadline.
-    pending_screenshot: Option<std::sync::mpsc::Sender<String>>,
+    pending_screenshot: Option<pending_screenshot::Pending>,
     /// `screenshot-sequence` while it runs.
     screenshot_sequence: Option<screenshot_sequence::Sequence>,
     /// `render-capture DIR`: replied once the renderer wrote the scene.
@@ -2175,6 +2184,16 @@ fn camera_rotation(
         -view_pitch.to_radians(),
         0.0,
     )
+}
+/// `Camera.setRotation(yaw, pitch, roll)`'s last turn, `rotationYXZ`'s `-roll`, on a camera
+/// rotation: what a mod's roll (`native_camera_roll`) does to what faces the camera. The
+/// conjugate is `camera::view_roll(roll)` in front of the view.
+fn rolled_camera(rotation: glam::Quat, roll: f32) -> glam::Quat {
+    if roll == 0.0 {
+        rotation
+    } else {
+        rotation * glam::Quat::from_rotation_z(-roll.to_radians())
+    }
 }
 impl Game<'_> {
     /// `Level.canHaveWeather`, from the level's dimension type (sky light, no
@@ -5212,13 +5231,14 @@ impl Game<'_> {
                 self.studio.freecam.pitch,
             ) * glam::Quat::from_rotation_z(self.studio.freecam.roll.to_radians());
         }
-        match self.posed_rotation {
+        let rotation = match self.posed_rotation {
             // The frame's camera, already turned round in front view.
             Some((yaw, pitch)) => {
                 camera_rotation(horizon_client::camera::CameraType::FirstPerson, yaw, pitch)
             }
             None => camera_rotation(self.camera_type, self.yaw, self.pitch),
-        }
+        };
+        rolled_camera(rotation, self.posed_roll)
     }
     /// `mark_motion` ids of entities that aren't mobs or dropped items (boats, minecarts, armor
     /// stands, item frames, paintings, primed TNT, falling blocks, rockets, tridents, thrown
@@ -8061,13 +8081,20 @@ impl Game<'_> {
         let camera_alpha = self.clock.camera_fraction();
         self.apply_requested_camera_type();
         let vanilla = self.camera_view(camera_alpha as f32);
+        let mod_camera = !self.shows_panorama() && !self.studio.flying();
         let view = vanilla.map(|view| {
-            if self.shows_panorama() || self.studio.flying() {
-                view
-            } else {
+            if mod_camera {
                 self.native_camera_pose_now(camera_alpha as f32, view)
+            } else {
+                view
             }
         });
+        let sequence_roll = self.sequence_frame_roll.take();
+        self.posed_roll = if mod_camera && view.is_some() {
+            sequence_roll.unwrap_or_else(|| self.native_camera_roll_now(camera_alpha as f32))
+        } else {
+            0.0
+        };
         // What faces the camera (particles, item sprites, block entity text) faces a mod's.
         // A spectated entity's view is not the local player's yaw and pitch
         // (`Camera.setup` reads the camera entity), so it is kept too.
@@ -8274,6 +8301,13 @@ impl Game<'_> {
         ) {
             let scale = HudBatch::new(size, self.settings.gui_scale_inputs()).scale;
             crosshair.debug_crosshair(at, view_pitch, view_yaw, scale);
+            // Its pass draws with the view alone, no pose: a mod's roll turns the axes about
+            // the view direction instead, so they turn with the world.
+            if self.posed_roll != 0.0 {
+                let turn =
+                    view.inverse() * horizon_client::camera::view_roll(self.posed_roll) * view;
+                crosshair.turn_on_top(at, turn.as_dmat4());
+            }
         }
         let debug_lines = horizon_client::gizmos::camera_relative(&lines, at, view);
         let debug_lines_on_top = horizon_client::gizmos::camera_relative(&on_top, at, view);
@@ -8388,6 +8422,15 @@ impl Game<'_> {
             glam::Mat4::IDENTITY
         } else {
             self.spinning_matrix(camera_alpha as f32)
+        };
+        // A mod's roll turns the camera itself (NeoForge's ComputeCameraAngles roll), so it sits
+        // last in the pose, right in front of the view rotation: the world, its culling, the
+        // sky, the packs' model-view and `Camera.view` all read `bob * spin`. The hand takes
+        // `bob` alone and stays level. Not gated by `camera_effects` or Distortion Effects.
+        let spin = if self.posed_roll == 0.0 {
+            spin
+        } else {
+            spin * horizon_client::camera::view_roll(self.posed_roll)
         };
         let terrain_distance = self.terrain_distance();
         let distance = (terrain_distance * 16) as f32;
@@ -9022,6 +9065,7 @@ impl Game<'_> {
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Escape))
         {
+            self.displace_pending_replay(mod_api::ReplayError::Unavailable);
             self.pending_entry = None;
             self.perf.cancel_world_opening();
             return;
@@ -9359,8 +9403,6 @@ impl Game<'_> {
                         }
                     }
                 }
-                WindowEvent::MouseWheel { .. }
-                    if self.screen == Screen::Playing && self.replay.driver.is_some() => {}
                 WindowEvent::MouseWheel { delta, .. } => {
                     let (raw_x, raw_y) = match delta {
                         MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
@@ -10246,9 +10288,9 @@ impl Game<'_> {
                             }
                         });
                     if let Some(result) = &finished
-                        && let Some(reply) = self.pending_screenshot.take()
+                        && let Some(pending) = self.pending_screenshot.take()
                     {
-                        let _ = reply.send(
+                        let _ = pending.reply.send(
                             match result {
                                 Ok([w, h]) => {
                                     serde_json::json!({ "ok": true, "width": w, "height": h })
@@ -10785,6 +10827,9 @@ impl<'a> Game<'a> {
             locator_camera: None,
             native_camera_frame: None,
             posed_rotation: None,
+            posed_roll: 0.0,
+            sequence_frame_roll: None,
+            sequence_frame_asks: None,
             post_effects: Vec::new(),
             polytone_post_ticks: 0.0,
             spectated_post_effect: None,
@@ -11600,6 +11645,10 @@ mod sign_chain_tests;
 #[cfg(test)]
 #[path = "game/interface/tests/sign_use_tests.rs"]
 mod sign_use_tests;
+
+#[cfg(test)]
+#[path = "game/interface/tests/camera_roll_tests.rs"]
+mod camera_roll_tests;
 
 /// For each block state, whether its block entity draws off screen (1: beacons, end gateways,
 /// structure and test instance blocks, `BlockEntityRenderer.shouldRenderOffScreen`) and far

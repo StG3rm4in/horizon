@@ -181,9 +181,11 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     fn mod_rules(&self, fluid: ModFluid, pos: BlockPos) -> ModFluidRules {
         self.level.mod_fluid_rules(pos, fluid, fluid.get().rules)
     }
-    /// `Fluid.getTickDelay`.
+    /// `Fluid.getTickDelay`. Only lava's reads the dimension type (`LavaFluid.getTickDelay`),
+    /// which is a lock and a hashed look-up of the level's key: water's does not ask for it.
     pub(crate) fn fluid_tick_delay(&self, kind: FluidKind, pos: BlockPos) -> i32 {
-        fluid_tick_delay(kind, self.fast_lava(), || {
+        let lava = matches!(kind, FluidKind::Lava | FluidKind::FlowingLava);
+        fluid_tick_delay(kind, lava && self.fast_lava(), || {
             kind.mod_fluid().map(|fluid| self.mod_rules(fluid, pos))
         })
     }
@@ -752,7 +754,12 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     }
     /// `FlowingFluid.tick` for the fluid at `pos`.
     pub(crate) fn fluid_tick(&mut self, pos: BlockPos) {
-        let mut state = self.state(pos);
+        let state = self.state(pos);
+        self.fluid_tick_of(pos, state);
+    }
+    /// [`Self::fluid_tick`] for `state`, the block at `pos` now: a due tick has just read it to
+    /// check that the tick's fluid is still there, and nothing has been written since.
+    pub(crate) fn fluid_tick_of(&mut self, pos: BlockPos, mut state: BlockStateId) {
         // Asked before the fluid tick hook as well as after it, as in `tick_due_block`: the hook
         // is dispatched and may cancel either way.
         let suppressed = self.level.template_suppressed(state);

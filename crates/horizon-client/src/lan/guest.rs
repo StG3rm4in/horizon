@@ -198,6 +198,9 @@ pub struct Guest {
     /// A disconnect was started ([`Guest::begin_disconnect`]); the connection closes when the
     /// server next polls it, and until then no other disconnect is sent.
     pub disconnect_pending: bool,
+    /// The mods are hearing `player_leaving` for this guest right now; a disconnect asked for
+    /// inside the hook is refused, as one is while [`Guest::disconnect_pending`].
+    pub leaving: bool,
     /// A mod's personal sidebar is on this client (`Game::native_sidebar`); it is gone with the
     /// connection.
     pub personal_sidebar: bool,
@@ -527,6 +530,11 @@ pub struct Guest {
     /// saves neither its player file nor its records, since the other server has the
     /// player now.
     pub released: bool,
+    /// The hand-overs of this player that were started (`player-export ... freeze`) and not
+    /// settled by a release. One outlives its freeze, which runs out on its own: the destination
+    /// may have committed in the meantime, so while any is unsettled the mods' `player_leaving`
+    /// is not heard for them. A successful `abort` settles its own hand-over only.
+    pub transfer_unresolved: Vec<u128>,
     /// Root command names the mods took out of this player's command tree
     /// (`native_player_commands_sent`); their tree is sent without them.
     pub hidden_commands: Vec<String>,
@@ -724,6 +732,7 @@ impl Guest {
             left_reason: String::new(),
             pending_move: None,
             disconnect_pending: false,
+            leaving: false,
             personal_sidebar: false,
             uuid: j.uuid,
             name: j.name,
@@ -875,6 +884,7 @@ impl Guest {
             arrival_recentered: false,
             quiet_leave: false,
             released: false,
+            transfer_unresolved: Vec::new(),
             hidden_commands: Vec::new(),
             abilities: Default::default(),
             dimension: "minecraft:overworld".into(),
@@ -915,6 +925,31 @@ impl Guest {
                 .sent(p.id, std::time::Instant::now());
         }
         match packet.try_encode() {
+            Ok(body) => self.sender.send(body),
+            Err(error) => eprintln!("[lan] send refused: {error}"),
+        }
+    }
+    /// [`Self::send`] of a packet encoded already (`encoded` is `packet.try_encode()`, made on
+    /// another thread for one): the record and the pings hear of the packet, and its body goes
+    /// to the connection, as `send` does. Keep the two alike.
+    pub fn send_encoded(
+        &self,
+        packet: &play::Clientbound,
+        encoded: horizon_protocol::Result<Vec<u8>>,
+    ) {
+        if !self.participates_online() {
+            return;
+        }
+        if self.record.is_some() {
+            self.note_change(packet);
+        }
+        if let play::Clientbound::Ping(p) = packet {
+            self.pings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sent(p.id, std::time::Instant::now());
+        }
+        match encoded {
             Ok(body) => self.sender.send(body),
             Err(error) => eprintln!("[lan] send refused: {error}"),
         }
@@ -3391,5 +3426,85 @@ mod tests {
         assert_eq!(guest.menu_sent[39].as_ref().map(|s| s.count), Some(63));
         guest.inventory[3].as_mut().unwrap().count = 64;
         assert_ne!(guest.menu_sent[39], guest.menu_slot(39));
+    }
+
+    /// A packet encoded ahead goes out as `send` sends it: the same bytes in the same order,
+    /// the ping noted alike, and nothing at all for a guest that is not online.
+    #[test]
+    fn a_packet_encoded_ahead_is_sent_as_send_sends_it() {
+        use horizon_protocol::packets::{
+            configuration::Ping,
+            play::{EntityEvent, SetEntityMotion, TrackedWaypoint, WaypointId, WaypointTarget},
+        };
+        let guest = |tx| {
+            Guest::new(
+                Joined {
+                    conn: 1,
+                    uuid: 1,
+                    name: "Ahead".into(),
+                    properties: Vec::new(),
+                    info: ClientInformation::new(8),
+                    brand: String::new(),
+                    sender: PlayerSender::new(tx, Arc::default()),
+                    latency: Arc::new(AtomicI32::new(0)),
+                    address: "127.0.0.1:1".parse().unwrap(),
+                    expected: false,
+                },
+                1,
+                [0.5, 64.0, 0.5],
+                10,
+            )
+        };
+        let bodies = |rx: &std::sync::mpsc::Receiver<crate::lan::Out>| -> Vec<Vec<u8>> {
+            rx.try_iter()
+                .flat_map(|out| match out {
+                    crate::lan::Out::Packet(body) => vec![body],
+                    crate::lan::Out::Packets(bodies) => bodies,
+                    crate::lan::Out::Disconnect(_) => panic!("unexpected disconnect"),
+                })
+                .collect()
+        };
+        let packets = [
+            play::Clientbound::TrackedWaypoint(TrackedWaypoint {
+                operation: 2,
+                id: WaypointId::Uuid(0x1234_5678),
+                style: "minecraft:default".into(),
+                color: Some(0x55FF55),
+                target: WaypointTarget::Block([3, 70, -9]),
+            }),
+            play::Clientbound::EntityEvent(EntityEvent { id: 4, event: 3 }),
+            play::Clientbound::Ping(Ping { id: 9 }),
+            play::Clientbound::SetEntityMotion(SetEntityMotion {
+                id: 1,
+                velocity: [0.25, -0.5, 0.0],
+            }),
+            play::Clientbound::TrackedWaypoint(TrackedWaypoint {
+                operation: 1,
+                id: WaypointId::Uuid(7),
+                style: "minecraft:bowtie".into(),
+                color: None,
+                target: WaypointTarget::Azimuth(1.25),
+            }),
+        ];
+        let (tx, sent_rx) = std::sync::mpsc::channel();
+        let sent = guest(tx);
+        let (tx, ahead_rx) = std::sync::mpsc::channel();
+        let ahead = guest(tx);
+        let (tx, offline_rx) = std::sync::mpsc::channel();
+        let mut offline = guest(tx);
+        offline.kind = GuestKind::Fake;
+        // Encoded first, all of them, as the waypoints' helpers do.
+        let encoded: Vec<_> = packets.iter().map(play::Clientbound::try_encode).collect();
+        for (p, body) in packets.iter().zip(encoded) {
+            sent.send(p);
+            offline.send_encoded(p, p.try_encode());
+            ahead.send_encoded(p, body);
+        }
+        let sent_bodies = bodies(&sent_rx);
+        assert_eq!(sent_bodies.len(), packets.len());
+        assert_eq!(sent_bodies, bodies(&ahead_rx));
+        assert!(bodies(&offline_rx).is_empty());
+        let pings = |g: &Guest| g.pings.lock().unwrap().len();
+        assert_eq!((pings(&sent), pings(&ahead), pings(&offline)), (1, 1, 0));
     }
 }

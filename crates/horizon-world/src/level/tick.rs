@@ -321,7 +321,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
         horizon_threads::work::set_block(self.b.block(state).0);
         if TickTypeId(self.b.fluid(state).kind().tick_id()) == tick.kind {
-            self.fluid_tick(tick.pos);
+            self.fluid_tick_of(tick.pos, state);
         }
     }
 

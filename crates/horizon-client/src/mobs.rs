@@ -2734,6 +2734,8 @@ impl Mob {
     #[inline]
     pub fn seen(&self, _player: Option<[i32; 4]>, items: &crate::items::Items) -> Seen {
         let (m, villager) = (self, self.species() == Species::Villager);
+        // The box, the hitbox and the eyes from one `dims()`: each would work it out again.
+        let (bounds, eye_y) = m.bounds_and_eye_y();
         Seen {
             kind: Arc::clone(&m.kind),
             in_water: self.fluids.in_water,
@@ -2742,9 +2744,9 @@ impl Mob {
             id: m.id,
             species: m.species(),
             position: m.position,
-            bounds: m.bounds(),
-            hitbox: m.hitbox(),
-            eye_y: m.eye_y(),
+            bounds,
+            hitbox: m.hitbox_of(bounds),
+            eye_y,
             alive: m.alive(),
             removed: m.removed,
             invulnerable: m.is_invulnerable(),
@@ -2832,6 +2834,19 @@ impl Mob {
             _ => "misc",
         }
     }
+}
+/// The box of a mob of dimensions `(width, height, _)` with its feet at `position`
+/// (`Entity.makeBoundingBox` of `EntityDimensions`, which are floats).
+fn box_of(position: Vec3, (width, height, _): (f64, f64, f64)) -> Aabb {
+    let w = f64::from(width as f32) / 2.0;
+    Aabb::new(
+        Vec3::new(position.x - w, position.y, position.z - w),
+        Vec3::new(
+            position.x + w,
+            position.y + f64::from(height as f32),
+            position.z + w,
+        ),
+    )
 }
 /// `Entity.push` on other mobs acts at once in vanilla: a mob ticking later
 /// moves with it this tick. Takes the `Push` events aimed at mobs out of
@@ -3819,7 +3834,11 @@ impl Mob {
     /// `LivingEntity.getHitbox`: a rider's box starts no lower than its seat
     /// (`vehicle.getPassengerRidingPosition(this).y`).
     pub fn hitbox(&self) -> Aabb {
-        let b = self.bounds();
+        self.hitbox_of(self.bounds())
+    }
+    /// [`Self::hitbox`] of the mob's box `b` ([`Self::bounds`]), already worked out.
+    #[inline]
+    pub fn hitbox_of(&self, b: Aabb) -> Aabb {
         match self.extra.seat.filter(|s| self.mount == Some(s.0)) {
             Some((_, offset, _)) => {
                 let (lo, hi) = (b.min_position(), b.max_position());
@@ -3849,6 +3868,15 @@ impl Mob {
     pub fn bounds(&self) -> Aabb {
         self.bounds_at(self.position)
     }
+    /// [`Self::bounds`] and [`Self::eye_y`] from one `dims()`, for the snapshot that takes both.
+    pub fn bounds_and_eye_y(&self) -> (Aabb, f64) {
+        let dims = self.dims();
+        let eye_y = self.position.y + dims.2;
+        if self.kind.species == Species::Shulker {
+            return (shulker::bounds_at(self, self.position), eye_y);
+        }
+        (box_of(self.position, dims), eye_y)
+    }
     /// `Entity.makeBoundingBox(position)`.
     pub fn bounds_at(&self, position: Vec3) -> Aabb {
         // Shulker.makeBoundingBox: the lid's lift, not the dimensions.
@@ -3857,16 +3885,7 @@ impl Mob {
         }
         // `width()` and `height()` in one `dims()`: every box asked for (each
         // collision, push and cart test) read the whole size twice.
-        let (width, height, _) = self.dims();
-        let w = f64::from(width as f32) / 2.0;
-        Aabb::new(
-            Vec3::new(position.x - w, position.y, position.z - w),
-            Vec3::new(
-                position.x + w,
-                position.y + f64::from(height as f32),
-                position.z + w,
-            ),
-        )
+        box_of(position, self.dims())
     }
     /// `CombatTracker.recordDamage`: a hit that took `damage` health, with
     /// the fall it ends.
@@ -6444,6 +6463,76 @@ mod totem_tests {
             Some("minecraft:totem_of_undying"),
             "the totem is still in the mouth"
         );
+    }
+}
+#[cfg(test)]
+mod seen_box_tests {
+    use super::*;
+
+    /// The snapshot's box, hitbox and eyes, from one `dims()`, are the mob's own `bounds()`,
+    /// `hitbox()` and `eye_y()`, to the bit: for species whose boxes follow their state, at
+    /// several sizes, scales and poses, seated on a vehicle, then no longer on it.
+    #[test]
+    fn a_snapshot_has_the_mobs_own_box_hitbox_and_eyes() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
+        if !root.join("entity-types.json").exists() {
+            return;
+        }
+        let types =
+            MobTypes::load_for_server(&root, &MobTypes::root_catalog(&root).unwrap()).unwrap();
+        let bits = |b: Aabb| {
+            let (lo, hi) = (b.min_position(), b.max_position());
+            [lo.x, lo.y, lo.z, hi.x, hi.y, hi.z].map(f64::to_bits)
+        };
+        let items = crate::items::Items::empty();
+        let vehicle = Aabb::new(Vec3::new(3.0, 64.0, -8.0), Vec3::new(4.0, 65.0, -7.0));
+        let ids = [
+            "cow",
+            "zombie",
+            "shulker",
+            "slime",
+            "pufferfish",
+            "phantom",
+            "goat",
+            "camel",
+            "villager",
+            "salmon",
+            "polar_bear",
+            "sniffer",
+        ];
+        let mut checked = 0;
+        for id in ids {
+            let kind = Arc::new(
+                types
+                    .types
+                    .get(&format!("minecraft:{id}"))
+                    .expect(id)
+                    .clone(),
+            );
+            for (size, scale, pose, seat) in [
+                (0, 0.0, 0, None),
+                (3, 1.5, 7, Some(0.4)),
+                (1, 0.5, 1, Some(-2.0)),
+                (2, 0.0, 5, Some(0.0)),
+            ] {
+                let mut m = Mob::new(1, Arc::clone(&kind), Vec3::new(3.25, 64.5, -7.75), 0.0);
+                (m.extra.size, m.extra.model_scale, m.extra.pose) = (size, scale, pose);
+                if let Some(offset) = seat {
+                    m.mount = Some(9);
+                    m.seated(9, offset, vehicle);
+                }
+                let seen = m.seen(None, &items);
+                assert_eq!(bits(seen.bounds), bits(m.bounds()), "{id}");
+                assert_eq!(bits(seen.hitbox), bits(m.hitbox()), "{id}");
+                assert_eq!(seen.eye_y.to_bits(), m.eye_y().to_bits(), "{id}");
+                m.mount = None;
+                assert_eq!(bits(m.seen(None, &items).hitbox), bits(m.hitbox()), "{id}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 4 * ids.len());
     }
 }
 #[cfg(test)]

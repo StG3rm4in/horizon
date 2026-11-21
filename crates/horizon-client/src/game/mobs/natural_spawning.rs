@@ -79,6 +79,11 @@ pub(super) struct SpawnScratch {
     stale: Vec<bool>,
     /// The spawn state's allocations, reused across passes.
     spawn_buffers: SpawnBuffers,
+    /// The grid of the mobs' boxes the last serial pass built, which the next fills again
+    /// ([`MobBoxes::refill`]), and the map of kept structure starts, emptied after each pass:
+    /// their allocations, reused rather than made anew every tick.
+    boxes: MobBoxes,
+    structure_starts: KeptStarts,
 }
 impl SpawnScratch {
     fn chunk(p: &LevelPlayer) -> (i32, i32) {
@@ -494,6 +499,8 @@ pub(super) struct SpawnHost<'g> {
 /// The structure starts a level keeps, by chunk and category ([`Level::structure_starts`]).
 type KeptStarts =
     horizon_client::fast_hash::FxHashMap<((i32, i32), Category), super::structures::ChunkStarts>;
+/// A chunk position and the chunk loaded there, if one is ([`Level::chunk_at`]).
+type KeptChunk<'g> = ((i32, i32), Option<&'g horizon_client::chunk::Chunk>);
 /// The game level as natural spawning reads it.
 pub(super) type GameLevel<'g, 'a> = Level<'g, &'g Game<'a>>;
 pub(super) struct Level<'g, H> {
@@ -507,6 +514,11 @@ pub(super) struct Level<'g, H> {
     #[cfg_attr(not(feature = "upstream-parallel-mobs"), allow(dead_code))]
     pub(super) shared_chickens: Option<&'g [(u32, Aabb)]>,
     pub(super) w: MobWorld<'g>,
+    /// The chunk the level's reads last looked up in the world's map: a spawn start reads its
+    /// chunk's surface and first block, and an attempt's blocks and light lie in its own chunk,
+    /// which each read looked up again. The map does not change while the level borrows the
+    /// world.
+    last_chunk: std::cell::Cell<Option<KeptChunk<'g>>>,
     /// Every player in the level ([`Game::level_players`]).
     pub(super) players: Vec<LevelPlayer>,
     /// Where the non-spectators among them are (`getNearestPlayer`).
@@ -576,11 +588,20 @@ fn mob_box(i: usize, m: &Mob) -> MobBox {
     )
 }
 /// The boxes of the game's mobs not removed, and a grid over them.
+#[derive(Default)]
 pub(super) struct MobBoxes {
     entries: Vec<MobBox>,
     grid: SeenGrid,
 }
 impl MobBoxes {
+    /// [`Self::new`] in place, over the allocations of the boxes this held before: the entries
+    /// and the grid a new one of `mobs` would have.
+    fn refill(&mut self, mobs: &[Mob]) {
+        self.entries.clear();
+        let live = mobs.iter().enumerate().filter(|(_, m)| !m.removed);
+        self.entries.extend(live.map(|(i, m)| mob_box(i, m)));
+        self.grid.refill(self.entries.iter().map(|e| e.1));
+    }
     fn new(mobs: &[Mob]) -> Self {
         let entries: Vec<_> = mobs
             .iter()
@@ -628,10 +649,14 @@ impl<H: LevelHost> Level<'_, H> {
     /// Builds the grid of the game's mobs now, for a pass that will ask so many box queries that
     /// the scans [`Self::mobs_near`] starts with would only add to the build (each works out
     /// every mob's box): a natural spawning pass over many chunks asks one for nearly every
-    /// attempt that finds room. The mobs do not change while the level holds the game.
-    fn build_boxes(&self) {
+    /// attempt that finds room. The mobs do not change while the level holds the game. The grid
+    /// is built in `kept`, one an earlier pass built, whose allocations are reused.
+    fn build_boxes(&self, mut kept: MobBoxes) {
         if self.shared_boxes.is_none() {
-            self.boxes.get_or_init(|| MobBoxes::new(self.game.mobs()));
+            self.boxes.get_or_init(|| {
+                kept.refill(self.game.mobs());
+                kept
+            });
         }
     }
     fn biome(&self, x: i32, y: i32, z: i32) -> Option<&BiomeInfo> {
@@ -676,6 +701,34 @@ impl<H: LevelHost> Level<'_, H> {
         let Checked { mob, .. } = self.checked.take()?;
         let at = [mob.position.x, mob.position.y, mob.position.z];
         (mob.kind.id == entity && at == position && mob.yaw == yaw).then_some(mob)
+    }
+}
+impl<'g, H: LevelHost> Level<'g, H> {
+    /// The chunk at (cx, cz) in the world's map (none where it isn't loaded), kept for the next
+    /// read of the same chunk ([`Self::last_chunk`]).
+    fn chunk_at(&self, cx: i32, cz: i32) -> Option<&'g horizon_client::chunk::Chunk> {
+        if let Some((at, chunk)) = self.last_chunk.get()
+            && at == (cx, cz)
+        {
+            return chunk;
+        }
+        let world = self.w.world;
+        let chunk = world.chunks.get(&(cx, cz)).map(|chunk| &**chunk);
+        self.last_chunk.set(Some(((cx, cz), chunk)));
+        chunk
+    }
+    /// `World::light` at a block, from the chunk [`Self::chunk_at`] finds.
+    fn light_at(&self, x: i32, y: i32, z: i32) -> u8 {
+        let chunk = self.chunk_at(x >> 4, z >> 4);
+        chunk.map_or(0xF0, |chunk| chunk.light(x & 15, y, z & 15))
+    }
+    /// `World::world_surface` with the block facts' air (the level's world view's surface),
+    /// from the chunk [`Self::chunk_at`] finds.
+    fn surface_at(&self, x: i32, z: i32) -> i32 {
+        let facts = self.w.facts;
+        (self.chunk_at(x >> 4, z >> 4)).map_or(self.w.world.bottom_y(), |chunk| {
+            chunk.world_surface(x, z, |v| facts.is_air(BlockStateId(v)))
+        })
     }
 }
 impl<'g, 'a> GameLevel<'g, 'a> {
@@ -861,8 +914,10 @@ impl<H: LevelHost> SpawnLevel for Level<'_, H> {
             .border
             .is_within_bounds(f64::from(x), f64::from(z), 0.0)
     }
+    // `World::block`, as the level's world view reads it, from the chunk `chunk_at` finds.
     fn state(&self, x: i32, y: i32, z: i32) -> BlockStateId {
-        self.w.state(x, y, z)
+        let chunk = self.chunk_at(x >> 4, z >> 4);
+        chunk.map_or(self.w.world.air, |chunk| chunk.block(x & 15, y, z & 15))
     }
     fn facts(&self) -> &BlockFacts {
         self.w.facts
@@ -883,10 +938,10 @@ impl<H: LevelHost> SpawnLevel for Level<'_, H> {
         self.w.data.biome_has(tag.trim_start_matches('#'), name)
     }
     fn sky_light(&self, x: i32, y: i32, z: i32) -> i32 {
-        self.w.sky_light(x, y, z)
+        self.w.sky_light_from(|| self.light_at(x, y, z))
     }
     fn block_light(&self, x: i32, y: i32, z: i32) -> i32 {
-        self.w.block_light(x, y, z)
+        MobWorld::block_light_from(self.light_at(x, y, z))
     }
     fn sky_darken(&self) -> i32 {
         SpawnLevel::sky_darken(&self.w)
@@ -898,7 +953,7 @@ impl<H: LevelHost> SpawnLevel for Level<'_, H> {
         self.w.sea_level()
     }
     fn world_surface(&self, x: i32, z: i32) -> i32 {
-        self.w.world_surface(x, z)
+        self.surface_at(x, z)
     }
     fn peaceful(&self) -> bool {
         self.w.peaceful()
@@ -1029,11 +1084,7 @@ impl<H: LevelHost> NaturalLevel for Level<'_, H> {
     ) -> Vec<StructureAt> {
         let chunk = (x >> 4, z >> 4);
         let world = self.w.world;
-        if world
-            .chunks
-            .get(&chunk)
-            .is_none_or(|c| c.structure_refs.is_empty())
-        {
+        if (self.chunk_at(chunk.0, chunk.1)).is_none_or(|c| c.structure_refs.is_empty()) {
             return Vec::new();
         }
         let mut kept = self.structure_starts.borrow_mut();
@@ -1069,7 +1120,7 @@ impl<H: LevelHost> NaturalLevel for Level<'_, H> {
     }
     /// `ServerLevel.canSpawnEntitiesInChunk`: the whole chunk is inside the border.
     fn can_spawn_in_chunk(&self, cx: i32, cz: i32) -> bool {
-        self.w.world.chunks.contains_key(&(cx, cz))
+        self.chunk_at(cx, cz).is_some()
             && self.within_world_border(cx << 4, cz << 4)
             && self.within_world_border((cx << 4).wrapping_add(15), (cz << 4).wrapping_add(15))
     }
@@ -1114,11 +1165,9 @@ impl<H: LevelHost> NaturalLevel for Level<'_, H> {
         // narrower than its chunks' column would read the column's bottom).
         let min_y = world.shape.min_y;
         if kind == Heightmap::WorldSurface {
-            return self.w.world_surface(x, z).max(min_y);
+            return self.surface_at(x, z).max(min_y);
         }
-        world
-            .chunks
-            .get(&(x >> 4, z >> 4))
+        (self.chunk_at(x >> 4, z >> 4))
             .and_then(|chunk| {
                 chunk.highest(world.air.0, |y| {
                     spawn_selection::heightmap_blocks(self, kind, x, y, z)
@@ -1224,6 +1273,7 @@ impl<'a> Game<'a> {
             shared_squares: None,
             shared_chickens: None,
             w: self.mob_world_base(&[]),
+            last_chunk: Default::default(),
             players,
             nearest,
             player_squares: Default::default(),
@@ -1501,7 +1551,9 @@ impl<'a> Game<'a> {
         let mut pending = Vec::new();
         let last_state;
         let extras = {
-            let level = self.natural_level();
+            let mut level = self.natural_level();
+            // The map of kept structure starts, which the last pass emptied.
+            *level.structure_starts.get_mut() = std::mem::take(&mut scratch.structure_starts);
             laps.lap("sn_level");
             let counted: Vec<Counted> = self
                 .mobs
@@ -1559,7 +1611,7 @@ impl<'a> Game<'a> {
             }
             if lanes.is_none() && !categories.is_empty() {
                 if scratch.candidates.len() >= GRID_FIRST_CHUNKS {
-                    level.build_boxes();
+                    level.build_boxes(std::mem::take(&mut scratch.boxes));
                 }
                 for chunk in scratch.candidates.drain(..) {
                     // ServerChunkCache.tickSpawningChunk gates the initial chunk too.
@@ -1586,6 +1638,13 @@ impl<'a> Game<'a> {
                 }
             }
             scratch.spawn_buffers = state.into_parts().1;
+            // The grid and the map of kept starts go back for the next pass, the starts emptied:
+            // they are this pass's alone.
+            if let Some(boxes) = level.boxes.take() {
+                scratch.boxes = boxes;
+            }
+            scratch.structure_starts = std::mem::take(level.structure_starts.get_mut());
+            scratch.structure_starts.clear();
             let created = std::mem::take(&mut *level.spawned.borrow_mut());
             let rides = std::mem::take(&mut *level.rides.borrow_mut());
             (created, rides)
@@ -3084,6 +3143,88 @@ mod tests {
         );
     }
 
+    /// The level's reads from the chunk it kept from its last read answer as the world's own
+    /// reads, whichever chunk was read before: blocks, the surface and the other heightmaps,
+    /// light, whether a chunk can spawn and whether it refers to a structure, in loaded chunks
+    /// read in turn, in unloaded ones, and above and below the column.
+    #[test]
+    #[ignore = "daily"]
+    fn reads_from_the_kept_chunk_answer_as_the_world() {
+        use super::super::native_entity_refs::tests::with_game;
+        with_game(|game| {
+            // Lit empty chunks -2..=4 on both axes (blocks -32..=79).
+            spawn_check_world(game, Vec3::new(0.5, 64.0, 0.5));
+            let registry = game.pack.assets.registry;
+            let states: Vec<BlockStateId> = [
+                "minecraft:stone",
+                "minecraft:water",
+                "minecraft:grass_block",
+                "minecraft:oak_leaves",
+            ]
+            .into_iter()
+            .filter_map(|name| registry.default_state(name))
+            .collect();
+            assert_eq!(states.len(), 4);
+            let mut seed = 0xD1B5_4A32_D192_ED03u64;
+            let mut next = |m: u64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % m
+            };
+            for _ in 0..8000 {
+                let (x, z) = (next(112) as i32 - 32, next(112) as i32 - 32);
+                let y = next(200) as i32 - 64;
+                game.world.set(x, y, z, states[next(4) as usize]).unwrap();
+            }
+            let level = game.natural_level();
+            let (world, facts) = (&game.world, game.res.facts());
+            let kinds = [
+                Heightmap::WorldSurface,
+                Heightmap::OceanFloor,
+                Heightmap::MotionBlocking,
+                Heightmap::MotionBlockingNoLeaves,
+            ];
+            let (mut x, mut y, mut z) = (0, 64, 0);
+            for step in 0..20_000 {
+                // Attempts wander a few blocks from a start; now and then the reads move to
+                // another chunk, loaded or not, at any height.
+                if step % 40 == 0 {
+                    (x, z) = (next(176) as i32 - 64, next(176) as i32 - 64);
+                    y = next(460) as i32 - 120;
+                } else {
+                    x += next(11) as i32 - 5;
+                    z += next(11) as i32 - 5;
+                }
+                let at = format!("{x} {y} {z}");
+                assert_eq!(SpawnLevel::state(&level, x, y, z), world.block(x, y, z), "{at}");
+                let surface = world.world_surface(x, z, |id| facts.is_air(id));
+                assert_eq!(SpawnLevel::world_surface(&level, x, z), surface, "{at}");
+                let sky = SpawnLevel::sky_light(&level.w, x, y, z);
+                assert_eq!(SpawnLevel::sky_light(&level, x, y, z), sky, "{at}");
+                let block = SpawnLevel::block_light(&level.w, x, y, z);
+                assert_eq!(SpawnLevel::block_light(&level, x, y, z), block, "{at}");
+                let (cx, cz) = (x >> 4, z >> 4);
+                let can = world.chunks.contains_key(&(cx, cz))
+                    && level.within_world_border(cx << 4, cz << 4)
+                    && level.within_world_border((cx << 4) + 15, (cz << 4) + 15);
+                assert_eq!(level.can_spawn_in_chunk(cx, cz), can, "{at}");
+                // No chunk here refers to a structure.
+                let wanted = |_: &str| true;
+                let reach = level.category_structures_at(Category::Monster, x, y, z, &wanted);
+                assert!(reach.is_empty(), "{at}");
+                if step % 10 == 0 {
+                    // A level of its own reads each chunk afresh.
+                    let fresh = game.natural_level();
+                    for kind in kinds {
+                        let height = fresh.heightmap(kind, x, z);
+                        assert_eq!(level.heightmap(kind, x, z), height, "{kind:?} at {at}");
+                    }
+                }
+            }
+        });
+    }
+
     /// The level's table of the biomes' spawn lists gives each biome's list for each category
     /// as the biome's own map does (past the table, plains'), and at each position the list of
     /// the biome `biome_spawns` finds there, in sections of one biome and of many, below, in and
@@ -3162,9 +3303,9 @@ mod tests {
         });
     }
 
-    /// A level that builds its mobs' grid before the first box query answers every query as one
-    /// that starts by scanning the mobs: room (the shulkers' solid boxes), obstruction and a
-    /// spawner's counts.
+    /// A level that builds its mobs' grid before the first box query, filling again a grid built
+    /// before over other mobs, answers every query as one that starts by scanning the mobs: room
+    /// (the shulkers' solid boxes), obstruction and a spawner's counts.
     #[test]
     #[ignore = "daily"]
     fn a_grid_built_first_answers_as_the_first_scans() {
@@ -3192,7 +3333,7 @@ mod tests {
             }
             assert!(game.mobs.len() >= 40, "{} mobs joined", game.mobs.len());
             let built = game.natural_level();
-            built.build_boxes();
+            built.build_boxes(MobBoxes::new(&game.mobs[..game.mobs.len() / 2]));
             let (mut asked, mut obstructed) = (0, 0);
             for _ in 0..300 {
                 // A fresh level for each box, whose queries all scan.

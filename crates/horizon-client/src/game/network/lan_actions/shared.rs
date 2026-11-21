@@ -381,6 +381,30 @@ pub(super) fn building_cache(host: Option<&LanHost>) {
     BUILDING_CACHE.with(|c| *c.borrow_mut() = bodies);
 }
 
+/// The hub's bodies built once for a run of guest turns outside `tick_guests` (the mobs' views
+/// of the guests, `Game::lan_guest_views`), as `tick_guests` builds them for its own: each turn
+/// starts from them, refreshed as every turn ends ([`refresh_building_player`]), which are the
+/// bodies it would build afresh. They are dropped with the guard, also when a turn panics.
+/// Inside `tick_guests`, whose bodies are built already, nothing is built and they stay.
+pub(super) fn building_cache_for_turns(host: Option<&LanHost>) -> Option<BuiltForTurns> {
+    let host = host?;
+    if BUILDING_CACHE.with(|c| c.borrow().is_some()) {
+        return None;
+    }
+    building_cache(Some(host));
+    Some(BuiltForTurns)
+}
+
+/// Drops the bodies [`building_cache_for_turns`] built.
+#[must_use = "the bodies are dropped with the guard"]
+pub(super) struct BuiltForTurns;
+
+impl Drop for BuiltForTurns {
+    fn drop(&mut self) {
+        building_cache(None);
+    }
+}
+
 /// The cached bodies as they are now in the hub, after `conn`'s turn (or its
 /// death step): every guest written since the last refresh, not only the
 /// actor, as a turn can move, kill or change another guest too (`/tp`, an

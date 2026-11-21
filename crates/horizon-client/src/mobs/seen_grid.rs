@@ -34,13 +34,29 @@ impl SeenGrid {
     /// The boxes of the snapshot's entries, in order.
     pub fn new(boxes: impl Iterator<Item = Aabb>) -> Self {
         let mut grid = Self::default();
+        grid.fill(boxes);
+        grid
+    }
+    /// [`Self::new`] over this grid's allocations, for the boxes of a snapshot taken again: a
+    /// column keeps its list's allocation while some box still has its corner there, and the
+    /// columns left with none are dropped, so the grid holds what a new one of `boxes` would.
+    pub fn refill(&mut self, boxes: impl Iterator<Item = Aabb>) {
+        for list in self.cells.values_mut() {
+            list.clear();
+        }
+        self.cell_of.clear();
+        (self.reach, self.entries) = (0.0, 0);
+        self.fill(boxes);
+        self.cells.retain(|_, list| !list.is_empty());
+    }
+    /// Adds `boxes` to a grid that holds no entry, as entries 0, 1, and so on.
+    fn fill(&mut self, boxes: impl Iterator<Item = Aabb>) {
         for (i, b) in boxes.enumerate() {
             let at = corner(b);
-            grid.reach = grid.reach.max(width(b));
-            grid.cells.entry(at).or_default().push(i as u32);
-            grid.cell_of.push(at);
+            self.reach = self.reach.max(width(b));
+            self.cells.entry(at).or_default().push(i as u32);
+            self.cell_of.push(at);
         }
-        grid
     }
     /// The widest box and the entries it has, for a grid of part of its entries that must meet
     /// the same entries in the same order (the server's parallel mob tick).
@@ -438,5 +454,50 @@ mod tests {
             }
         }
         assert!(scanned > 0 && scanned < 500, "{scanned} of 500 scanned");
+    }
+
+    /// A grid filled again with another snapshot's boxes holds what a new grid of them holds: the
+    /// same columns, each with its entries in order and none empty, the same bounds, and the same
+    /// answers, also after it answered as a larger list's grid.
+    #[test]
+    fn a_refilled_grid_holds_what_a_new_one_holds() {
+        let mut seed = 0x3C6E_F372_FE94_F82Bu64;
+        let mut next = |range: f64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 11) as f64 / (1u64 << 53) as f64 * range
+        };
+        let first: Vec<Aabb> = (0..250)
+            .map(|_| boxed(next(80.0) - 40.0, next(8.0), next(80.0) - 40.0, 0.6))
+            .collect();
+        let mut grid = SeenGrid::new(first.into_iter()).answering_as((9.0, 4000));
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for round in 0..6 {
+            // Every snapshot holds more or fewer boxes, in columns some of the last one's share.
+            let n = 120 + 70 * (round % 3);
+            let boxes: Vec<Aabb> = (0..n)
+                .map(|i| {
+                    let w = if i % 37 == 0 { 3.9 } else { 0.6 };
+                    boxed(next(80.0) - 40.0, next(8.0), next(80.0) - 40.0, w)
+                })
+                .collect();
+            grid.refill(boxes.iter().copied());
+            let fresh = SeenGrid::new(boxes.iter().copied());
+            assert_eq!(grid.bounds(), fresh.bounds(), "round {round}");
+            assert_eq!(grid.cell_of, fresh.cell_of, "round {round}");
+            assert_eq!(grid.cells.len(), fresh.cells.len(), "round {round}");
+            for (at, list) in &fresh.cells {
+                assert_eq!(
+                    grid.cells.get(at),
+                    Some(list),
+                    "round {round}, column {at:?}"
+                );
+            }
+            for _ in 0..300 {
+                let area = boxed(next(90.0) - 45.0, next(8.0), next(90.0) - 45.0, next(6.0));
+                let indexed = grid.candidates(area, &mut a);
+                assert_eq!(fresh.candidates(area, &mut b), indexed, "round {round}");
+                assert_eq!(a, b, "round {round}");
+            }
+        }
     }
 }

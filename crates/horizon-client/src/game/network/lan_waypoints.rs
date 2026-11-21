@@ -5,6 +5,18 @@ use horizon_client::{
     items::ItemStack,
     lan::waypoints::{self, HIDING_HEADS, PLAYER_RANGE},
 };
+use horizon_protocol::packets::play::Clientbound;
+
+/// Waypoint packets one of the tick's threads encodes at a time: up to this many are encoded on
+/// the tick's own thread alone (`par_chunks_mut` runs a single piece in place).
+const ENCODED_TOGETHER: usize = 128;
+
+/// A slice of the tick's waypoint packets, with their connections, and their bodies once
+/// encoded.
+type Encoded<'a> = (
+    &'a [(u32, Clientbound)],
+    Vec<horizon_protocol::Result<Vec<u8>>>,
+);
 
 /// `waypoint_transmit_range`: hidden by crouching, invisibility or a head worn.
 fn transmit_range(crouching: bool, invisible: bool, head: Option<&ItemStack>) -> f64 {
@@ -104,9 +116,21 @@ impl Game<'_> {
                 host.waypoints.remove(&level);
             }
         }
-        for (conn, packet) in out {
-            if let Some(g) = host.hub.guest(conn) {
-                g.send(&packet);
+        // The packets are encoded on the tick's helpers, a slice at a time, as `Guest::send`
+        // encodes them, then handed to their connections here in their order: each connection
+        // gets the same bytes in the same order.
+        let mut encoded: Vec<Encoded<'_>> = (out.chunks(ENCODED_TOGETHER))
+            .map(|packets| (packets, Vec::with_capacity(packets.len())))
+            .collect();
+        horizon_client::parallel::par_chunks_mut(&mut encoded, 1, |pieces| {
+            for (packets, bodies) in pieces {
+                bodies.extend(packets.iter().map(|(_, packet)| packet.try_encode()));
+            }
+        });
+        let bodies = encoded.into_iter().flat_map(|(_, bodies)| bodies);
+        for ((conn, packet), body) in out.iter().zip(bodies) {
+            if let Some(g) = host.hub.guest(*conn) {
+                g.send_encoded(packet, body);
             }
         }
     }

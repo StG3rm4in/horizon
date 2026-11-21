@@ -265,6 +265,7 @@ pub(super) fn propose(
             shared_squares: squares.as_ref(),
             shared_chickens: Some(&chickens),
             w: rebuild(),
+            last_chunk: Default::default(),
             players: players.clone(),
             nearest: nearest.clone(),
             player_squares: Default::default(),
