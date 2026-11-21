@@ -383,6 +383,7 @@ mod precheck_envelope_tests {
             entity_tags: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
         };
         let camera = glam::DVec3::new(3.0, 62.0, -4.0);

@@ -5,10 +5,17 @@ use horizon_core::geometry::Vec3;
 pub(crate) fn in_powder_snow(m: &Mob, w: &MobWorld) -> bool {
     let b = m.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5));
     let (min, max) = (b.min_position(), b.max_position());
-    for x in min.x.floor() as i32..=max.x.floor() as i32 {
-        for y in min.y.floor() as i32..=max.y.floor() as i32 {
-            for z in min.z.floor() as i32..=max.z.floor() as i32 {
-                if &*w.facts.get(w.world.block(x, y, z)).name == "minecraft:powder_snow" {
+    let lo = [min.x, min.y, min.z].map(|v| v.floor() as i32);
+    let hi = [max.x, max.y, max.z].map(|v| v.floor() as i32);
+    // No section of the box may hold powder snow: no cell of it has.
+    if !super::may_contact(w, lo, hi, super::CONTACT_POWDER_SNOW) {
+        return false;
+    }
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                let state = w.world.block(x, y, z);
+                if super::contact_bits(w, state) & super::CONTACT_POWDER_SNOW != 0 {
                     return true;
                 }
             }

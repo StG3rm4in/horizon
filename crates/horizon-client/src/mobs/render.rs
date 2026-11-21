@@ -2953,6 +2953,7 @@ mod tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             resolved: Default::default(),
             mod_spawns: Default::default(),
         };
@@ -3293,6 +3294,7 @@ mod tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
             resolved: Default::default(),
         };
@@ -3388,6 +3390,7 @@ mod tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
             resolved: Default::default(),
         };
@@ -3447,6 +3450,7 @@ mod tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
             resolved: Default::default(),
         };
@@ -3565,6 +3569,7 @@ mod tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
             resolved: Default::default(),
         };
@@ -3873,6 +3878,7 @@ mod scroll_tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
             resolved: Default::default(),
         };
@@ -4041,6 +4047,7 @@ mod emissive_tests {
             blinks: RwLock::new(blinks),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
             resolved: Default::default(),
         }
@@ -4323,6 +4330,7 @@ mod random_texture_tests {
             entity_tags: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
             resolved: Default::default(),
         }
