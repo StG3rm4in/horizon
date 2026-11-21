@@ -53,6 +53,11 @@ pub struct LanSettings {
     pub force_game_mode: bool,
 }
 
+/// Each mob's hurt time, death and swing time as the last flush saw them, by id
+/// (`Game::lan_flush_effects`): looked up for every mob at each flush and never iterated, so
+/// with the fast hasher.
+type MobFlags = horizon_client::fast_hash::FxHashMap<u32, (i32, bool, Option<i32>)>;
+
 pub(super) struct LanHost {
     pub hub: Hub,
     /// The mods heard that everyone still here leaves with the server.
@@ -65,7 +70,7 @@ pub(super) struct LanHost {
     pub broken: Vec<[f64; 3]>,
     /// Hurt time, death and swing time (while swinging) of the mobs guests
     /// see; the players' hurt time by entity id.
-    mob_state: HashMap<super::Dim, HashMap<u32, (i32, bool, Option<i32>)>>,
+    mob_state: HashMap<super::Dim, MobFlags>,
     /// Each placed guest's pose as the mods last heard it
     /// (`native_entity_pose_change`), by connection.
     pub poses: HashMap<u32, horizon_client::pose::Pose>,
@@ -3364,15 +3369,14 @@ impl Game<'_> {
             host.mob_state.clear();
             return;
         }
-        // Hurt and death animations of mobs.
-        let mut seen = HashMap::new();
+        // Hurt and death animations of mobs, against what the last flush saw in this level. Its
+        // map is looked up once, not for every mob: nothing below writes `mob_state` until the
+        // new map takes its place. The new one is made at its size, as it gets every mob.
+        let last = host.mob_state.get(&self.dim);
+        let mut seen = MobFlags::with_capacity_and_hasher(self.mobs.len() + 1, Default::default());
         for m in &self.mobs {
             let dead = !m.alive();
-            let old = host
-                .mob_state
-                .get(&self.dim)
-                .and_then(|s| s.get(&m.id))
-                .copied();
+            let old = last.and_then(|s| s.get(&m.id)).copied();
             let at = [m.position.x, m.position.y, m.position.z];
             // LivingEntity.hurtServer: a hurt that restarted the hurt time.
             if m.hurt_time > old.map_or(0, |o| o.0)
@@ -3413,11 +3417,7 @@ impl Game<'_> {
         if let Some(d) = self.dragon.as_ref().filter(|d| d.id != 0) {
             let id = d.id;
             let dead = !d.alive();
-            let old = host
-                .mob_state
-                .get(&self.dim)
-                .and_then(|s| s.get(&id))
-                .copied();
+            let old = last.and_then(|s| s.get(&id)).copied();
             let at = [d.position.x, d.position.y, d.position.z];
             if d.hurt_time > old.map_or(0, |o| o.0) && !dead {
                 let (kind, cause, direct) =
@@ -5586,6 +5586,73 @@ mod mob_swing_sync_tests {
             sent.iter().any(|p| p.id == main as i32 && p.hand == 0),
             "the main hand: {sent:?}"
         );
+    }
+
+    /// The damage events and swings of the mobs, as `LivingEntity.hurtServer` and `swing`
+    /// broadcast them: a hurt time that went up since the level's last flush, or a swing that
+    /// started or restarted, goes out once, whatever the order of the mobs, and nothing more
+    /// while they stay as they are (`mob_state`, by mob id).
+    #[test]
+    #[ignore = "daily"]
+    fn a_mobs_hurt_and_swing_go_out_once_for_each_change() {
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        game.build_registries();
+        game.set_allow_commands(true);
+        for x in [8.5, 10.5, 12.5, 14.5, 16.5, 18.5] {
+            let summon = format!("summon piglin {x} 80 8.5 {{NoAI:1b,PersistenceRequired:1b}}");
+            assert!(game.run_command(&summon), "{summon}");
+        }
+        let ids: Vec<i32> = game.mobs.iter().map(|m| m.id as i32).collect();
+        assert_eq!(ids.len(), 6);
+        let rx = guest_at(&mut game, [12.5, 80.0, 8.5]);
+        // The ids of the mobs the guest was sent a damage event and a swing of.
+        let sent = |rx: &mpsc::Receiver<Out>| {
+            let (mut hurt, mut swung) = (Vec::new(), Vec::new());
+            let bodies = rx.try_iter().flat_map(|out| match out {
+                Out::Packet(body) => vec![body],
+                Out::Packets(bodies) => bodies,
+                Out::Disconnect(_) => panic!("unexpected disconnect"),
+            });
+            for body in bodies {
+                let mut r = horizon_protocol::buf::Reader::new(&body);
+                let id = r.varint().unwrap();
+                match C::decode(id, r.rest()).unwrap() {
+                    C::DamageEvent(p) => hurt.push(p.id),
+                    C::SwingAnimation(p) => swung.push(p.id),
+                    _ => {}
+                }
+            }
+            (hurt, swung)
+        };
+        let hurt = |game: &mut Game<'_>, id: i32, time: i32| {
+            let m = game.mobs.iter_mut().find(|m| m.id as i32 == id).unwrap();
+            m.hurt_time = time;
+            m.last_damage = Some((horizon_client::mobs::Damage::fall(), 0));
+        };
+        game.lan_flush_effects();
+        let _ = sent(&rx);
+        hurt(&mut game, ids[0], 10);
+        hurt(&mut game, ids[1], 10);
+        game.mobs[2].swing_hand_modified(false, SwingAnimation::DEFAULT);
+        game.mobs[3].swing_hand_modified(true, SwingAnimation::DEFAULT);
+        game.lan_flush_effects();
+        assert_eq!(sent(&rx), (ids[..2].to_vec(), ids[2..4].to_vec()));
+        // The same mobs in the other order: nothing changed since the last flush.
+        let mobs: Vec<horizon_client::mobs::Mob> = game.mobs.iter().cloned().collect();
+        game.mobs.clear();
+        for m in mobs.into_iter().rev() {
+            game.mobs.push(m);
+        }
+        game.lan_flush_effects();
+        assert_eq!(sent(&rx), (Vec::new(), Vec::new()));
+        // A hurt time that went down is no hurt; one that goes up from there is a new one.
+        hurt(&mut game, ids[0], 5);
+        game.lan_flush_effects();
+        assert_eq!(sent(&rx), (Vec::new(), Vec::new()));
+        hurt(&mut game, ids[0], 9);
+        game.lan_flush_effects();
+        assert_eq!(sent(&rx), (vec![ids[0]], Vec::new()));
     }
 }
 #[cfg(test)]
