@@ -21,6 +21,7 @@ differs (`--detail`) and prints the first rows that differ.
 import argparse
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -32,11 +33,20 @@ DEFAULT_COMMANDS = "1 forceload add -128 -128 127 127\n"
 GPU_STAGES = ("DENSITY", "SURFACE", "ORES", "CAVES", "LIGHT", "SECTIONS", "BIOMES")
 
 
-def server_properties(seed):
+def free_port():
+    """A port nothing listens on now, so that two harnesses (or a harness and a bench) can run at
+    once; the game binds it a few seconds later, and a port taken in between ends the run with a
+    clear message (see `run`)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def server_properties(seed, port):
     return "\n".join([
         f"level-seed={seed}", "view-distance=10", "simulation-distance=10", "online-mode=false",
         "white-list=false", "gamemode=creative", "force-gamemode=true", "spawn-protection=0",
-        "max-players=200", "difficulty=easy", "sync-chunk-writes=true", "server-port=25599",
+        "max-players=200", "difficulty=easy", "sync-chunk-writes=true", f"server-port={port}",
         # no pause while nobody is on, no watchdog: a fixture tick waits for its chunk work
         "pause-when-empty-seconds=0", "max-tick-time=-1",
     ]) + "\n"
@@ -50,7 +60,7 @@ def run(bin_dir, out, ticks, commands, seed, gpu, full, players=0, join_every=10
         shutil.rmtree(out)
     out.mkdir(parents=True)
     hs = Path(bin_dir) / "horizon-server"
-    (out / "server.properties").write_text(server_properties(seed))
+    (out / "server.properties").write_text(server_properties(seed, free_port()))
     (out / "eula.txt").write_text("eula=true\n")
     imported = subprocess.run([hs, "--dir", out, "import", out / "server.properties"],
                               capture_output=True, text=True)
@@ -88,7 +98,8 @@ def run(bin_dir, out, ticks, commands, seed, gpu, full, players=0, join_every=10
     count = lambda: len(digest.read_text().splitlines()) if digest.exists() else 0
     with open(out / "run.log", "w") as log:
         # The supervisor stays once the game has stopped: it is stopped here when the game (its
-        # child) is gone, after the last digest line or after a crash.
+        # child) is gone, after the last digest line, after a crash, or after a clean stop before
+        # the end (the port taken), which writes no more lines either.
         supervisor = subprocess.Popen([hs, "--dir", out, "run"], env=env, stdout=log,
                                       stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         game_seen = False
@@ -96,8 +107,10 @@ def run(bin_dir, out, ticks, commands, seed, gpu, full, players=0, join_every=10
             children = subprocess.run(["pgrep", "-P", str(supervisor.pid)], capture_output=True,
                                       text=True).stdout.split()
             game_seen = game_seen or bool(children)
-            if game_seen and not children and (count() >= ticks or "crash" in log_tail(out)):
-                break
+            if game_seen and not children:
+                tail = log_tail(out)
+                if count() >= ticks or "crash" in tail or "stopping server" in tail:
+                    break
             if time.monotonic() - started > timeout:
                 print(f"{out}: no end after {timeout} s")
                 break
@@ -110,7 +123,9 @@ def run(bin_dir, out, ticks, commands, seed, gpu, full, players=0, join_every=10
     lines = digest.read_text().splitlines() if digest.exists() else []
     print(f"== {out}: {len(lines)} ticks in {time.monotonic() - started:.0f} s")
     if len(lines) not in (ticks, ticks + 1):
-        sys.exit(f"{out}: {len(lines)} digest lines for {ticks} ticks (see {out}/logs/latest.log)")
+        why = " (its port was taken)" if "failed to bind to port" in log_tail(out) else ""
+        sys.exit(f"{out}: {len(lines)} digest lines for {ticks} ticks{why} "
+                 f"(see {out}/logs/latest.log)")
     return digest
 
 
