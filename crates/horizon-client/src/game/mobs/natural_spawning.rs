@@ -557,6 +557,9 @@ struct Checked {
     provisional: u32,
 }
 const SCANNED_QUERIES: u32 = 8;
+/// A natural spawning pass over this many candidate chunks (a player's square) or more builds
+/// the mobs' grid before its first box query ([`Level::build_boxes`]).
+const GRID_FIRST_CHUNKS: usize = 289;
 /// A mob not removed: its index in `Game::mobs`, box, alive, and whether
 /// it is a living shulker.
 type MobBox = (usize, Aabb, bool, bool);
@@ -618,6 +621,15 @@ impl<H: LevelHost> Level<'_, H> {
                 .get_or_init(|| MobBoxes::new(self.game.mobs()))
                 .near(area),
         )
+    }
+    /// Builds the grid of the game's mobs now, for a pass that will ask so many box queries that
+    /// the scans [`Self::mobs_near`] starts with would only add to the build (each works out
+    /// every mob's box): a natural spawning pass over many chunks asks one for nearly every
+    /// attempt that finds room. The mobs do not change while the level holds the game.
+    fn build_boxes(&self) {
+        if self.shared_boxes.is_none() {
+            self.boxes.get_or_init(|| MobBoxes::new(self.game.mobs()));
+        }
     }
     fn biome(&self, x: i32, y: i32, z: i32) -> Option<&BiomeInfo> {
         Some(self.w.biomes.get(self.w.world.noise_biome(x, y, z)?))
@@ -1520,6 +1532,9 @@ impl<'a> Game<'a> {
                 }
             }
             if lanes.is_none() && !categories.is_empty() {
+                if scratch.candidates.len() >= GRID_FIRST_CHUNKS {
+                    level.build_boxes();
+                }
                 for chunk in scratch.candidates.drain(..) {
                     // ServerChunkCache.tickSpawningChunk gates the initial chunk too.
                     if !level.can_spawn_in_chunk(chunk.0, chunk.1) {
@@ -3041,5 +3056,57 @@ mod tests {
             ["spawn_raids", "spawn_natural", "spawn_custom"],
             "ServerLevel.tick ticks the raids before the chunk source's spawns"
         );
+    }
+
+    /// A level that builds its mobs' grid before the first box query answers every query as one
+    /// that starts by scanning the mobs: room (the shulkers' solid boxes), obstruction and a
+    /// spawner's counts.
+    #[test]
+    #[ignore = "daily"]
+    fn a_grid_built_first_answers_as_the_first_scans() {
+        use super::super::creatures::SpawnSite;
+        use super::super::native_entity_refs::tests::with_game;
+        use horizon_client::mobs::spawner::SpawnerLevel;
+        with_game(|game| {
+            spawn_check_world(game, Vec3::new(0.5, 64.0, 0.5));
+            let kinds = [
+                "minecraft:zombie",
+                "minecraft:shulker",
+                "minecraft:cow",
+                "minecraft:spider",
+            ];
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            let mut next = |m: f64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % 1_000_000) as f64 / 1_000_000.0 * m
+            };
+            for i in 0..160 {
+                let at = [next(48.0), 64.0 + next(4.0), next(48.0)];
+                let _ = game.spawn_mob(kinds[i % kinds.len()], at, false, SpawnSite::Plain);
+            }
+            assert!(game.mobs.len() >= 40, "{} mobs joined", game.mobs.len());
+            let built = game.natural_level();
+            built.build_boxes();
+            let (mut asked, mut obstructed) = (0, 0);
+            for _ in 0..300 {
+                // A fresh level for each box, whose queries all scan.
+                let scanning = game.natural_level();
+                let (x, y, z) = (next(48.0), 63.0 + next(6.0), next(48.0));
+                let b = spawn_selection::spawn_box(x, y, z, 0.3 + next(2.0) as f32, 1.8);
+                assert_eq!(scanning.no_collision(b), built.no_collision(b), "{b:?}");
+                let unobstructed = scanning.unobstructed(b);
+                assert_eq!(unobstructed, built.unobstructed(b), "{b:?}");
+                for kind in kinds {
+                    let count = scanning.count_entities(kind, b);
+                    assert_eq!(count, built.count_entities(kind, b), "{kind} in {b:?}");
+                }
+                assert!(scanning.boxes.get().is_none(), "the fresh level scanned");
+                asked += 1;
+                obstructed += usize::from(!unobstructed);
+            }
+            assert!(obstructed > 0 && obstructed < asked, "{obstructed} of {asked}");
+        });
     }
 }
