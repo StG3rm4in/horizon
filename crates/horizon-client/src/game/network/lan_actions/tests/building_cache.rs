@@ -434,3 +434,40 @@ fn bodies_cost() {
         );
     }
 }
+
+/// The mobs' views of the guests (`lan_guest_views`, a turn as every guest) build the shared
+/// bodies for their turns and drop them after; inside a tick's guest turns, whose bodies are
+/// built already, they keep those. A turn under the bodies built for the views sees the boxes a
+/// turn sees without them.
+#[test]
+#[ignore = "daily"]
+fn the_mobs_views_of_the_guests_share_the_bodies_for_their_turns_only() {
+    let built = || super::super::BUILDING_CACHE.with(|c| c.borrow().as_ref().map(|b| b.1.clone()));
+    let mut resources = None;
+    let mut game = game(&mut resources);
+    assert!(built().is_none());
+    let views = game.lan_guest_views();
+    assert_eq!(views.len(), 2, "both guests are seen");
+    assert!(built().is_none(), "the views' bodies go with their turns");
+    let fresh = seen_by_builder(&mut game);
+    {
+        let bodies = super::super::building_cache_for_turns(game.lan.as_ref());
+        assert!(bodies.is_some() && built().is_some());
+        assert_eq!(seen_by_builder(&mut game), fresh);
+        let again = super::super::building_cache_for_turns(game.lan.as_ref());
+        assert!(again.is_none(), "built once");
+    }
+    assert!(built().is_none());
+    // Inside a tick's guest turns, the bodies built for them stay.
+    crate::game::lan_actions::building_cache(game.lan.as_ref());
+    let outer = built().expect("built for the tick's turns");
+    let seen_again = game.lan_guest_views();
+    let kept = built().expect("still built");
+    assert!(std::rc::Rc::ptr_eq(&kept, &outer));
+    drop(kept);
+    crate::game::lan_actions::building_cache(None);
+    let who = |views: &[(u32, horizon_client::mobs::PlayerView)]| {
+        views.iter().map(|(conn, v)| (*conn, v.uuid, v.position)).collect::<Vec<_>>()
+    };
+    assert_eq!(who(&views), who(&seen_again));
+}
