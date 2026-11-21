@@ -491,6 +491,9 @@ pub(super) struct SpawnHost<'g> {
     pub(super) items: &'g horizon_client::items::Items,
     pub(super) camel_husk_size: (f32, f32),
 }
+/// The structure starts a level keeps, by chunk and category ([`Level::structure_starts`]).
+type KeptStarts =
+    horizon_client::fast_hash::FxHashMap<((i32, i32), Category), super::structures::ChunkStarts>;
 /// The game level as natural spawning reads it.
 pub(super) type GameLevel<'g, 'a> = Level<'g, &'g Game<'a>>;
 pub(super) struct Level<'g, H> {
@@ -534,6 +537,10 @@ pub(super) struct Level<'g, H> {
     /// nether's few): for any other the cost is none wherever it stands, and
     /// spawning asks for one for every loaded mob each tick.
     pub(super) costed: Vec<&'g str>,
+    /// The structure starts of the chunks the spawn attempts asked `mobsAt` about, by chunk and
+    /// category, kept from the first attempt of each ([`NaturalLevel::category_structures_at`]):
+    /// the chunks and their references do not change while the level holds the game.
+    structure_starts: std::cell::RefCell<KeptStarts>,
     /// The spawner block whose tick this pass is, told to the spawn checks;
     /// None for natural spawning and the other passes.
     pub(super) spawner: Option<mod_api::Spawner>,
@@ -888,6 +895,14 @@ impl<H: LevelHost> SpawnLevel for Level<'_, H> {
         })
     }
 }
+/// A structure a position is in, as natural spawning reads it.
+fn structure_at(reach: super::structures::Reach) -> StructureAt {
+    StructureAt {
+        id: reach.name,
+        in_piece: reach.in_piece,
+        in_bounds: reach.in_box,
+    }
+}
 impl<H: LevelHost> NaturalLevel for Level<'_, H> {
     fn spawn_hooks(&self) -> bool {
         !mod_api::__private::mods().is_empty()
@@ -960,12 +975,40 @@ impl<H: LevelHost> NaturalLevel for Level<'_, H> {
             wanted,
         )
         .into_iter()
-        .map(|reach| StructureAt {
-            id: reach.name,
-            in_piece: reach.in_piece,
-            in_bounds: reach.in_box,
-        })
+        .map(structure_at)
         .collect()
+    }
+    /// [`Self::structures_at`] from the starts the level keeps for the position's chunk and
+    /// `category`, looked up by the chunk's first attempt: the same starts in the same order, each
+    /// tested at the position as [`reaches_in`] tests it. Most chunks refer to no structure and
+    /// keep nothing.
+    fn category_structures_at(
+        &self,
+        category: Category,
+        x: i32,
+        y: i32,
+        z: i32,
+        wanted: &dyn Fn(&str) -> bool,
+    ) -> Vec<StructureAt> {
+        let chunk = (x >> 4, z >> 4);
+        let world = self.w.world;
+        if world
+            .chunks
+            .get(&chunk)
+            .is_none_or(|c| c.structure_refs.is_empty())
+        {
+            return Vec::new();
+        }
+        let mut kept = self.structure_starts.borrow_mut();
+        let starts = kept.entry((chunk, category)).or_insert_with(|| {
+            super::structures::ChunkStarts::in_world(
+                world,
+                &|| self.host.locator.clone(),
+                chunk,
+                wanted,
+            )
+        });
+        starts.reaching([x, y, z]).into_iter().map(structure_at).collect()
     }
     fn structure_spawns(&self) -> &StructureSpawns {
         self.host.structure_spawns
@@ -1156,6 +1199,7 @@ impl<'a> Game<'a> {
             box_queries: Default::default(),
             group: Default::default(),
             costed: spawn_cost_types(world_biomes!(self)),
+            structure_starts: Default::default(),
             spawner: None,
             checked: Default::default(),
         }

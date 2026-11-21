@@ -408,6 +408,20 @@ pub trait NaturalLevel: SpawnLevel {
         z: i32,
         wanted: &dyn Fn(&str) -> bool,
     ) -> Vec<StructureAt>;
+    /// [`Self::structures_at`] for `mobsAt` of `category`, whose `wanted` takes the structures
+    /// that can change the category's list and depends on nothing else: a level may keep the
+    /// starts a chunk's references name for a category and answer the chunk's positions from
+    /// them.
+    fn category_structures_at(
+        &self,
+        _category: Category,
+        x: i32,
+        y: i32,
+        z: i32,
+        wanted: &dyn Fn(&str) -> bool,
+    ) -> Vec<StructureAt> {
+        self.structures_at(x, y, z, wanted)
+    }
     fn structure_spawns(&self) -> &StructureSpawns;
     /// Where the players `getNearestPlayer(x, y, z, -1, false)` measures to
     /// are: every one that is not a spectator.
@@ -843,7 +857,7 @@ fn vanilla_mobs_at<L: NaturalLevel>(
     // most chunks are mineshafts, which override nothing).
     let overrides = l.structure_spawns();
     let monster = category == Category::Monster;
-    let structures = l.structures_at(x, y, z, &|id| {
+    let structures = l.category_structures_at(category, x, y, z, &|id| {
         (monster && id == "minecraft:fortress") || overrides.get(id, category.name()).is_some()
     });
     // The structures first: both sides are plain reads, and the list is almost always empty,

@@ -270,6 +270,7 @@ pub(super) fn propose(
             box_queries: Default::default(),
             group: Default::default(),
             costed: costed.clone(),
+            structure_starts: Default::default(),
             spawner: None,
             checked: Default::default(),
         };
