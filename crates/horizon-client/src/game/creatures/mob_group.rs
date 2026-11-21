@@ -125,31 +125,23 @@ pub(super) struct Start {
 impl Group {
     /// A group of `mobs`, whose snapshot entries are `snapshot`.
     pub(super) fn new(mobs: Vec<Mob>, snapshot: Vec<Seen>, start: Start) -> Self {
-        let grid = SeenGrid::new(snapshot.iter().map(|s| s.bounds));
-        let mut index = FxHashMap::with_capacity_and_hasher(snapshot.len(), Default::default());
-        let (mut villager_slots, mut solid_slots) = (Vec::new(), Vec::new());
-        for (i, s) in snapshot.iter().enumerate() {
-            index.entry(s.id).or_insert(i as u32);
-            if s.species == Species::Villager {
-                villager_slots.push(i as u32);
-            }
-            if s.may_block_mobs() {
-                solid_slots.push(i as u32);
-            }
-        }
+        Self::of_list(mobs.into_iter().collect(), snapshot, start)
+    }
+
+    /// [`Self::new`] of mobs already in their list.
+    pub(super) fn of_list(mobs: JoinList<Mob>, snapshot: Vec<Seen>, start: Start) -> Self {
         let n = mobs.len();
-        let species_slots = horizon_client::mobs::species_slots::SpeciesSlots::new(&snapshot);
-        Self {
+        let mut group = Self {
             spare: start.guests.first().map(|g| g.1.clone()),
-            mobs: mobs.into_iter().collect(),
+            mobs,
             global: Vec::new(),
             ends: Vec::with_capacity(n),
-            snapshot,
-            grid,
-            index,
-            villager_slots,
-            species_slots,
-            solid_slots,
+            snapshot: Vec::new(),
+            grid: SeenGrid::default(),
+            index: FxHashMap::default(),
+            villager_slots: Vec::new(),
+            species_slots: Default::default(),
+            solid_slots: Vec::new(),
             pushes: PendingPushes::default(),
             events: start.events,
             random: start.random,
@@ -165,10 +157,74 @@ impl Group {
             guest_events: Vec::new(),
             credit_expired: Vec::new(),
             own_random: own_random(),
-        }
+        };
+        group.index_snapshot(snapshot);
+        group
     }
 
-    /// The group's spatial query extent and scan threshold match the whole list's `whole`.
+    /// `snapshot` as the group's entries, with what its turns find them by: the grid of their
+    /// boxes, the first slot of each id, and the slots of the villagers, of the mobs that may
+    /// block others and of each species.
+    fn index_snapshot(&mut self, snapshot: Vec<Seen>) {
+        self.grid = SeenGrid::new(snapshot.iter().map(|s| s.bounds));
+        let mut index = FxHashMap::with_capacity_and_hasher(snapshot.len(), Default::default());
+        let (mut villager_slots, mut solid_slots) = (Vec::new(), Vec::new());
+        for (i, s) in snapshot.iter().enumerate() {
+            index.entry(s.id).or_insert(i as u32);
+            if s.species == Species::Villager {
+                villager_slots.push(i as u32);
+            }
+            if s.may_block_mobs() {
+                solid_slots.push(i as u32);
+            }
+        }
+        self.species_slots = horizon_client::mobs::species_slots::SpeciesSlots::new(&snapshot);
+        (self.index, self.villager_slots, self.solid_slots) = (index, villager_slots, solid_slots);
+        self.snapshot = snapshot;
+    }
+
+    /// The group's part of the snapshot the tick started from, `frozen` (its members' entries,
+    /// by their places in the whole list), indexed as [`Self::new`] indexes it and answering as
+    /// the whole list's grid `whole` would, with its members' player bindings and death marks
+    /// out of `bindings` and `died`. The parallel tick's lanes make it for their own groups before
+    /// their turns, rather than the server thread for every group.
+    pub(super) fn prepare(
+        &mut self,
+        frozen: &[Seen],
+        whole: (f64, usize),
+        bindings: &FxHashMap<u32, u32>,
+        died: &FxHashSet<u32>,
+    ) {
+        let snapshot = self.global.iter().map(|&k| frozen[k].clone()).collect();
+        self.index_snapshot(snapshot);
+        self.grid = std::mem::take(&mut self.grid).answering_as(whole);
+        // A group reads and writes only its own mobs' bindings and death marks.
+        self.bindings = self
+            .mobs
+            .iter()
+            .filter_map(|m| bindings.get(&m.id).map(|&conn| (m.id, conn)))
+            .collect();
+        self.died = self
+            .mobs
+            .iter()
+            .filter(|m| died.contains(&m.id))
+            .map(|m| m.id)
+            .collect();
+    }
+
+    /// Drops what only the turns read, the snapshot's grid and slot lists, once they are over:
+    /// on the lane that [`Self::prepare`] made them on. The merge reads the rest.
+    pub(super) fn release(&mut self) {
+        self.grid = SeenGrid::default();
+        self.index = FxHashMap::default();
+        self.villager_slots = Vec::new();
+        self.species_slots = Default::default();
+        self.solid_slots = Vec::new();
+    }
+
+    /// The group's spatial query extent and scan threshold match the whole list's `whole`: the
+    /// tests' groups; the pass's own groups set their grid's in [`Self::prepare`].
+    #[cfg(test)]
     pub(super) fn answering_as(self, whole: (f64, usize)) -> Self {
         Self {
             grid: self.grid.answering_as(whole),
@@ -506,5 +562,84 @@ impl Group {
             );
         }
         self.random = lent_level.into_random();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A group whose lane makes its part of the snapshot (`prepare`) holds what a group made
+    /// whole from the same members holds (as the setup made every group before): the same entries,
+    /// grid answers, index, slots, bindings and death marks, with marks of mobs of other groups
+    /// left out. `release` leaves the entries the merge reads.
+    #[test]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
+    fn a_group_prepared_on_its_lane_is_the_group_made_whole() {
+        let mut game = super::super::super::native_machines::tests::server_game();
+        let kinds = ["cow", "villager", "pig", "villager", "sheep", "cow", "chicken"];
+        for (k, kind) in kinds.iter().enumerate() {
+            let at = [0.5 + 2.0 * k as f64, 65.0, 0.5 + 6.0 * (k % 3) as f64];
+            game.spawn_mob(&format!("minecraft:{kind}"), at, true, SpawnSite::Plain)
+                .unwrap();
+        }
+        let mobs = game.mobs.to_vec();
+        let frozen: Vec<Seen> = mobs.iter().map(|m| m.seen(None, game.items())).collect();
+        let whole = SeenGrid::bounds_of(frozen.iter().map(|s| s.bounds));
+        let id = |k: usize| mobs[k].id;
+        // Members 1, 3, 4 and 6: both villagers. One member and one other mob are bound to a
+        // guest, one member and one other mob are marked dead.
+        let members = vec![1, 3, 4, 6];
+        let bindings: FxHashMap<u32, u32> = [(id(3), 7), (id(0), 8)].into_iter().collect();
+        let died: FxHashSet<u32> = [id(4), id(2)].into_iter().collect();
+        let start = |bindings: FxHashMap<u32, u32>, died: FxHashSet<u32>| Start {
+            events: Vec::new(),
+            random: LevelRandom::for_level(horizon_core::random::LegacyRandom::new(7)),
+            guests: Vec::new(),
+            player: None,
+            bindings,
+            died,
+            ticked: Default::default(),
+        };
+        let own: Vec<Mob> = members.iter().map(|&k| mobs[k].clone()).collect();
+        let made_whole = {
+            let b = own
+                .iter()
+                .filter_map(|m| bindings.get(&m.id).map(|&conn| (m.id, conn)))
+                .collect();
+            let d = own.iter().filter(|m| died.contains(&m.id)).map(|m| m.id).collect();
+            let seen = members.iter().map(|&k| frozen[k].clone()).collect();
+            Group::new(own.clone(), seen, start(b, d)).answering_as(whole)
+        };
+        let blank = start(Default::default(), Default::default());
+        let mut prepared = Group::of_list(own.into_iter().collect(), Vec::new(), blank);
+        prepared.global = members;
+        prepared.prepare(&frozen, whole, &bindings, &died);
+        let entries = |g: &Group| g.snapshot.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>();
+        assert_eq!(entries(&prepared), entries(&made_whole));
+        assert_eq!(prepared.index, made_whole.index);
+        assert_eq!(prepared.villager_slots, made_whole.villager_slots);
+        assert_eq!(prepared.villager_slots.len(), 2, "both villagers are members");
+        assert_eq!(prepared.solid_slots, made_whole.solid_slots);
+        assert_eq!(prepared.bindings, made_whole.bindings);
+        assert_eq!(prepared.died, made_whole.died);
+        assert_eq!((prepared.bindings.len(), prepared.died.len()), (1, 1));
+        assert_eq!(prepared.grid.bounds(), made_whole.grid.bounds());
+        for s in &frozen {
+            for by in [0.0, 3.0, 40.0] {
+                let area = s.bounds.inflate(Vec3::new(by, by, by));
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let found = prepared.grid.candidates(area, &mut a);
+                assert_eq!(found, made_whole.grid.candidates(area, &mut b));
+                assert_eq!(a, b, "{area:?}");
+            }
+        }
+        for s in &frozen {
+            let species = s.species;
+            assert_eq!(prepared.species_slots.of(species), made_whole.species_slots.of(species));
+        }
+        prepared.release();
+        assert!(prepared.index.is_empty() && prepared.villager_slots.is_empty());
+        assert_eq!(entries(&prepared), entries(&made_whole), "the merge reads the entries");
     }
 }

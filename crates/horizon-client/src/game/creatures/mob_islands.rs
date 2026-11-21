@@ -32,6 +32,7 @@ use super::mob_group::{Group, Shared, Start, Turns};
 use super::*;
 use horizon_client::{
     fast_hash::{FxHashMap, FxHashSet},
+    join_seq::JoinList,
     mobs::{ForeignSeen, WhoLookup, leash, seen_grid::SeenGrid},
 };
 use horizon_core::{
@@ -354,10 +355,11 @@ impl Islands<'_> {
             }
         }
         assert!(lane_of.iter().all(|&l| l < lanes), "every mob has a group");
-        let mut taken: Vec<Vec<Mob>> = plan
+        // Straight into each group's own list, the one its turns run on.
+        let mut taken: Vec<JoinList<Mob>> = plan
             .groups
             .iter()
-            .map(|members| Vec::with_capacity(members.len()))
+            .map(|members| JoinList::with_capacity(members.len()))
             .collect();
         for (m, &lane) in mobs.drain(..).zip(&lane_of) {
             taken[lane].push(m);
@@ -368,27 +370,18 @@ impl Islands<'_> {
             .zip(taken)
             .enumerate()
             .map(|(lane, (members, group_mobs))| {
-                // A group reads and writes only its own mobs' bindings and death marks.
-                let bindings = group_mobs
-                    .iter()
-                    .filter_map(|m| start.bindings.get(&m.id).map(|&conn| (m.id, conn)))
-                    .collect();
-                let died = group_mobs
-                    .iter()
-                    .filter(|m| start.died.contains(&m.id))
-                    .map(|m| m.id)
-                    .collect();
+                // Its snapshot entries, their indexes, its bindings and its death marks are made
+                // on its own lane, before its turns (`Group::prepare`).
                 let group_start = Start {
                     events: Vec::new(),
                     random: LevelRandom::for_level(draws.lane(lane)),
                     guests: start.guests.clone(),
                     player: start.player.clone(),
-                    bindings,
-                    died,
+                    bindings: FxHashMap::default(),
+                    died: FxHashSet::default(),
                     ticked: FxHashSet::default(),
                 };
-                let seen = members.iter().map(|&k| snapshot[k].clone()).collect();
-                let mut group = Group::new(group_mobs, seen, group_start).answering_as(whole);
+                let mut group = Group::of_list(group_mobs, Vec::new(), group_start);
                 group.global = members;
                 group
             })
@@ -399,9 +392,14 @@ impl Islands<'_> {
         drop(setup);
         let lanes_span = horizon_client::spans::guard("islands_lanes");
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let board = &board;
+            let prepare = |g: &mut Group| {
+                g.prepare(&board.frozen, whole, &start.bindings, &start.died);
+            };
             self.run_threads(
                 &mut groups,
-                &board,
+                board,
+                &prepare,
                 turns,
                 shared,
                 serial.as_ref().map(|s| &s.1),
@@ -502,11 +500,13 @@ impl Islands<'_> {
     /// content mod's effect while mods are loaded) and the UUID lookup ([`LoopLookup`], the same
     /// answers). The helpers' sampled costs join this thread's sums. A lane waits for the lanes
     /// before it, so each needs a thread while the others run: a plan never has more groups than
-    /// the pool has helpers, plus this thread ([`Plan::fit`]).
+    /// the pool has helpers, plus this thread ([`Plan::fit`]). Each lane first makes its group's
+    /// part of the snapshot (`prepare`), and drops what only the turns read after them.
     fn run_threads(
         &self,
         groups: &mut [Group],
         board: &Board,
+        prepare: &(dyn Fn(&mut Group) + Sync),
         turns: &Turns,
         shared: &Shared,
         seeds: Option<&Arc<horizon_client::random_source::SeedReplay>>,
@@ -522,6 +522,7 @@ impl Islands<'_> {
         let canceled = turns.canceled;
         let sampling = super::super::tick_profile::sampling();
         let run = |g: &mut Group, ticking: Box<dyn Fn(i32, i32) -> bool + Send>| {
+            prepare(g);
             let foreign = Foreign {
                 board,
                 reader: Cell::new(0),
@@ -545,6 +546,7 @@ impl Islands<'_> {
             } else {
                 g.run(&mut turns, shared, Some(&foreign));
             }
+            g.release();
         };
         let tickings: Vec<_> = groups.iter().map(|_| (self.ticking)()).collect();
         let mut parts = groups.iter_mut().zip(tickings);
@@ -1486,7 +1488,8 @@ struct Board {
 }
 impl Board {
     fn new(frozen: Vec<Seen>, groups: &[Group], draws: Arc<OrderedDraws>) -> Self {
-        let mut index = FxHashMap::default();
+        // Only looked up: sized for every entry from the start.
+        let mut index = FxHashMap::with_capacity_and_hasher(frozen.len(), Default::default());
         for (i, s) in frozen.iter().enumerate() {
             index.entry(s.id).or_insert(i as u32);
         }
