@@ -982,6 +982,54 @@ impl PlayerCells {
         }
         out.sort_unstable();
     }
+    /// [`Self::within_8`] from the players of the three by three squares around the chunk's
+    /// square, which `unions` keeps for these cells: every chunk of a square looks in the same
+    /// nine squares, so a pass gathers and orders their players once a square rather than once a
+    /// chunk, and each chunk takes those within 8 of it, in the players' order.
+    fn within_8_kept(&self, cx: i32, cz: i32, unions: &mut CellUnions, out: &mut Vec<usize>) {
+        let (x0, x1) = (cx.saturating_sub(8) >> 3, cx.saturating_add(8) >> 3);
+        let (z0, z1) = (cz.saturating_sub(8) >> 3, cz.saturating_add(8) >> 3);
+        // At the ends of the coordinates the clamped range is narrower: no square to share.
+        if x1 - x0 != 2 || z1 - z0 != 2 {
+            self.within_8(cx, cz, out);
+            return;
+        }
+        let CellUnions { runs, list } = unions;
+        let (start, len) = *runs.entry((x0, z0)).or_insert_with(|| {
+            let start = list.len();
+            for kx in x0..=x1 {
+                for kz in z0..=z1 {
+                    if let Some(players) = self.cells.get(&(kx, kz)) {
+                        list.extend_from_slice(players);
+                    }
+                }
+            }
+            list[start..].sort_unstable_by_key(|&(i, _, _)| i);
+            (start as u32, (list.len() - start) as u32)
+        });
+        out.clear();
+        out.extend(
+            list[start as usize..(start + len) as usize]
+                .iter()
+                .filter(|&&(_, px, pz)| (px - cx).abs().max((pz - cz).abs()) <= 8)
+                .map(|&(i, _, _)| i as usize),
+        );
+    }
+}
+
+/// The players of the three by three squares of a [`PlayerCells`] around each square asked
+/// about ([`PlayerCells::within_8_kept`]), in the players' order: each square's run in `list`.
+/// Kept for one set of cells.
+#[derive(Clone, Debug, Default)]
+struct CellUnions {
+    runs: FxHashMap<(i32, i32), (u32, u32)>,
+    list: Vec<(u32, i32, i32)>,
+}
+impl CellUnions {
+    fn clear(&mut self) {
+        self.runs.clear();
+        self.list.clear();
+    }
 }
 
 /// A player as the spawn caps see it.
@@ -1010,6 +1058,8 @@ pub struct SpawnState {
     /// Scratch for [`Nearest`] and `players_near`, kept to be reused.
     nearby: Vec<[f64; 3]>,
     tracked: Vec<usize>,
+    /// The players of the squares of `cells` around each square `players_near` asked about.
+    unions: CellUnions,
     /// The position and charge of the last `can_spawn`; `after_spawn` always
     /// follows it for the same type and position.
     last_checked: Option<([i32; 3], f64)>,
@@ -1025,6 +1075,7 @@ pub struct SpawnBuffers {
     player_counts: Vec<[i32; 8]>,
     nearby: Vec<[f64; 3]>,
     tracked: Vec<usize>,
+    unions: CellUnions,
 }
 impl SpawnState {
     /// `getSpawnableChunkCount` and `getMobCategoryCounts` (by
@@ -1100,6 +1151,7 @@ impl SpawnState {
         buffers.near_list.clear();
         buffers.player_counts.clear();
         buffers.player_counts.resize(players.len(), [0; 8]);
+        buffers.unions.clear();
         Self {
             spawnable_chunks,
             limits: SpawnLimits::VANILLA,
@@ -1112,6 +1164,7 @@ impl SpawnState {
             near_list: buffers.near_list,
             nearby: buffers.nearby,
             tracked: buffers.tracked,
+            unions: buffers.unions,
             last_checked: None,
         }
     }
@@ -1133,6 +1186,7 @@ impl SpawnState {
             player_counts: self.player_counts,
             nearby: self.nearby,
             tracked: self.tracked,
+            unions: self.unions,
         };
         (self.players, buffers)
     }
@@ -1146,12 +1200,12 @@ impl SpawnState {
     /// non-spectators within 128 blocks of the chunk's centre.
     fn players_near(&mut self, cx: i32, cz: i32) -> std::ops::Range<usize> {
         let (list, players, cells) = (&mut self.near_list, &self.players, &self.cells);
-        let tracked = &mut self.tracked;
+        let (tracked, unions) = (&mut self.tracked, &mut self.unions);
         let (start, len) = *self.players_near.entry((cx, cz)).or_insert_with(|| {
             let start = list.len() as u32;
             // Every player within 128 blocks of the chunk's centre stands in
             // a chunk within 8 of it: those 8 chunks hold every answer.
-            cells.within_8(cx, cz, tracked);
+            cells.within_8_kept(cx, cz, unions, tracked);
             if !tracked.is_empty() {
                 let (x, z) = (f64::from(cx * 16 + 8), f64::from(cz * 16 + 8));
                 list.extend(tracked.iter().copied().filter(|&i| {
@@ -2101,6 +2155,91 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(found, scan, "chunk ({cx}, {cz})");
+            }
+        }
+    }
+
+    /// The squares' gathered players answer every chunk as [`PlayerCells::within_8`] does, the
+    /// chunks of a square sharing them, at the ends of the coordinates too; and the spawn state's
+    /// players near a chunk are the non-spectators within 128 blocks of its centre, in the
+    /// players' order, as a look at every player finds them.
+    #[test]
+    fn gathered_squares_find_what_within_8_finds() {
+        let mut seed = 0x517C_C1B7_2722_0A95u64;
+        let mut next = |m: f64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 1_000_000) as f64 / 1_000_000.0 * 2.0 * m - m
+        };
+        // Spread over 6 000 blocks, a cluster of forty, and players on chunk and square edges.
+        let mut players: Vec<(f64, f64)> =
+            (0..120).map(|_| (next(3_000.0), next(3_000.0))).collect();
+        players.extend((0..40).map(|_| (100.0 + next(60.0), -200.0 + next(60.0))));
+        players.extend([
+            (0.0, 0.0),
+            (-0.5, 127.9),
+            (128.0, -128.0),
+            (2047.99, -2048.0),
+        ]);
+        let cells = PlayerCells::new(players.iter().copied());
+        let mut unions = CellUnions::default();
+        let (mut kept, mut found) = (Vec::new(), Vec::new());
+        let chunk = |(x, z): (f64, f64)| ((x.floor() as i32) >> 4, (z.floor() as i32) >> 4);
+        for &(x, z) in players.iter().step_by(3) {
+            let (pcx, pcz) = chunk((x, z));
+            for dx in -12..=12 {
+                for dz in [-12, -9, -8, -1, 0, 7, 8, 9, 12] {
+                    let (cx, cz) = (pcx + dx, pcz + dz);
+                    cells.within_8_kept(cx, cz, &mut unions, &mut kept);
+                    cells.within_8(cx, cz, &mut found);
+                    assert_eq!(kept, found, "chunk ({cx}, {cz})");
+                }
+            }
+        }
+        assert!(unions.runs.len() > 1 && !unions.list.is_empty());
+        // Where the range is clamped the chunk looks for itself; just inside, it shares.
+        let ends = [(f64::from(i32::MAX), 0.0), (f64::from(i32::MIN), 0.0)];
+        let far = PlayerCells::new(ends);
+        let mut far_unions = CellUnions::default();
+        for cx in [
+            i32::MAX,
+            i32::MAX - 7,
+            i32::MAX - 20,
+            i32::MIN,
+            i32::MIN + 9,
+        ] {
+            far.within_8_kept(cx, 0, &mut far_unions, &mut kept);
+            far.within_8(cx, 0, &mut found);
+            assert_eq!(kept, found, "chunk ({cx}, 0)");
+        }
+        let spawn_players: Vec<SpawnPlayer> = players
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, z))| SpawnPlayer {
+                position: [x, 64.0, z],
+                spectator: i % 7 == 0,
+            })
+            .collect();
+        let mut state = SpawnState::uncounted(289, spawn_players.clone());
+        for &(x, z) in players.iter().step_by(5) {
+            let (pcx, pcz) = chunk((x, z));
+            for (cx, cz) in [
+                (pcx, pcz),
+                (pcx + 8, pcz - 3),
+                (pcx - 9, pcz),
+                (pcx + 5, pcz + 7),
+            ] {
+                let near = state.players_near(cx, cz);
+                let centre = (f64::from(cx * 16 + 8), f64::from(cz * 16 + 8));
+                let scan: Vec<usize> = (0..spawn_players.len())
+                    .filter(|&i| {
+                        let p = &spawn_players[i];
+                        let (dx, dz) = (centre.0 - p.position[0], centre.1 - p.position[2]);
+                        !p.spectator && dx * dx + dz * dz < 16384.0
+                    })
+                    .collect();
+                assert_eq!(state.near_list[near], scan[..], "chunk ({cx}, {cz})");
             }
         }
     }
