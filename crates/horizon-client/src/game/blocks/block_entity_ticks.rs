@@ -12,10 +12,12 @@ use horizon_client::{
     block_entity_anim::Ticker,
     containers::{BlockEntity, FurnaceKind, HOPPER_SLOTS},
     furnace::FurnaceCooking,
+    mobs::trial_spawner::TrialState,
+    vault::VaultState,
 };
 use horizon_core::position::BlockPos;
 use horizon_gameplay::block_entity_ticks::{block_ticking_at, ticker_name};
-use horizon_world::registry::BlockStateId;
+use horizon_world::registry::{BlockRegistry, BlockStateId};
 
 /// What `block_entities.tick` is visiting: the kinds its dispatch ticks, read once per entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +259,103 @@ impl<N: LoopMod, T: BlockEntityTickSlot> BlockEntityTickSlot for Attributed<N, T
     }
 }
 
+/// What a block entity's tick in the pass did, as far as the pass's [`PlayerPositions`] go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Ticked {
+    /// It only waited: nothing changed but its own block entity's fields and sleep, no hook ran,
+    /// and no entity or player moved, so the positions read before it still hold.
+    Waited,
+    /// Its full tick ran, which may have done anything.
+    Ran,
+}
+
+/// Where every player is, for the quiet ticks of the pass: a spawner or a trial spawner that no
+/// player can be near does nothing (`isNearPlayer`, `tryDetectPlayers`), and finding that out
+/// from these walks a short list where each spawner walked the server's guests. They are the
+/// game's own player and every guest of its server, whatever their level, game mode, health or
+/// state: more than any tick counts, so a tick none of these is in range of finds nobody. They
+/// are read at the first ask, and again at the first ask after anything but a quiet tick
+/// ([`Ticked::Ran`]) or a mod's slot, either of which may have moved a player.
+#[derive(Default)]
+pub(super) struct PlayerPositions {
+    positions: Vec<[f64; 3]>,
+    read: bool,
+}
+
+impl PlayerPositions {
+    /// The positions, read now unless they were since the last [`Self::forget`].
+    pub(super) fn get(&mut self, game: &Game<'_>) -> &[[f64; 3]] {
+        if !self.read {
+            self.positions.clear();
+            let own = game.player.as_ref().map(|p| p.position);
+            self.positions.extend(own.map(|p| [p.x, p.y, p.z]));
+            let guests = game.lan.iter().flat_map(|host| host.hub.guests.iter());
+            self.positions.extend(guests.map(|g| g.position));
+            self.read = true;
+        }
+        &self.positions
+    }
+    /// A player may have moved: the positions are read again at the next ask.
+    pub(super) fn forget(&mut self) {
+        self.read = false;
+    }
+}
+
+/// What the quiet ticks of trial spawners, vaults and creaking hearts read of their block's
+/// state, for every state: the registry's answers by name (`trial_spawner_state`,
+/// `vault_block_state`, `heart_block_state`), read once where each tick looked the block's
+/// template and properties up by name. Made for one registry with the block entity types as they
+/// were (`factory_block` reads them): asked with another registry, or with the types installed
+/// since, it answers nothing and the registry is read, until the next pass makes it again
+/// (`ensure_waiting_blocks`).
+#[derive(Default)]
+pub(super) struct WaitingBlocks {
+    /// The registry the entries were read from, and whether the block entity types were installed.
+    built_for: Option<(&'static BlockRegistry, bool)>,
+    entries: Vec<WaitingBlock>,
+    /// Once that registry's code block table is set (`code_block_owners`), whether it names any
+    /// state: with none, no template ticker is ever suppressed.
+    owned: Option<bool>,
+}
+
+/// One state's entry of [`WaitingBlocks`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct WaitingBlock {
+    /// A trial spawner block's `trial_spawner_state` and ominous flag.
+    pub(super) trial: Option<(TrialState, bool)>,
+    /// A vault block's `vault_state` and ominous flag.
+    pub(super) vault: Option<(VaultState, bool)>,
+    /// A creaking heart block's (by its facts' name): whether it is uprooted.
+    pub(super) heart: Option<bool>,
+}
+
+impl WaitingBlocks {
+    /// Whether the entries are `registry`'s, read with the block entity types installed or not as
+    /// `typed` says.
+    fn is_for(&self, registry: &BlockRegistry, typed: bool) -> bool {
+        self.built_for.is_some_and(|(built, was)| std::ptr::eq(built, registry) && was == typed)
+    }
+    /// The entry of `state`, when the entries are `registry`'s as the block entity types are now.
+    pub(super) fn get(
+        &self,
+        registry: &BlockRegistry,
+        state: BlockStateId,
+    ) -> Option<WaitingBlock> {
+        let typed = horizon_client::block_entity_types::current().is_some();
+        if !self.is_for(registry, typed) {
+            return None;
+        }
+        self.entries.get(state.0 as usize).copied()
+    }
+    /// Whether a template ticker on `registry` may be suppressed: not once its code block table is
+    /// known to name no state.
+    fn may_suppress(&self, registry: &BlockRegistry) -> bool {
+        let none_owned = self.owned == Some(false)
+            && self.built_for.is_some_and(|(built, _)| std::ptr::eq(built, registry));
+        !none_owned
+    }
+}
+
 /// A pass's working state: the item and mob caches and the spawners ticked so far.
 type PassScratch = (
     Option<crate::game::machines::ItemColumns>,
@@ -336,6 +435,7 @@ impl Game<'_> {
             let energy = this.native_energy_tables();
             this.world.block_entities.set_mod_energy(energy);
         }
+        this.ensure_waiting_blocks();
         // Only lingering cooldowns are dropped; a hopper that ticks checks
         // its own block. Once a second is soon enough for the rest.
         if this.world.game_time % 20 == 0 {
@@ -347,6 +447,8 @@ impl Game<'_> {
         this.item_columns = Some(Default::default());
         this.pass_mobs = Some(Default::default());
         let tickers = this.world.block_entity_tickers();
+        // Read at the first quiet tick that asks, and again after any other tick (`Ticked`).
+        let mut players = PlayerPositions::default();
         let mut last_chunk = (i32::MIN, i32::MIN);
         let mut last_chunk_ticking = false;
         for ticker in tickers.iter().copied() {
@@ -362,27 +464,32 @@ impl Game<'_> {
             if !chunk_ticking {
                 continue;
             }
-            // Ticks before this one can remove it (`TickingBlockEntity.isRemoved`).
+            // Ticks before this one can remove it (`TickingBlockEntity.isRemoved`): one lookup of
+            // the map says whether it still ticks and what it is.
             if this.world.block_entities.is_asleep(&pos)
-                || !this.world.block_entities.is_live(ticker)
                 || !this.border.contains(f64::from(pos.0), f64::from(pos.2))
             {
                 continue;
             }
-            let Some((kind, mod_type)) = this
-                .world
-                .block_entities
-                .get(&pos)
-                .and_then(TickedKind::with_type)
-            else {
+            let Some(entity) = this.world.block_entities.live_entity(ticker) else {
                 continue;
             };
-            match slot.before(&mut BlockEntityTick {
+            let Some((kind, mod_type)) = TickedKind::with_type(entity) else {
+                continue;
+            };
+            // What the recheck below lets through is of the same kind, whose name this is.
+            let name = ticker_name(entity);
+            let flow = slot.before(&mut BlockEntityTick {
                 game: this,
                 pos,
                 kind,
                 mod_type,
-            }) {
+            });
+            // The game's own slot does nothing; a mod's may have moved a player.
+            if S::RECHECK {
+                players.forget();
+            }
+            match flow {
                 LoopFlow::Continue => {}
                 LoopFlow::Skip => continue,
                 LoopFlow::Stop => break,
@@ -401,33 +508,34 @@ impl Game<'_> {
                 continue;
             }
             horizon_threads::work::set_chunk(chunk.0, chunk.1);
-            horizon_threads::work::set_entity(horizon_threads::work::entity_id(
-                this.world.block_entities.get(&pos).map_or("", ticker_name),
-            ));
+            horizon_threads::work::set_entity(horizon_threads::work::entity_id(name));
+            // With no state of a code mod's in the registry, no block is read for it.
             let suppressed = !matches!(kind, TickedKind::Mod)
                 && this.native_authoritative()
+                && this.waiting_blocks.may_suppress(this.pack.assets.registry)
                 && crate::game::code_block_owners::suppressed(
                     this.pack.assets.registry,
                     this.world.block(pos.0, pos.1, pos.2),
                 );
+            let mut ticked = Ticked::Ran;
             match kind {
                 // A mod block's template ticker (a furnace burning its fuel and input) is the
                 // template's own: it waits while the block's mod is off. The slots still run.
-                _ if suppressed => {}
+                _ if suppressed => ticked = Ticked::Waited,
                 TickedKind::Hopper => this.tick_hopper(pos),
                 TickedKind::Crafter => this.tick_crafter(pos),
                 TickedKind::Jukebox => this.tick_jukebox(pos),
                 TickedKind::Beacon => this.tick_beacon_at(pos),
-                TickedKind::CreakingHeart => this.tick_creaking_heart(pos)?,
+                TickedKind::CreakingHeart => ticked = this.tick_creaking_heart(pos)?,
                 TickedKind::Spawner => {
-                    this.tick_spawner(pos)?;
+                    ticked = this.tick_spawner(pos, &mut players)?;
                     this.spawner_tick_positions.push(pos);
                 }
                 TickedKind::TrialSpawner => {
-                    this.tick_trial_spawner(pos)?;
+                    ticked = this.tick_trial_spawner(pos, &mut players)?;
                     this.trial_spawner_tick_positions.push(pos);
                 }
-                TickedKind::Vault => this.tick_vault(pos)?,
+                TickedKind::Vault => ticked = this.tick_vault(pos)?,
                 TickedKind::Beehive => this.tick_beehive(pos),
                 TickedKind::Furnace => this.tick_furnace(pos)?,
                 TickedKind::BrewingStand => this.tick_brewing_stand(pos)?,
@@ -444,12 +552,18 @@ impl Game<'_> {
                     }
                 }
             }
+            if ticked == Ticked::Ran {
+                players.forget();
+            }
             slot.after(&mut BlockEntityTick {
                 game: this,
                 pos,
                 kind,
                 mod_type,
             });
+            if S::RECHECK {
+                players.forget();
+            }
         }
         horizon_threads::work::clear_work();
         // Items move between passes: the columns hold for this one only.
@@ -582,6 +696,34 @@ impl Game<'_> {
                 }
             })
             .collect()
+    }
+    /// Makes [`WaitingBlocks`] for the registry in use, unless they already are its with the
+    /// block entity types as they are now, and notes whether a code mod owns a state once the
+    /// registry's table says.
+    fn ensure_waiting_blocks(&mut self) {
+        let registry = self.pack.assets.registry;
+        let typed = horizon_client::block_entity_types::current().is_some();
+        if !self.waiting_blocks.is_for(registry, typed) {
+            let entries = (0..registry.len() as u32)
+                .map(BlockStateId)
+                .map(|state| WaitingBlock {
+                    trial: self.trial_spawner_state(state),
+                    vault: self.vault_block_state(state),
+                    heart: self.heart_block_state(state),
+                })
+                .collect();
+            self.waiting_blocks = WaitingBlocks {
+                built_for: Some((registry, typed)),
+                entries,
+                owned: None,
+            };
+        }
+        if self.waiting_blocks.owned.is_none() {
+            self.waiting_blocks.owned = registry
+                .code_block_owners
+                .get()
+                .map(|owners| owners.iter().any(|&owner| owner != u16::MAX));
+        }
     }
     /// `LevelChunk.isTicking` (block coordinates): a block-ticking chunk from
     /// every player's tickets (`update_chunk_tickets`), its entities loaded
@@ -1870,5 +2012,248 @@ mod own_block_entity_tests {
             assert_eq!(ticks_of(game, a), [2]);
             assert_eq!(ticks_of(game, c), [1, 1]);
         });
+    }
+}
+
+/// The quiet ticks (`Ticked::Waited`) of spawners, trial spawners, vaults and creaking hearts
+/// against their whole ticks, and the block states they read (`WaitingBlocks`).
+#[cfg(test)]
+mod quiet_tick_tests {
+    use super::{PlayerPositions, Ticked, WaitingBlocks};
+    use crate::game::Game;
+    use crate::game::game_tests::tests::server_game;
+    use horizon_client::{
+        block_entities::Pos,
+        containers::BlockEntity,
+        mobs::trial_spawner::{TrialSpawner, TrialSpawnerExt, TrialState},
+        vault::VaultState,
+    };
+    use horizon_core::{geometry::Vec3, random::RandomSource};
+    use horizon_world::registry::{BlockRegistry, BlockStateId};
+
+    /// Where the block entity under test stands, in the chunk `server_game` holds.
+    const AT: Pos = (8, 64, 8);
+
+    /// The state of `block` with `props` set.
+    fn state_of(game: &Game<'_>, block: &str, props: &[(&str, &str)]) -> BlockStateId {
+        let registry = game.pack.assets.registry;
+        let default = registry.default_state(block).expect("the block");
+        let mut state = registry.state(default).expect("its state").clone();
+        for (key, value) in props {
+            state.properties.insert((*key).to_owned(), (*value).to_owned());
+        }
+        let Ok(id) = registry.resolve(&state) else {
+            panic!("no state of {block} with {props:?}");
+        };
+        id
+    }
+
+    /// A dedicated server's game where mobs spawn (easy), with nobody playing, the table of waiting
+    /// blocks made, and `block` (with `props`) at [`AT`] holding `entity`.
+    fn with_entity(
+        block: &str,
+        props: &[(&str, &str)],
+        entity: BlockEntity,
+        test: impl FnOnce(&mut Game<'_>),
+    ) {
+        let mut game_resources = None;
+        let mut game = server_game(&mut game_resources);
+        game.options.dedicated = Some(Vec::new());
+        // Easy, for the quiet check (`ui`) and for the spawning level (`health_rules`) alike.
+        game.ui.difficulty = 1;
+        game.world.health_rules.difficulty = horizon_world::food::Difficulty::Easy;
+        game.ensure_waiting_blocks();
+        let state = state_of(&game, block, props);
+        game.world.set(AT.0, AT.1, AT.2, state).unwrap();
+        game.world.block_entities.insert(AT, entity);
+        test(&mut game);
+    }
+
+    /// The game's own player, standing at `at`.
+    fn place_player(game: &mut Game<'_>, at: [f64; 3]) {
+        game.player = Some(
+            horizon_client::motion::PlayerMotion::new(game.motion, Vec3::new(at[0], at[1], at[2]))
+                .unwrap(),
+        );
+    }
+
+    /// `ticks` game ticks of the block entity at [`AT`] from the state the game is in, each through
+    /// `tick`, the pass's. Each tick that only waited runs again from the same state through
+    /// `full`, the whole tick without its shortcuts: both leave the same block entity and block,
+    /// and the whole tick draws nothing from the level random and adds no mob. How many only
+    /// waited.
+    fn compare(
+        game: &mut Game<'_>,
+        ticks: usize,
+        tick: impl Fn(&mut Game<'_>, &mut PlayerPositions) -> Ticked,
+        full: impl Fn(&mut Game<'_>),
+    ) -> usize {
+        let mut waited = 0;
+        for _ in 0..ticks {
+            game.world.game_time += 1;
+            let time = game.world.game_time;
+            let before = game.world.block_entities.get(&AT).cloned().expect("the entity");
+            let block = game.world.block(AT.0, AT.1, AT.2);
+            let mut random = game.world.random.clone();
+            let mobs = game.mobs.len();
+            if tick(game, &mut PlayerPositions::default()) == Ticked::Ran {
+                continue;
+            }
+            waited += 1;
+            let quiet = format!("{:?}", game.world.block_entities.get(&AT));
+            assert_eq!(game.world.block(AT.0, AT.1, AT.2), block, "tick {time}");
+            game.world.block_entities.insert(AT, before);
+            full(game);
+            let whole = format!("{:?}", game.world.block_entities.get(&AT));
+            assert_eq!(whole, quiet, "tick {time}");
+            assert_eq!(game.world.block(AT.0, AT.1, AT.2), block, "tick {time}");
+            assert_eq!(game.mobs.len(), mobs, "tick {time}");
+            let drawn = game.world.random.next_long();
+            assert_eq!(drawn, random.next_long(), "tick {time}: the whole tick drew");
+        }
+        waited
+    }
+
+    fn spawner_tick(game: &mut Game<'_>, players: &mut PlayerPositions) -> Ticked {
+        game.tick_spawner(AT, players).unwrap()
+    }
+    fn spawner_full(game: &mut Game<'_>) {
+        game.tick_spawner_fully(AT).unwrap();
+    }
+    fn trial_tick(game: &mut Game<'_>, players: &mut PlayerPositions) -> Ticked {
+        game.tick_trial_spawner(AT, players).unwrap()
+    }
+    fn trial_full(game: &mut Game<'_>) {
+        game.tick_trial_spawner_fully(AT).unwrap();
+    }
+    fn vault_tick(game: &mut Game<'_>, _: &mut PlayerPositions) -> Ticked {
+        game.tick_vault(AT).unwrap()
+    }
+    fn vault_full(game: &mut Game<'_>) {
+        game.server_tick_vault(AT).unwrap();
+    }
+    fn heart_tick(game: &mut Game<'_>, _: &mut PlayerPositions) -> Ticked {
+        game.tick_creaking_heart(AT).unwrap()
+    }
+    fn heart_full(game: &mut Game<'_>) {
+        game.tick_creaking_heart_fully(AT).unwrap();
+    }
+
+    /// A spawner no player is in range of only waits, as its whole tick does; with the game's
+    /// player in range its whole tick runs.
+    #[test]
+    #[ignore = "daily"]
+    fn a_spawner_nobody_is_near_waits_as_its_whole_tick() {
+        let spawner = BlockEntity::Spawner(Box::default());
+        with_entity("minecraft:spawner", &[], spawner, |game| {
+            assert_eq!(compare(game, 40, spawner_tick, spawner_full), 40);
+            // The default range is 16 blocks: 20 away is out of it, 4 away in it.
+            place_player(game, [8.5, 64.0, 28.5]);
+            assert_eq!(compare(game, 20, spawner_tick, spawner_full), 20);
+            place_player(game, [8.5, 64.0, 12.5]);
+            assert_eq!(compare(game, 20, spawner_tick, spawner_full), 0);
+        });
+    }
+
+    /// A trial spawner waiting for players only waits, as its whole tick does, through the ticks
+    /// it looks for them with nobody in range too; with the game's player in range, it finds them.
+    #[test]
+    #[ignore = "daily"]
+    fn a_trial_spawner_nobody_is_near_waits_as_its_whole_tick() {
+        let mut spawner = TrialSpawner::default();
+        spawner.override_entity("minecraft:zombie");
+        let entity = BlockEntity::TrialSpawner(Box::new(spawner));
+        with_entity("minecraft:trial_spawner", &[], entity.clone(), |game| {
+            // The first tick picks the mob to show and starts waiting; every later one, the
+            // three that look for players among them, only waits.
+            assert_eq!(compare(game, 60, trial_tick, trial_full), 59);
+            let waiting = game.trial_spawner_block(AT).map(|(state, _)| state);
+            assert_eq!(waiting, Some(TrialState::WaitingForPlayers));
+        });
+        with_entity("minecraft:trial_spawner", &[], entity, |game| {
+            place_player(game, [8.5, 64.0, 11.5]);
+            let waited = compare(game, 60, trial_tick, trial_full);
+            assert!(waited < 59, "the look finds the player: {waited}");
+        });
+    }
+
+    /// A vault with nothing due only waits, as its whole tick does: an inactive one between its
+    /// looks for players, once a second, and an active one but on the ticks its display item
+    /// changes, until it finds nobody near and turns inactive.
+    #[test]
+    #[ignore = "daily"]
+    fn a_vault_with_nothing_due_waits_as_its_whole_tick() {
+        let vault = BlockEntity::Vault(Box::default());
+        with_entity("minecraft:vault", &[], vault.clone(), |game| {
+            // Due on the first tick, then on every 20th.
+            assert_eq!(compare(game, 60, vault_tick, vault_full), 57);
+        });
+        with_entity("minecraft:vault", &[("vault_state", "active")], vault, |game| {
+            assert_eq!(compare(game, 60, vault_tick, vault_full), 57);
+            let state = game.world.block(AT.0, AT.1, AT.2);
+            let inactive = game.vault_block_state(state).map(|(vault, _)| vault);
+            assert_eq!(inactive, Some(VaultState::Inactive));
+        });
+    }
+
+    /// A creaking heart with nothing to do only waits, as its whole tick does: an uprooted one on
+    /// every tick, and one between its logs by day between its updates, about one tick in 20.
+    #[test]
+    #[ignore = "daily"]
+    fn a_creaking_heart_with_nothing_to_do_waits_as_its_whole_tick() {
+        let heart = BlockEntity::CreakingHeart(Box::default());
+        let uprooted = [("creaking_heart_state", "uprooted")];
+        with_entity("minecraft:creaking_heart", &uprooted, heart.clone(), |game| {
+            assert_eq!(compare(game, 60, heart_tick, heart_full), 60);
+        });
+        let dormant = [("axis", "y"), ("creaking_heart_state", "dormant")];
+        with_entity("minecraft:creaking_heart", &dormant, heart, |game| {
+            let log = state_of(game, "minecraft:pale_oak_log", &[("axis", "y")]);
+            game.world.set(AT.0, AT.1 - 1, AT.2, log).unwrap();
+            game.world.set(AT.0, AT.1 + 1, AT.2, log).unwrap();
+            let waited = compare(game, 60, heart_tick, heart_full);
+            assert!((55..60).contains(&waited), "{waited} of 60 waited");
+            let state = game.world.block(AT.0, AT.1, AT.2);
+            assert_eq!(game.heart_block_state(state), Some(false), "still dormant");
+        });
+    }
+
+    /// The waiting blocks hold for every block state what the registry read by name gives, and
+    /// answer nothing for another registry.
+    #[test]
+    #[ignore = "daily"]
+    fn the_waiting_blocks_read_every_state_as_the_registry_does() {
+        let mut game_resources = None;
+        let mut game = server_game(&mut game_resources);
+        game.ensure_waiting_blocks();
+        let registry = game.pack.assets.registry;
+        let mut found = [0; 3];
+        for i in 0..registry.len() as u32 {
+            let state = BlockStateId(i);
+            let block = game.waiting_blocks.get(registry, state).expect("made for the registry");
+            assert_eq!(block.trial, game.trial_spawner_state(state), "{state:?}");
+            assert_eq!(block.vault, game.vault_block_state(state), "{state:?}");
+            assert_eq!(block.heart, game.heart_block_state(state), "{state:?}");
+            found[0] += usize::from(block.trial.is_some());
+            found[1] += usize::from(block.vault.is_some());
+            found[2] += usize::from(block.heart.is_some());
+        }
+        assert!(found.iter().all(|&n| n > 0), "{found:?}");
+        let get = |state| game.waiting_blocks.get(registry, state).unwrap();
+        let active = [("trial_spawner_state", "active"), ("ominous", "true")];
+        let trial = state_of(&game, "minecraft:trial_spawner", &active);
+        assert_eq!(get(trial).trial, Some((TrialState::Active, true)));
+        let ejecting = [("vault_state", "ejecting"), ("ominous", "false")];
+        let vault = state_of(&game, "minecraft:vault", &ejecting);
+        assert_eq!(get(vault).vault, Some((VaultState::Ejecting, false)));
+        let uprooted = [("creaking_heart_state", "uprooted")];
+        let heart = state_of(&game, "minecraft:creaking_heart", &uprooted);
+        assert_eq!(get(heart).heart, Some(true));
+        // Another registry's states are read by name, not from these.
+        let facts = r#"{"defaults":{"minecraft:stone":0},
+            "states":[["s",false,false,"","minecraft:stone"]]}"#;
+        let other = BlockRegistry::from_facts_json(facts.as_bytes()).unwrap();
+        assert_eq!(game.waiting_blocks.get(&other, BlockStateId(0)), None);
+        assert_eq!(WaitingBlocks::default().get(registry, trial), None);
     }
 }

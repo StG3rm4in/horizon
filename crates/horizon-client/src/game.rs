@@ -1666,6 +1666,8 @@ struct Game<'a> {
     /// Block-entity positions retained between ticks for client effects.
     spawner_tick_positions: Vec<horizon_client::block_entities::Pos>,
     trial_spawner_tick_positions: Vec<horizon_client::block_entities::Pos>,
+    /// What the quiet block entity ticks read of their block states (`block_entity_ticks.rs`).
+    waiting_blocks: block_entity_ticks::WaitingBlocks,
     /// The `[[native.loop]]` slots' state, per published loop (`published_loops.rs`).
     loop_states: published_loops::LoopStates,
     creative_screen: Creative,
@@ -10862,6 +10864,7 @@ impl<'a> Game<'a> {
             pass_mobs: None,
             spawner_tick_positions: Vec::new(),
             trial_spawner_tick_positions: Vec::new(),
+            waiting_blocks: Default::default(),
             loop_states: Default::default(),
             creative_screen: prepared.creative_screen,
             creative_ignore_text: false,

@@ -1,7 +1,12 @@
 //! Trial spawners in the game: `TrialSpawner.tickServer` for every trial
 //! spawner (`mobs::trial_spawner`), the block's state as it changes, the mobs
 //! it adds and the rewards it ejects.
-use super::{Game, natural_spawning::GameLevel, spawner::Planned};
+use super::{
+    Game,
+    block_entity_ticks::{PlayerPositions, Ticked},
+    natural_spawning::GameLevel,
+    spawner::Planned,
+};
 use horizon_client::{
     Result,
     containers::BlockEntity,
@@ -20,6 +25,7 @@ use horizon_core::{
     geometry::Vec3,
     random::{LegacyRandom, LevelRandom, RandomSource},
 };
+use horizon_world::registry::BlockStateId;
 use std::collections::HashMap;
 
 type Pos = (i32, i32, i32);
@@ -103,15 +109,33 @@ impl TrialSpawnerLevel for GameLevel<'_, '_> {
 }
 
 impl Game<'_> {
-    /// The server tick of the trial spawner at `key`. Its client tick comes
-    /// after every block entity's.
-    pub(super) fn tick_trial_spawner(&mut self, key: Pos) -> Result<()> {
+    /// The server tick of the trial spawner at `key`, with the players' positions the block
+    /// entity pass lends: a spawner waiting for players that will find none only waits
+    /// ([`Self::trial_spawner_only_waits`]). Its client tick comes after every block entity's.
+    pub(super) fn tick_trial_spawner(
+        &mut self,
+        key: Pos,
+        players: &mut PlayerPositions,
+    ) -> Result<Ticked> {
         let Some((current, ominous)) = self.trial_spawner_block(key) else {
-            return Ok(());
+            return Ok(Ticked::Waited);
         };
-        if current == TrialState::WaitingForPlayers && self.trial_spawner_only_waits(key, ominous) {
-            return Ok(());
+        if current == TrialState::WaitingForPlayers
+            && self.trial_spawner_only_waits(key, ominous, players)
+        {
+            return Ok(Ticked::Waited);
         }
+        self.tick_trial_spawner_as(key, current, ominous)?;
+        Ok(Ticked::Ran)
+    }
+    /// The whole server tick of the trial spawner at `key`, whose block is in `current`, ominous
+    /// or not: the spawner taken out of the map for it and put back.
+    fn tick_trial_spawner_as(
+        &mut self,
+        key: Pos,
+        current: TrialState,
+        ominous: bool,
+    ) -> Result<()> {
         let Some((lease, BlockEntity::TrialSpawner(mut spawner))) =
             self.world.block_entities.take(&key)
         else {
@@ -123,45 +147,72 @@ impl Game<'_> {
             .put(lease, BlockEntity::TrialSpawner(spawner));
         result
     }
+    /// [`Self::tick_trial_spawner`] without its shortcuts, its block read from the registry by
+    /// name: what the quiet ticks are checked against.
+    #[cfg(test)]
+    pub(super) fn tick_trial_spawner_fully(&mut self, key: Pos) -> Result<()> {
+        let state = self.world.block(key.0, key.1, key.2);
+        let Some((current, ominous)) = self.trial_spawner_state(state) else {
+            return Ok(());
+        };
+        self.tick_trial_spawner_as(key, current, ominous)
+    }
     /// Whether the spawner at `key`, waiting for players, only waits this tick, as
     /// `TrialSpawner.tick` does in `WAITING_FOR_PLAYERS`: a level where it may spawn (spawner
-    /// blocks work, mobs spawn, not peaceful), no mob it keeps track of, no player detected, its next
-    /// spawn data holding a mob, and not one of the ticks in 20 when it looks for players
-    /// (`tryDetectPlayers`). Its tick then draws nothing, changes nothing and tells nothing but its
-    /// ominous flag, set here: the spawning level that `server_tick_trial_spawner` builds for each
-    /// spawner on every tick is not needed.
-    fn trial_spawner_only_waits(&mut self, key: Pos, ominous: bool) -> bool {
-        let packed = horizon_core::position::BlockPos::new(key.0, key.1, key.2).pack();
+    /// blocks work, mobs spawn, not peaceful), no mob it keeps track of, no player detected, its
+    /// next spawn data holding a mob, and either not one of the ticks in 20 when it looks for
+    /// players (`tryDetectPlayers`), or one when no position of `players`, which holds every
+    /// player's, is in its range by `detect`'s own sum, so that the look finds nobody. Its tick
+    /// then draws nothing, changes nothing and tells nothing but its ominous flag, set here in
+    /// place: the spawning level that `server_tick_trial_spawner` builds for each spawner on every
+    /// tick is not needed, nor is the spawner taken out of the map (`get_mut` wakes it, as the
+    /// take does).
+    fn trial_spawner_only_waits(
+        &mut self,
+        key: Pos,
+        ominous: bool,
+        players: &mut PlayerPositions,
+    ) -> bool {
         let rules = &self.ui.rules;
-        if packed.wrapping_add(self.world.game_time) % 20 == 0
-            || !rules.bool_at(horizon_client::gamerules::vanilla::SPAWNER_BLOCKS_WORK)
+        if !rules.bool_at(horizon_client::gamerules::vanilla::SPAWNER_BLOCKS_WORK)
             || !rules.bool_at(horizon_client::gamerules::vanilla::SPAWN_MOBS)
             || self.ui.difficulty == 0
         {
             return false;
         }
-        let Some((lease, entity)) = self.world.block_entities.take(&key) else {
+        let Some(BlockEntity::TrialSpawner(spawner)) = self.world.block_entities.get(&key) else {
             return false;
         };
-        let waits = match &entity {
-            BlockEntity::TrialSpawner(spawner) => {
-                spawner.current_mobs.is_empty()
-                    && spawner.detected_players.is_empty()
-                    && (spawner.next_spawn_data.as_ref()).is_some_and(|data| {
-                        horizon_client::mobs::spawner::SpawnDataExt::id(data).is_some()
-                    })
+        let waits = spawner.current_mobs.is_empty()
+            && spawner.detected_players.is_empty()
+            && (spawner.next_spawn_data.as_ref()).is_some_and(|data| {
+                horizon_client::mobs::spawner::SpawnDataExt::id(data).is_some()
+            });
+        if !waits {
+            return false;
+        }
+        let packed = horizon_core::position::BlockPos::new(key.0, key.1, key.2).pack();
+        if packed.wrapping_add(self.world.game_time) % 20 == 0 {
+            let range = f64::from(spawner.required_player_range);
+            let pos = [key.0, key.1, key.2];
+            // `detect`'s test of a player's block, the difference wrapping as a release build's.
+            let near = |p: &[f64; 3]| {
+                let block = p.map(|v| v.floor() as i32);
+                let d = [0, 1, 2].map(|i| f64::from(block[i].wrapping_sub(pos[i])));
+                d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < range * range
+            };
+            if players.get(self).iter().any(near) {
+                return false;
             }
-            _ => false,
-        };
-        let entity = match entity {
-            BlockEntity::TrialSpawner(mut spawner) if waits => {
-                spawner.is_ominous = ominous;
-                BlockEntity::TrialSpawner(spawner)
+            // The spawning level's mob world turns the path type cache on (`mob_world_base`).
+            if self.is_logical_server() {
+                self.world.enable_path_type_cache();
             }
-            other => other,
-        };
-        self.world.block_entities.put(lease, entity);
-        waits
+        }
+        if let Some(BlockEntity::TrialSpawner(spawner)) = self.world.block_entities.get_mut(&key) {
+            spawner.is_ominous = ominous;
+        }
+        true
     }
     /// What the LAN encoder builds update tags from beyond the block entity:
     /// the mods' hook (`api_block_entity_update_tag`), and the block
@@ -190,25 +241,31 @@ impl Game<'_> {
             })
             .collect();
     }
-    /// The trial spawner block at `key`: its state and ominous flag.
+    /// The trial spawner block at `key`: its state and ominous flag, from the pass's table
+    /// (`WaitingBlocks`).
     pub(super) fn trial_spawner_block(&self, key: Pos) -> Option<(TrialState, bool)> {
-        let block = self
-            .pack
-            .assets
-            .registry
-            .state(self.world.block(key.0, key.1, key.2))?;
+        let state = self.world.block(key.0, key.1, key.2);
+        match self.waiting_blocks.get(self.pack.assets.registry, state) {
+            Some(block) => block.trial,
+            None => self.trial_spawner_state(state),
+        }
+    }
+    /// The trial spawner block in `state`: its `trial_spawner_state` and ominous flag, read from
+    /// the registry by name; `None` for a block that is no trial spawner's.
+    pub(super) fn trial_spawner_state(&self, state: BlockStateId) -> Option<(TrialState, bool)> {
+        let block = self.pack.assets.registry.state(state)?;
         if horizon_client::block_entity_types::factory_block(&block.name)
             != "minecraft:trial_spawner"
         {
             return None;
         }
-        let state = block
+        let current = block
             .properties
             .get("trial_spawner_state")
             .and_then(|s| TrialState::from_name(s))
             .unwrap_or_default();
         Some((
-            state,
+            current,
             block.properties.get("ominous").is_some_and(|v| v == "true"),
         ))
     }

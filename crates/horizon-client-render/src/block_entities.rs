@@ -1207,6 +1207,19 @@ impl BlockEntities {
     pub fn is_live(&self, (pos, slot): (Pos, u32)) -> bool {
         self.live.get(&pos) == Some(&slot) && self.map.contains_key(&pos)
     }
+    /// The block entity of a slot from `tickers` that still ticks ([`Self::is_live`]), with one
+    /// lookup of the map.
+    pub fn live_entity(&self, (pos, slot): (Pos, u32)) -> Option<&BlockEntity> {
+        if self.live.get(&pos) != Some(&slot) {
+            return None;
+        }
+        self.map.get(&pos)
+    }
+    /// Wakes the block entity at `pos`, as `take` and `get_mut` do, for a tick that reads it in
+    /// place and leaves it as it is.
+    pub fn wake(&mut self, pos: &Pos) {
+        self.asleep.remove(pos);
+    }
     /// Frees the slot at `pos` (the block entity stays).
     pub fn forget(&mut self, pos: &Pos) {
         self.cancel(pos);
@@ -1298,6 +1311,31 @@ mod tests {
         assert!(b.is_asleep(&kept));
         b.retain(|_, _| true);
         assert!(!b.is_asleep(&kept));
+    }
+
+    /// `live_entity` answers as `is_live` and `get` together: for a slot that ticks, the slot of
+    /// a removed block entity and a slot number its position does not have; `wake` undoes
+    /// `sleep`.
+    #[test]
+    fn a_live_entity_is_a_live_slots_block_entity() {
+        let mut b = level();
+        let (a, c) = ((1, 64, 1), (2, 64, 1));
+        b.insert(a, hopper());
+        b.insert(c, hopper());
+        let slots = b.tickers(|_| 1);
+        assert_eq!(slots.len(), 2);
+        b.remove(&c);
+        for &slot in slots.iter() {
+            assert_eq!(b.live_entity(slot).is_some(), b.is_live(slot), "{slot:?}");
+            if let Some(entity) = b.live_entity(slot) {
+                assert!(std::ptr::eq(entity, b.get(&slot.0).unwrap()));
+            }
+        }
+        assert!(b.live_entity((a, u32::MAX)).is_none());
+        b.sleep(a);
+        assert!(b.is_asleep(&a));
+        b.wake(&a);
+        assert!(!b.is_asleep(&a));
     }
 
     fn near(b: &BlockEntities, x: f64, z: f64, radius: f64) -> Vec<Pos> {

@@ -2,7 +2,7 @@
 //! (`vault`), the block's state as it changes, the rewards it ejects, the
 //! keys players insert (`VaultBlock.useItemOn`) and the display item spinning
 //! inside (`VaultRenderer`).
-use super::Game;
+use super::{Game, block_entity_ticks::Ticked};
 use horizon_assets::item_model::DisplayContext;
 use horizon_client::{
     Result,
@@ -15,6 +15,7 @@ use horizon_client::{
     vault::{Vault, VaultEvent, VaultLevel, VaultPlayer, VaultState},
 };
 use horizon_core::random::{LegacyRandom, LevelRandom};
+use horizon_world::registry::BlockStateId;
 
 type Pos = (i32, i32, i32);
 
@@ -61,16 +62,7 @@ impl Game<'_> {
     /// The vault at `key` with its block's state and ominous flag.
     pub(super) fn take_vault(&mut self, key: Pos) -> Option<TakenVault> {
         let state = self.world.block(key.0, key.1, key.2);
-        let block = self.pack.assets.registry.state(state)?;
-        if horizon_client::block_entity_types::factory_block(&block.name) != "minecraft:vault" {
-            return None;
-        }
-        let current = block
-            .properties
-            .get("vault_state")
-            .and_then(|s| VaultState::from_name(s))
-            .unwrap_or_default();
-        let ominous = block.properties.get("ominous").is_some_and(|v| v == "true");
+        let (current, ominous) = self.vault_block_state(state)?;
         let Some((lease, BlockEntity::Vault(vault))) = self.world.block_entities.take(&key) else {
             return None;
         };
@@ -149,9 +141,47 @@ impl Game<'_> {
             .put(lease, BlockEntity::Vault(vault));
         Some(self.vault_events(key, events).map(|()| out))
     }
+    /// The vault block in `state`: its `vault_state` and ominous flag, read from the registry by
+    /// name; `None` for a block that is no vault's.
+    pub(super) fn vault_block_state(&self, state: BlockStateId) -> Option<(VaultState, bool)> {
+        let block = self.pack.assets.registry.state(state)?;
+        if horizon_client::block_entity_types::factory_block(&block.name) != "minecraft:vault" {
+            return None;
+        }
+        let current = block
+            .properties
+            .get("vault_state")
+            .and_then(|s| VaultState::from_name(s))
+            .unwrap_or_default();
+        let ominous = block.properties.get("ominous").is_some_and(|v| v == "true");
+        Some((current, ominous))
+    }
+    /// [`Self::vault_block_state`] of the block at `key`, from the pass's table
+    /// (`WaitingBlocks`).
+    fn vault_block(&self, key: Pos) -> Option<(VaultState, bool)> {
+        let state = self.world.block(key.0, key.1, key.2);
+        match self.waiting_blocks.get(self.pack.assets.registry, state) {
+            Some(block) => block.vault,
+            None => self.vault_block_state(state),
+        }
+    }
     /// The server tick of the vault at `key`, then its client tick when there
-    /// is a window.
-    pub(super) fn tick_vault(&mut self, key: Pos) -> Result<()> {
+    /// is a window. A vault with nothing due only waits ([`Self::vault_waits`]);
+    /// a window's client tick is no quiet one.
+    pub(super) fn tick_vault(&mut self, key: Pos) -> Result<Ticked> {
+        let mut ticked = Ticked::Waited;
+        if !self.vault_waits(key) {
+            self.server_tick_vault(key)?;
+            ticked = Ticked::Ran;
+        }
+        if self.options.dedicated.is_none() {
+            self.client_tick_vault(key);
+            ticked = Ticked::Ran;
+        }
+        Ok(ticked)
+    }
+    /// The whole server tick of the vault at `key`: taken out of the map for it.
+    pub(super) fn server_tick_vault(&mut self, key: Pos) -> Result<()> {
         let pos = [key.0, key.1, key.2];
         let ticked = self.with_vault(key, |v, l, random, state, ominous, roll, events| {
             v.server_tick(l, random, pos, state, ominous, roll, events);
@@ -159,10 +189,30 @@ impl Game<'_> {
         if let Some(result) = ticked {
             result?;
         }
-        if self.options.dedicated.is_none() {
-            self.client_tick_vault(key);
-        }
         Ok(())
+    }
+    /// Whether the vault at `key` only waits this tick. `VaultBlockEntity.Server.tick` changes
+    /// nothing before `stateUpdatingResumesAt` (a vault looks at its players once a second) when
+    /// it has no shared data to send, unless it is an active vault on one of the ticks in 20 its
+    /// display item changes on. The whole tick would take the vault out of the map, when its block
+    /// is a vault's, and put it back untouched; this leaves it in place and wakes it as the take
+    /// does.
+    fn vault_waits(&mut self, key: Pos) -> bool {
+        let now = self.world.game_time;
+        let Some(BlockEntity::Vault(vault)) = self.world.block_entities.get(&key) else {
+            return false;
+        };
+        if now >= vault.state_updating_resumes_at || vault.shared_dirty {
+            return false;
+        }
+        let block = self.vault_block(key);
+        if now % 20 == 0 && block.is_some_and(|(state, _)| state == VaultState::Active) {
+            return false;
+        }
+        if block.is_some() {
+            self.world.block_entities.wake(&key);
+        }
+        true
     }
     /// `VaultBlock.useItemOn` with `held` in the hand that acts: true when the
     /// vault took the click (an active vault, with anything in the hand).

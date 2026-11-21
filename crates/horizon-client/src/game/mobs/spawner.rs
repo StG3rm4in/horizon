@@ -6,6 +6,7 @@
 mod entity_registry;
 use super::{
     Game,
+    block_entity_ticks::{PlayerPositions, Ticked},
     creatures::{Finalized, SpawnReason},
 };
 pub(super) use entity_registry::entity_type_saves;
@@ -51,13 +52,49 @@ pub(super) struct SpawnerState {
 }
 
 impl Game<'_> {
-    /// The server tick of the spawner at `key`. Its client tick comes after
-    /// every block entity's (`client_tick_spawners`).
+    /// The server tick of the spawner at `key`, with the players' positions the block entity
+    /// pass lends: a spawner no player is near only waits ([`Self::spawner_waits`]). Its client
+    /// tick comes after every block entity's (`client_tick_spawners`).
     ///
     /// The caller only reaches this for a `BlockEntity::Spawner`, and changing
     /// the block removes or replaces that entity, so the block is not read
     /// again here.
-    pub(super) fn tick_spawner(&mut self, key: Pos) -> Result<()> {
+    pub(super) fn tick_spawner(
+        &mut self,
+        key: Pos,
+        players: &mut PlayerPositions,
+    ) -> Result<Ticked> {
+        if self.spawner_waits(key, players) {
+            return Ok(Ticked::Waited);
+        }
+        self.tick_spawner_fully(key)?;
+        Ok(Ticked::Ran)
+    }
+    /// Whether the spawner at `key` only waits this tick. `BaseSpawner.serverTick` does nothing
+    /// without an alive, non-spectating player in range (`isNearPlayer`, which
+    /// `server_tick_spawner_of` asks first), and no position of `players`, which holds every
+    /// player's, is in range by `alive_player_near`'s own sum. The whole tick would take the
+    /// spawner out of the map and put it back untouched; this leaves it in place and wakes it, as
+    /// the take does.
+    fn spawner_waits(&mut self, key: Pos, players: &mut PlayerPositions) -> bool {
+        let Some(BlockEntity::Spawner(spawner)) = self.world.block_entities.get(&key) else {
+            return false;
+        };
+        let range = f64::from(spawner.required_player_range);
+        let [x, y, z] = [key.0, key.1, key.2].map(|c| f64::from(c) + 0.5);
+        let near = |p: &[f64; 3]| {
+            range < 0.0
+                || (p[0] - x).powi(2) + (p[1] - y).powi(2) + (p[2] - z).powi(2) < range * range
+        };
+        if players.get(self).iter().any(near) {
+            return false;
+        }
+        self.world.block_entities.wake(&key);
+        true
+    }
+    /// [`Self::tick_spawner`] without its shortcut: the spawner taken out of the map for its
+    /// `serverTick` and put back.
+    pub(super) fn tick_spawner_fully(&mut self, key: Pos) -> Result<()> {
         let Some((lease, BlockEntity::Spawner(mut spawner))) = self.world.block_entities.take(&key)
         else {
             return Ok(());
@@ -736,7 +773,7 @@ mod tests {
             };
             for expected in [2, 1, 0] {
                 let mut before = game.world.random.clone();
-                game.tick_spawner(key).unwrap();
+                game.tick_spawner(key, &mut PlayerPositions::default()).unwrap();
                 assert_eq!(delay(game), expected);
                 assert_eq!(
                     game.world.random.next_long(),
@@ -746,7 +783,7 @@ mod tests {
                 assert!(game.mobs.is_empty());
             }
             let mut before = game.world.random.clone();
-            game.tick_spawner(key).unwrap();
+            game.tick_spawner(key, &mut PlayerPositions::default()).unwrap();
             assert!((200..800).contains(&delay(game)), "{}", delay(game));
             assert_ne!(game.world.random.next_long(), before.next_long());
         });
