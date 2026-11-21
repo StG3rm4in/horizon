@@ -3407,7 +3407,7 @@ fn plugin_player_stack_follows_network_moves_and_local_carriers() {
     game.remove_entity(40);
     assert_eq!(game.riding, None);
     assert_eq!(
-        game.mobs.iter().find(|m| m.id == 41).unwrap().extra.mount,
+        game.mobs.iter().find(|m| m.id == 41).unwrap().mount,
         None
     );
 }

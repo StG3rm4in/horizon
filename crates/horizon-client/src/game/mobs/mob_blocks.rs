@@ -620,7 +620,7 @@ impl Game<'_> {
                         animation: worn_head_animation(
                             mob,
                             // The local player's synthetic mob carries no `mount`.
-                            mob.extra
+                            mob
                                 .mount
                                 .or(if local_player { self.riding } else { None }),
                             &self.mobs,

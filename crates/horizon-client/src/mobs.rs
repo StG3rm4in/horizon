@@ -1214,9 +1214,7 @@ pub struct Extra {
     /// The sniffer's and the ghastling's brain.
     pub animal_brain: Option<Box<animal_brain::Brain>>,
     pub axolotl: axolotl::Animation,
-    /// The mob or boat this one rides, and the mob riding it (`getVehicle`,
-    /// `getFirstPassenger`).
-    pub mount: Option<u32>,
+    /// The mob riding this one (`getFirstPassenger`); what it rides is [`Mob::mount`].
     pub rider: Option<u32>,
     /// This rider's place in its vehicle's `getPassengers`, beside `Guest.vehicle_order`: the
     /// lowest goes first. Passengers that load together keep 0 and their list order.
@@ -1529,7 +1527,13 @@ pub struct Mob {
     pub effects_dirty: bool,
     pub random: EntityRandom,
     pub ai: Box<ai::Ai>,
-    pub extra: Extra,
+    /// Behind a box: the species state is 2,632 of a mob's 4,048 bytes, mostly read rarely,
+    /// while the mob list is walked by id and position and moved whole (the islands move
+    /// every mob into its group and back each tick).
+    pub extra: Box<Extra>,
+    /// The mob or boat this one rides (`getVehicle`). Out of [`Extra`]'s box: the riders'
+    /// vehicle lookups and the passengers' scans read it for every mob.
+    pub mount: Option<u32>,
     pub fluids: living::Fluids,
     /// Entity.wasEyeInWater: the eyes were in water before this tick's fluid
     /// update (`isUnderWater` reads it).
@@ -2776,8 +2780,8 @@ impl Mob {
             panicking: m.ai.panicking,
             active_raid: raider::has_active_raid(m),
             opened_chest: m.extra.opened_chest,
-            passenger: m.extra.mount.is_some(),
-            vehicle: m.extra.mount,
+            passenger: m.mount.is_some(),
+            vehicle: m.mount,
             pushable: m.pushable(),
             sleeping: villager::sleeping(m)
                 || (m.species() == Species::Fox && fox::flag(m, fox::SLEEPING)),
@@ -2798,7 +2802,7 @@ impl Mob {
             sitting: m.extra.sitting,
             silent: m.silent,
             lying: m.species() == Species::Cat && (m.extra.flag || m.extra.relax_one),
-            ridden: m.rider.is_some() || m.extra.rider.is_some() || m.extra.mount.is_some(),
+            ridden: m.rider.is_some() || m.extra.rider.is_some() || m.mount.is_some(),
             is_vehicle: equine::is_vehicle(m),
             still: m.species() == Species::HappyGhast && happy_ghast::on_still_timeout(m),
             carrying: m.rider.is_some() || m.extra.rider.is_some(),
@@ -3713,7 +3717,8 @@ impl Mob {
             persistent: false,
             random,
             ai: Box::default(),
-            extra: Extra::default(),
+            extra: Box::default(),
+            mount: None,
             fluids: living::Fluids::default(),
             was_eye_in_water: false,
             first_tick: true,
@@ -3815,7 +3820,7 @@ impl Mob {
     /// (`vehicle.getPassengerRidingPosition(this).y`).
     pub fn hitbox(&self) -> Aabb {
         let b = self.bounds();
-        match self.extra.seat.filter(|s| self.extra.mount == Some(s.0)) {
+        match self.extra.seat.filter(|s| self.mount == Some(s.0)) {
             Some((_, offset, _)) => {
                 let (lo, hi) = (b.min_position(), b.max_position());
                 let y = (self.position.y + offset).max(lo.y);
@@ -3829,7 +3834,7 @@ impl Mob {
     pub fn attack_box(&self, range: f64, vehicle: Option<Aabb>) -> Aabb {
         let b = self.bounds();
         let (mut lo, mut hi) = (b.min_position(), b.max_position());
-        if let Some(vehicle) = vehicle.filter(|_| self.extra.mount.is_some()) {
+        if let Some(vehicle) = vehicle.filter(|_| self.mount.is_some()) {
             let (vlo, vhi) = (vehicle.min_position(), vehicle.max_position());
             lo = Vec3::new(lo.x.min(vlo.x), lo.y, lo.z.min(vlo.z));
             hi = Vec3::new(hi.x.max(vhi.x), hi.y, hi.z.max(vhi.z));

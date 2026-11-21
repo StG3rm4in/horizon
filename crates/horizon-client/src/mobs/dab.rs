@@ -89,7 +89,7 @@ pub fn exempt(m: &Mob) -> bool {
         || super::raider::in_raid(m)
         || m.rider.is_some()
         || m.extra.rider.is_some()
-        || m.extra.mount.is_some()
+        || m.mount.is_some()
         || m.extra.leash.is_some()
         || m.extra.leash_pending.is_some()
         || m.extra.leash_player.is_some()

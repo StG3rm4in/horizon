@@ -242,7 +242,7 @@ impl Game<'_> {
             if let Some(m) = self.mob_object_mut(rider) {
                 // Preserve the tree for serialization after all transitions
                 // have used the positions left by ejectPassengers.
-                m.extra.mount = Some(root);
+                m.mount = Some(root);
                 m.extra.passenger = true;
             }
         }
@@ -394,7 +394,7 @@ impl Game<'_> {
             // these kinds but a mob a server seats on a primed TNT.
             if source == destination
                 || game.lone_traveller_box(id).is_none()
-                || game.mobs.iter().any(|m| m.extra.mount == Some(id))
+                || game.mobs.iter().any(|m| m.mount == Some(id))
             {
                 return Ok(Some(false));
             }
@@ -478,7 +478,7 @@ impl Game<'_> {
             if game
                 .mobs
                 .iter()
-                .any(|m| m.id == root && m.extra.mount.is_some())
+                .any(|m| m.id == root && m.mount.is_some())
             {
                 game.dismount_mob(root);
             }
@@ -547,7 +547,7 @@ impl Game<'_> {
             // new horse's getViewYRot(0) / getViewXRot(0). A fresh living
             // entity's previous head yaw is still zero, before its first tick.
             let new_root = restored_objects.root;
-            let mounts: Vec<_> = game.mob_objects().map(|m| (m.id, m.extra.mount)).collect();
+            let mounts: Vec<_> = game.mob_objects().map(|m| (m.id, m.mount)).collect();
             let restored = super::persist::vehicle_tree(new_root, &mounts);
             let horses: Vec<_> = game
                 .mob_objects()

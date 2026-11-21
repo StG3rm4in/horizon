@@ -605,7 +605,7 @@ mod tests {
                     let mut m = mob(1, "minecraft:camel");
                     if let Some(name) = rider {
                         let mut r = mob(2, name);
-                        r.extra.mount = Some(m.id);
+                        r.mount = Some(m.id);
                         m.extra.rider = Some(r.id);
                         seen.push(r.seen(None, &crate::items::Items::empty()));
                     }

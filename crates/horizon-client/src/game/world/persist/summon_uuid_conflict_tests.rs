@@ -172,7 +172,7 @@ fn mob_tagged(game: &Game<'_>, tag: &str) -> Vec<u32> {
         .collect()
 }
 fn mount(game: &Game<'_>, id: u32) -> Option<u32> {
-    game.mobs.iter().find(|m| m.id == id).unwrap().extra.mount
+    game.mobs.iter().find(|m| m.id == id).unwrap().mount
 }
 /// The first tag and the UUID of each saved passenger of mob `id`, in order.
 fn saved_riders(game: &mut Game<'_>, id: u32) -> Vec<(String, Option<Tag>)> {
@@ -362,7 +362,7 @@ fn dismount_uses_the_retained_vehicle_and_repairs_both_object_lists() {
 
         game.dismount_mob(leaf);
         let leaf = game.mob_object(leaf).unwrap();
-        assert_eq!(leaf.extra.mount, None);
+        assert_eq!(leaf.mount, None);
         // Entity.getDismountLocationForPassenger: adult pig height is 0.9f.
         assert_eq!(leaf.position, Vec3::new(4.5, 200.89999997615814, 4.5));
         assert_eq!(game.mob_object(rejected).unwrap().extra.rider, None);
@@ -370,7 +370,7 @@ fn dismount_uses_the_retained_vehicle_and_repairs_both_object_lists() {
 
         // Entity.remove ejects even a passenger that never entered the level.
         game.dismount_mob(rejected);
-        assert_eq!(game.mob_object(rejected).unwrap().extra.mount, None);
+        assert_eq!(game.mob_object(rejected).unwrap().mount, None);
         assert_eq!(game.mob_object(root).unwrap().extra.rider, None);
         assert!(game.level_entity(rejected as i32).is_none());
     });

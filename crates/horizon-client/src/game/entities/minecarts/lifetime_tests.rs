@@ -364,7 +364,7 @@ fn destroyed_carts_retain_authoritative_state_and_retire_their_registration() {
                 game.riding = Some(73);
                 let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
                 let mut rider = horizon_client::mobs::Mob::new(72, kind, start, 0.0);
-                rider.extra.mount = Some(71);
+                rider.mount = Some(71);
                 game.persist
                     .off_level
                     .insert(72, super::super::persist::OffLevel::Mob(rider));
@@ -398,7 +398,7 @@ fn destroyed_carts_retain_authoritative_state_and_retire_their_registration() {
                 assert!(game.entity(71).is_none());
                 assert!(!game.carts.iter().any(|cart| cart.id == 71));
                 assert_vehicle_residency_retired(game, 71);
-                assert_eq!(game.mob_object(72).unwrap().extra.mount, Some(71));
+                assert_eq!(game.mob_object(72).unwrap().mount, Some(71));
                 assert_eq!(game.carts[0].velocity, Vec3::new(7.0, 8.0, 9.0));
                 let Some(super::super::persist::RemovedVehicle::Cart(cart)) =
                     game.persist.removed_vehicles.get(&71)
@@ -433,7 +433,7 @@ fn destroyed_carts_retain_authoritative_state_and_retire_their_registration() {
                     assert_eq!(cart.damage, if mode == 2 { 57.0 } else { 7.0 });
                     assert_eq!(cart.position, start);
                 }
-                game.mob_object_mut(72).unwrap().extra.mount = None;
+                game.mob_object_mut(72).unwrap().mount = None;
                 game.release_removed_vehicle(71);
                 assert!(!game.persist.removed_vehicles.contains_key(&71));
                 assert_vehicle_residency_retired(game, 71);

@@ -547,7 +547,7 @@ pub fn tick(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
 /// raw peek, pushing whatever it opens into.
 pub fn shell_tick(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     let p = block_pos(m);
-    if m.extra.mount.is_none() && !can_stay_at(m, w, p, m.extra.variant3) {
+    if m.mount.is_none() && !can_stay_at(m, w, p, m.extra.variant3) {
         match attachable(m, w, p) {
             Some(f) => m.extra.variant3 = f,
             None => {

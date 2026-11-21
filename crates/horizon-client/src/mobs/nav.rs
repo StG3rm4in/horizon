@@ -230,7 +230,7 @@ impl Mob {
             // without this).
             NavKind::Ground | NavKind::WallClimber => {
                 self.ai.navigation_redirect.as_ref().map_or_else(
-                    || self.on_ground || self.is_in_liquid() || self.extra.mount.is_some(),
+                    || self.on_ground || self.is_in_liquid() || self.mount.is_some(),
                     |r| r.body.on_ground || r.in_liquid || r.passenger,
                 )
             }
@@ -1001,9 +1001,9 @@ mod tests {
             !m.can_update_path(),
             "in the air with no vehicle: no path is made or followed"
         );
-        m.extra.mount = Some(7);
+        m.mount = Some(7);
         assert!(m.can_update_path(), "riding a vehicle: isPassenger()");
-        m.extra.mount = None;
+        m.mount = None;
         m.fluids.in_water = true;
         assert!(m.can_update_path(), "in a liquid");
     }

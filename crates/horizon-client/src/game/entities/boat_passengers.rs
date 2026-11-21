@@ -137,7 +137,7 @@ impl Game<'_> {
     /// next written: each boat asks for its passengers and each cart on rails whether it is
     /// ridden, and each one walked every mob of the level.
     fn vehicle_riders(&self, id: u32) -> Vec<usize> {
-        let rides = |v: u32| move |&j: &usize| self.mobs[j].extra.mount == Some(v);
+        let rides = |v: u32| move |&j: &usize| self.mobs[j].mount == Some(v);
         if !self.vehicle_mobs_indexed() {
             return (0..self.mobs.len()).filter(rides(id)).collect();
         }
@@ -146,7 +146,7 @@ impl Game<'_> {
         if riders.as_ref().is_none_or(|(s, _)| *s != stamp) {
             let mut by_vehicle = FxHashMap::<u32, Vec<usize>>::default();
             for (j, m) in self.mobs.iter().enumerate() {
-                if let Some(v) = m.extra.mount {
+                if let Some(v) = m.mount {
                     by_vehicle.entry(v).or_default().push(j);
                 }
             }
@@ -162,7 +162,7 @@ impl Game<'_> {
         let riders = self.vehicle_riders(id);
         riders.iter().any(|&j| !self.mobs[j].removed)
             || self.persist.off_level.values().any(|entity| {
-                matches!(entity, super::persist::OffLevel::Mob(m) if !m.removed && m.extra.mount == Some(id))
+                matches!(entity, super::persist::OffLevel::Mob(m) if !m.removed && m.mount == Some(id))
             })
     }
     /// Whether what a stretch of vehicle ticks reads from the mob list may stand in for a walk
@@ -267,7 +267,7 @@ impl Game<'_> {
         self.boat_players(id)
             + self
                 .mob_objects()
-                .filter(|m| m.extra.mount == Some(id) && !m.removed)
+                .filter(|m| m.mount == Some(id) && !m.removed)
                 .count()
     }
     /// `AbstractBoat.canAddPassenger`: a seat is free and the boat is not
@@ -293,7 +293,7 @@ impl Game<'_> {
     pub(super) fn mob_root_vehicle(&self, mut j: usize) -> Option<u32> {
         let mut root = None;
         for _ in 0..8 {
-            let Some(v) = self.mobs[j].extra.mount else {
+            let Some(v) = self.mobs[j].mount else {
                 break;
             };
             root = Some(v);
@@ -335,7 +335,7 @@ impl Game<'_> {
     pub(super) fn boat_obstacles(&self, id: u32, area: Aabb) -> Vec<Aabb> {
         let mut out = Vec::new();
         self.mobs_meeting(area, |j, m, b| {
-            if pushable(m) && (m.extra.mount.is_none() || self.mob_root_vehicle(j) != Some(id)) {
+            if pushable(m) && (m.mount.is_none() || self.mob_root_vehicle(j) != Some(id)) {
                 out.push(b);
             }
         });
@@ -406,7 +406,7 @@ impl Game<'_> {
             .into_iter()
             .filter_map(|j| {
                 let m = &self.mobs[j];
-                if !pushable(m) || m.extra.mount.is_some() && self.mob_root_vehicle(j) == Some(id) {
+                if !pushable(m) || m.mount.is_some() && self.mob_root_vehicle(j) == Some(id) {
                     return None;
                 }
                 let mb = m.bounds();
@@ -443,7 +443,7 @@ impl Game<'_> {
                 let m = &self.mobs[j];
                 let boards = pick_up
                     && count < max
-                    && m.extra.mount.is_none()
+                    && m.mount.is_none()
                     && m.width() < super::boats::WIDTH as f32
                     && !self
                         .res
@@ -470,12 +470,12 @@ impl Game<'_> {
                         let Some(m) = self
                             .mobs
                             .iter_mut()
-                            .find(|m| m.id == mob && !m.removed && m.extra.mount.is_none())
+                            .find(|m| m.id == mob && !m.removed && m.mount.is_none())
                         else {
                             continue;
                         };
                         horizon_client::mobs::shulker::on_start_riding(m);
-                        m.extra.mount = Some(id);
+                        m.mount = Some(id);
                         m.extra.passenger = true;
                         m.ai.nav.stop();
                         count += 1;
@@ -542,7 +542,7 @@ impl Game<'_> {
             let cid = self.carts[c].id;
             let ridden = self.riding == Some(cid)
                 || guest_carts.contains(&cid)
-                || self.mobs.iter().any(|m| m.extra.mount == Some(cid));
+                || self.mobs.iter().any(|m| m.mount == Some(cid));
             if !ridden {
                 self.carts
                     .update(c, |c| c.velocity = c.velocity.add_vector(v));
@@ -744,7 +744,7 @@ impl Game<'_> {
         for rider in self.mob_passenger_ids(vehicle) {
             if self
                 .mob_object(rider)
-                .is_some_and(|mob| !mob.removed && mob.extra.mount == Some(vehicle))
+                .is_some_and(|mob| !mob.removed && mob.mount == Some(vehicle))
             {
                 self.dismount_cart_mob_at(rider, y);
             }
@@ -760,7 +760,7 @@ impl Game<'_> {
         for rider in self.mob_passenger_ids(id) {
             if self
                 .mob_object(rider)
-                .is_none_or(|m| m.removed || m.extra.mount != Some(id))
+                .is_none_or(|m| m.removed || m.mount != Some(id))
             {
                 continue;
             }
@@ -769,7 +769,7 @@ impl Game<'_> {
             }
             let Some(m) = self
                 .mob_object(rider)
-                .filter(|m| !m.removed && m.extra.mount == Some(id))
+                .filter(|m| !m.removed && m.mount == Some(id))
             else {
                 continue;
             };
@@ -791,7 +791,7 @@ impl Game<'_> {
                 )
             };
             let m = self.mob_object_mut(rider).unwrap();
-            m.extra.mount = None;
+            m.mount = None;
             m.extra.passenger = false;
             m.extra.boarding_cooldown = BOARDING_COOLDOWN;
             m.position = at;
@@ -818,7 +818,7 @@ mod tests {
             ));
             for id in [72, 73] {
                 let mut rider = Mob::new(id, kind.clone(), Vec3::ZERO, 0.0);
-                rider.extra.mount = Some(71);
+                rider.mount = Some(71);
                 game.persist
                     .off_level
                     .insert(id, super::super::persist::OffLevel::Mob(rider));
@@ -827,7 +827,7 @@ mod tests {
             // An ordinary oak boat has two seats; rejected passengers still own both.
             assert_eq!(game.boat_passengers(71), 2);
             assert!(!game.boat_has_room(0));
-            game.mob_object_mut(73).unwrap().extra.mount = None;
+            game.mob_object_mut(73).unwrap().mount = None;
             assert_eq!(game.boat_passengers(71), 1);
             assert!(game.boat_has_room(0));
         });
@@ -1000,13 +1000,13 @@ mod tests {
         }
         let riders =
             |game: &Game| [100, 101, 102].map(|id| (game.mob_rides(id), game.boat_mobs(id)));
-        game.mobs[0].extra.mount = Some(100);
+        game.mobs[0].mount = Some(100);
         game.vehicles_ticking(true);
         let none = (false, vec![]);
         assert_eq!(riders(&game), [(true, vec![0]), none.clone(), none.clone()]);
         game.mobs[0].removed = true;
-        game.mobs[1].extra.mount = Some(101);
-        game.mobs[3].extra.mount = Some(102);
+        game.mobs[1].mount = Some(101);
+        game.mobs[3].mount = Some(102);
         game.mobs[3].health = 0.0;
         let after = [none, (true, vec![1]), (true, vec![])];
         assert_eq!(riders(&game), after);
@@ -1026,10 +1026,10 @@ mod off_level_tests {
             let pig = game.res.mob_types().get("minecraft:pig").unwrap().clone();
             let boat = Boat::new(71, "oak".into(), Vec3::new(1.0, 80.0, 0.5), 0.0);
             let mut ghost = horizon_client::mobs::Mob::new(72, pig.clone(), Vec3::ZERO, 0.0);
-            ghost.extra.mount = Some(71);
+            ghost.mount = Some(71);
             ghost.extra.vehicle_order = 0;
             let mut resident = horizon_client::mobs::Mob::new(73, pig, Vec3::ZERO, 0.0);
-            resident.extra.mount = Some(71);
+            resident.mount = Some(71);
             resident.extra.vehicle_order = 1;
             let offset = riders::vehicle_attachment(&resident, 1.375);
             let expected = boat.seat(1, 2, true, offset, false);
@@ -1107,12 +1107,12 @@ mod boat_callback_review_tests {
                 let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
                 for id in [72, 73, 74] {
                     let mut mob = Mob::new(id, kind.clone(), Vec3::ZERO, 0.0);
-                    mob.extra.mount = (id != 74).then_some(71);
+                    mob.mount = (id != 74).then_some(71);
                     mob.extra.vehicle_order = i64::from(id);
                     game.mobs.push(mob);
                 }
                 game.eject_boat_mobs(0, true);
-                assert_eq!(game.mob_object(73).unwrap().extra.mount, Some(74));
+                assert_eq!(game.mob_object(73).unwrap().mount, Some(74));
                 assert_eq!(
                     heard
                         .lock()
@@ -1149,10 +1149,10 @@ mod boat_callback_review_tests {
                 let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
                 let original = Vec3::new(2.0, 60.0, 3.0);
                 let mut rider = Mob::new(72, kind.clone(), original, 0.0);
-                rider.extra.mount = Some(71);
+                rider.mount = Some(71);
                 game.mobs.push(rider);
                 let mut child = Mob::new(73, kind, original, 0.0);
-                child.extra.mount = Some(72);
+                child.mount = Some(72);
                 game.mobs.push(child);
                 let mut boat = game.boats[0].clone();
                 boat.position = Vec3::new(40.0, 70.0, 40.0);

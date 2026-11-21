@@ -438,8 +438,7 @@ fn is_baby_riding_baby(m: &Mob, w: &MobWorld) -> bool {
     if !m.is_baby() {
         return false;
     }
-    m.extra
-        .mount
+    m.mount
         .and_then(|id| w.seen(id))
         .is_some_and(|v| v.baby && matches!(v.species, Species::Piglin | Species::Hoglin))
 }
@@ -609,7 +608,7 @@ fn block_of(at: Vec3) -> [i32; 3] {
 /// it ends once the target's block is a block away (`reachedTarget`) and aims
 /// again when that block has moved more than 2 blocks.
 fn mount(m: &mut Mob, cx: &mut Cx) {
-    if m.extra.mount.is_some() {
+    if m.mount.is_some() {
         return;
     }
     let Some(ride) = m.extra.piglin.ride else {
@@ -673,7 +672,7 @@ fn wants_to_stop_riding(m: &Mob, vehicle: &Seen) -> bool {
 /// blocks and the piglin does not want off it; if not, the piglin gets off
 /// and forgets the ride target. A vehicle gone from the level counts as dead.
 fn dismount_or_skip_mounting(m: &mut Mob, w: &MobWorld) {
-    let Some(vehicle) = m.extra.mount.or(m.extra.piglin.ride.map(|r| r.vehicle)) else {
+    let Some(vehicle) = m.mount.or(m.extra.piglin.ride.map(|r| r.vehicle)) else {
         return;
     };
     let keep = match w.seen(vehicle) {
@@ -689,7 +688,7 @@ fn dismount_or_skip_mounting(m: &mut Mob, w: &MobWorld) {
 /// `LivingEntity.stopRiding`: get off the vehicle, onto the spot
 /// `Animal.getDismountLocationForPassenger` finds beside it.
 fn dismount(m: &mut Mob, w: &MobWorld) {
-    let Some(vehicle) = m.extra.mount else { return };
+    let Some(vehicle) = m.mount else { return };
     let at = w
         .seen(vehicle)
         .map(|s| super::riders::dismount_location(w, s, m.width(), m.height()));

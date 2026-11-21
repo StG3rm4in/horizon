@@ -48,7 +48,7 @@ impl Game<'_> {
                 || m.species() == horizon_client::mobs::Species::Bat
                 || self
                     .riding
-                    .is_some_and(|v| v == m.id || m.extra.mount == Some(v))
+                    .is_some_and(|v| v == m.id || m.mount == Some(v))
                 || !m.bounds().intersects(bounds)
             {
                 continue;

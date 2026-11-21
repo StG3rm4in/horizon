@@ -940,9 +940,9 @@ mod tests {
             };
             check(game, cow, true);
             check(game, wither, false);
-            game.mobs[0].extra.mount = Some(99);
+            game.mobs[0].mount = Some(99);
             check(game, cow, false);
-            game.mobs[0].extra.mount = None;
+            game.mobs[0].mount = None;
             game.riding = Some(12);
             check(game, cow, false);
             game.riding = None;

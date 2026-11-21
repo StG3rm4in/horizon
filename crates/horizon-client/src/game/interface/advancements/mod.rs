@@ -735,7 +735,7 @@ impl Game<'_> {
             passengers: self
                 .mobs
                 .iter()
-                .filter(|m| m.extra.mount == Some(b.id))
+                .filter(|m| m.mount == Some(b.id))
                 .map(|m| self.mob_entity(m))
                 .chain(self.rider_entity(b.id))
                 .collect(),
@@ -787,7 +787,7 @@ impl Game<'_> {
         let passengers: Vec<EntityView> = self
             .mobs
             .iter()
-            .filter(|r| r.extra.mount == Some(m.id))
+            .filter(|r| r.mount == Some(m.id))
             .map(|r| self.mob_entity(r))
             .chain(self.rider_entity(m.id))
             .collect();
@@ -803,7 +803,7 @@ impl Game<'_> {
             super::persist::add_passengers(&mut tag, riders);
             tag
         });
-        let movement = (m.extra.mount.is_none()
+        let movement = (m.mount.is_none()
             && m.rider.is_none()
             && self.riding != Some(m.id)
             && self.lan.as_ref().is_none_or(|host| {
@@ -2188,7 +2188,7 @@ impl Game<'_> {
     /// for every `ServerPlayer` in `entityToRide.getIndirectPassengersStream()`.
     pub(super) fn trigger_started_riding(&mut self, vehicle: u32) {
         let mounts: Vec<(u32, Option<u32>)> =
-            self.mobs.iter().map(|m| (m.id, m.extra.mount)).collect();
+            self.mobs.iter().map(|m| (m.id, m.mount)).collect();
         let aboard = super::boarding::passenger_vehicles(vehicle, &mounts);
         self.for_each_player(|g| {
             if g.riding.is_some_and(|v| aboard.contains(&v)) {
@@ -3736,7 +3736,7 @@ mod movement_predicate_tests {
         assert_eq!(mob.velocity, Vec3::ZERO);
         assert_eq!(mob.fall_distance, 0.0);
         assert!(mob.no_ai && mob.no_gravity);
-        assert!(mob.extra.mount.is_none());
+        assert!(mob.mount.is_none());
         let view = game.entity_view_of(super::super::commands::Target::Mob(id));
         assert_eq!(view.kind, "minecraft:pig");
         let mut failures = Vec::new();

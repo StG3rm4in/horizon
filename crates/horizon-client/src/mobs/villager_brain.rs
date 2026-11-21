@@ -2192,7 +2192,7 @@ impl B {
                 r
             }
             B::SleepInBed { t, next_ok } => {
-                if m.extra.mount.is_some() {
+                if m.mount.is_some() {
                     return false;
                 }
                 let mm = mem(m);

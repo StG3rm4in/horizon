@@ -51,7 +51,7 @@ impl Game<'_> {
                 .find(|c| c.id as i32 == hit.id)
                 .map(|c| {
                     let ridden = self.riding == Some(c.id)
-                        || self.mobs.iter().any(|m| m.extra.mount == Some(c.id));
+                        || self.mobs.iter().any(|m| m.mount == Some(c.id));
                     (
                         c.kind
                             .interact_passes(sneaking, ridden, self.can_use_game_master_blocks()),
@@ -68,7 +68,7 @@ impl Game<'_> {
                     || self
                         .mobs
                         .iter()
-                        .any(|m| m.extra.mount.is_some_and(|r| r as i32 == hit.id)));
+                        .any(|m| m.mount.is_some_and(|r| r as i32 == hit.id)));
             let passes =
                 is_painting || frame_passes || boat_passes || cart_passes || cushion_passes;
             // Otherwise the main hand's turn takes it; there is no off hand turn.

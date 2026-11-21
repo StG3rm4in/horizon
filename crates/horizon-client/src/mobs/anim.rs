@@ -294,7 +294,7 @@ pub fn walk_position(m: &Mob, alpha: f32) -> f32 {
 /// the rider of a living vehicle is drawn from the vehicle's body and its own
 /// head, any other mob from its own body.
 pub fn body_rot(m: &Mob, alpha: f32) -> f32 {
-    match m.extra.vehicle_body.filter(|v| m.extra.mount == Some(v.0)) {
+    match m.extra.vehicle_body.filter(|v| m.mount == Some(v.0)) {
         Some((_, before, now)) => {
             let head = m.previous_head_yaw + wrap(m.head_yaw - m.previous_head_yaw) * alpha;
             super::riders::solve_body_rot(head, before + wrap(now - before) * alpha)

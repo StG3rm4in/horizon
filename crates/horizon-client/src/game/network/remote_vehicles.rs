@@ -182,11 +182,11 @@ impl Game<'_> {
             if m.id == vehicle_id {
                 m.extra.rider = passengers.first().map(|&p| p as u32);
             }
-            if m.extra.mount == Some(vehicle_id) && !passengers.contains(&(m.id as i32)) {
-                m.extra.mount = None;
+            if m.mount == Some(vehicle_id) && !passengers.contains(&(m.id as i32)) {
+                m.mount = None;
                 m.extra.passenger = false;
             } else if passengers.contains(&(m.id as i32)) {
-                m.extra.mount = Some(vehicle_id);
+                m.mount = Some(vehicle_id);
                 m.extra.passenger = true;
             }
         }

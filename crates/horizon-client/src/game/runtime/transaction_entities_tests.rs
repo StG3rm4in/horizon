@@ -346,7 +346,6 @@ fn a_removal_then_abort_keeps_the_row_map_and_rider() {
                 .iter()
                 .find(|m| m.id == cow.id())
                 .unwrap()
-                .extra
                 .mount
         };
         assert_eq!(mount(game), Some(boat.id()), "the rider stays on");

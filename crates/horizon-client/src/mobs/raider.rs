@@ -609,7 +609,7 @@ impl Goal for Celebration {
         }
         // Raider.RaiderCelebration.tick: a raider riding a ravager (or any
         // vehicle) does not jump. The roll is skipped too, as in vanilla.
-        if m.extra.mount.is_none()
+        if m.mount.is_none()
             && m.random
                 .next_int_bound(super::goals::reduced(50))
                 .unwrap_or(1)
@@ -882,7 +882,7 @@ mod tests {
                     m.random.set_seed(seed);
                     m.extra.raider = Some(Box::default());
                     if riding {
-                        m.extra.mount = Some(9);
+                        m.mount = Some(9);
                     }
                     let mut goal = Celebration;
                     let mut test_level = crate::health::TestLevel::new(1);

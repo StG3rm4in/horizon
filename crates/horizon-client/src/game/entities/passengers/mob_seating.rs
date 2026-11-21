@@ -3,7 +3,7 @@ use super::*;
 
 impl Game<'_> {
     pub(in crate::game) fn position_mob_rider(&mut self, i: usize, index: &HashMap<u32, usize>) {
-        let Some(v) = self.mobs[i].extra.mount else {
+        let Some(v) = self.mobs[i].mount else {
             return;
         };
         let Some(&j) = index.get(&v) else {
@@ -61,7 +61,7 @@ impl Game<'_> {
             // Camel.getPassengerAttachmentPoint: the seat follows the
             // rider's place in `getPassengers` (load order).
             let mut aboard: Vec<usize> = (0..self.mobs.len())
-                .filter(|&k| self.mobs[k].extra.mount == Some(v))
+                .filter(|&k| self.mobs[k].mount == Some(v))
                 .collect();
             let player_aboard = vehicle.rider.is_some() || self.riding == Some(v);
             let (seat, count) = if player_aboard {
@@ -104,7 +104,7 @@ impl Game<'_> {
             let seat = usize::from(player_aboard)
                 + self.mobs[..i]
                     .iter()
-                    .filter(|r| r.extra.mount == Some(v))
+                    .filter(|r| r.mount == Some(v))
                     .count();
             let seat = if self.persist.off_level.is_empty() {
                 seat
@@ -158,12 +158,12 @@ impl Game<'_> {
         i: usize,
         index: &HashMap<u32, usize>,
     ) {
-        if let Some(vehicle) = self.mobs[i].extra.mount {
+        if let Some(vehicle) = self.mobs[i].mount {
             let aboard = self
                 .mobs
                 .iter()
                 .enumerate()
-                .filter_map(|(j, m)| (m.extra.mount == Some(vehicle)).then_some(j))
+                .filter_map(|(j, m)| (m.mount == Some(vehicle)).then_some(j))
                 .collect();
             let riders = Riders::from([(vehicle, aboard)]);
             self.seat_boat_mobs(&riders);

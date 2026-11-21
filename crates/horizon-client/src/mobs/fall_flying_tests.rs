@@ -136,7 +136,7 @@ fn a_grounded_riding_or_levitating_mob_stops_gliding() {
                 let mut grounded = husk(types, no_ai, Some(0));
                 grounded.on_ground = true;
                 let mut riding = husk(types, no_ai, Some(0));
-                riding.extra.mount = Some(99);
+                riding.mount = Some(99);
                 let mut levitating = husk(types, no_ai, Some(0));
                 levitating.add_effect("minecraft:levitation", 200, 0);
                 for (what, mut m) in [

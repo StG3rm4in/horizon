@@ -805,7 +805,7 @@ impl B {
             // ForceUnmount: `Warden.canRide` is false, but `/ride` and a
             // summon's `Passengers` force it aboard; `unRide` gets it off.
             B::ForceUnmount(t) => {
-                if m.extra.mount.is_none() {
+                if m.mount.is_none() {
                     return false;
                 }
                 t.begin(cx.level.random(), cx.now);
@@ -814,7 +814,6 @@ impl B {
                     from: m.position,
                 });
                 let at = m
-                    .extra
                     .mount
                     .and_then(|v| cx.w.seen(v))
                     .map(|v| super::riders::dismount_location(cx.w, v, m.width(), m.height()));
@@ -1677,11 +1676,11 @@ mod tests {
                     now: 100,
                 };
                 assert!(!b.try_start(&mut m, &mut cx), "nothing to get off");
-                m.extra.mount = Some(7);
+                m.mount = Some(7);
                 m.extra.passenger = true;
                 assert!(b.try_start(&mut m, &mut cx));
             }
-            assert_eq!(m.extra.mount, None);
+            assert_eq!(m.mount, None);
             assert!(!m.extra.passenger);
             assert!(matches!(
                 events[..],

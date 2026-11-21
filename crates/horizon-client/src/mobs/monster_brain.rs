@@ -901,9 +901,8 @@ impl B {
                 {
                     return false;
                 }
-                let stuck = m.extra.mount.is_some()
-                    || m.fluids.in_water
-                    || m.has_effect("minecraft:levitation");
+                let stuck =
+                    m.mount.is_some() || m.fluids.in_water || m.has_effect("minecraft:levitation");
                 if !stuck {
                     return false;
                 }

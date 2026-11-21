@@ -67,7 +67,7 @@ impl Game<'_> {
         }
         seats.extend(
             self.mob_objects()
-                .filter(|m| m.extra.mount == Some(vehicle) && !m.removed)
+                .filter(|m| m.mount == Some(vehicle) && !m.removed)
                 .map(|m| (m.extra.vehicle_order, m.id, false)),
         );
         seats.sort_by_key(|&(place, ..)| place);
@@ -87,7 +87,7 @@ impl Game<'_> {
     /// `addPassenger` for the mob `id`, linked to its vehicle just now.
     pub(in crate::game) fn seat_mob(&mut self, id: u32) {
         let mount = self.mob_object(id);
-        let Some(vehicle) = mount.and_then(|m| m.extra.mount) else {
+        let Some(vehicle) = mount.and_then(|m| m.mount) else {
             return;
         };
         let order = self.boarding_order(vehicle, id, false);
@@ -137,14 +137,14 @@ mod tests {
             let pig = game.res.mob_types().get("minecraft:pig").unwrap().clone();
             for (id, order) in [(74, 2), (72, 0)] {
                 let mut m = Mob::new(id, pig.clone(), Vec3::ZERO, 0.0);
-                m.extra.mount = Some(71);
+                m.mount = Some(71);
                 m.extra.vehicle_order = order;
                 game.persist
                     .off_level
                     .insert(id, crate::game::persist::OffLevel::Mob(m));
             }
             let mut resident = Mob::new(73, pig, Vec3::ZERO, 0.0);
-            resident.extra.mount = Some(71);
+            resident.mount = Some(71);
             resident.extra.vehicle_order = 1;
             game.mobs.push(resident);
             assert_eq!(

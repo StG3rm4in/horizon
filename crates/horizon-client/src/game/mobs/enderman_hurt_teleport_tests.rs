@@ -279,7 +279,7 @@ fn a_teleporting_shulker_leaves_its_rider_behind() {
         let z = game.mobs.iter().find(|m| m.id == rider).unwrap();
         if s.position.distance(at) > 0.5 {
             teleported += 1;
-            assert_eq!(z.extra.mount, None, "seed {seed}: still riding");
+            assert_eq!(z.mount, None, "seed {seed}: still riding");
             assert_eq!(s.extra.rider, None, "seed {seed}: still carrying");
             assert!(
                 z.position.distance(at) < 2.0,
@@ -288,7 +288,7 @@ fn a_teleporting_shulker_leaves_its_rider_behind() {
             );
         } else {
             assert_eq!(
-                z.extra.mount,
+                z.mount,
                 Some(id),
                 "seed {seed}: thrown off without a teleport"
             );

@@ -63,7 +63,7 @@ impl Game<'_> {
         match t {
             Target::Player => self.riding,
             Target::Guest(conn) => self.command_guest(conn)?.vehicle,
-            Target::Mob(id) => self.mob_object(id).filter(|m| !m.removed)?.extra.mount,
+            Target::Mob(id) => self.mob_object(id).filter(|m| !m.removed)?.mount,
             // A general row rides the row its tree loaded with; a row queued
             // for removal rides nothing, as a removed mob does not.
             Target::General(id) => self
@@ -878,7 +878,7 @@ mod tests {
                 }
                 assert!(game.start_riding_target(Target::Mob(40), Target::Mob(41), true));
                 assert!(!game.start_riding_target(Target::Mob(40), Target::Mob(42), true));
-                assert_eq!(game.mobs[0].extra.mount, Some(41));
+                assert_eq!(game.mobs[0].mount, Some(41));
                 assert_eq!(*events.lock().unwrap(), [true, true, false]);
             });
         });
@@ -913,13 +913,13 @@ mod tests {
                     "ride @e[type=minecraft:zombie,limit=1] mount @e[type=minecraft:pig,limit=1]";
                 let boat = "ride @e[type=minecraft:zombie,limit=1] mount @e[type=minecraft:oak_boat,limit=1]";
                 assert!(game.run_command(pig));
-                game.mobs[0].extra.mount = None;
+                game.mobs[0].mount = None;
                 game.mobs[1].extra.rider = None;
                 assert!(game.run_command(boat));
-                game.mobs[0].extra.mount = None;
-                game.mobs[2].extra.mount = Some(41);
+                game.mobs[0].mount = None;
+                game.mobs[2].mount = Some(41);
                 game.mobs[1].extra.rider = Some(42);
-                game.mobs[3].extra.mount = Some(44);
+                game.mobs[3].mount = Some(44);
                 game.riding = Some(44);
                 events.lock().unwrap().clear();
                 let rider = game.entity(40).unwrap();
@@ -935,8 +935,8 @@ mod tests {
                 // /ride forces mob boarding: capacity alone must not suppress its hook.
                 assert!(game.run_command(pig));
                 assert_eq!(*events.lock().unwrap(), [true]);
-                assert_eq!(game.mobs[0].extra.mount, Some(41));
-                assert_eq!(game.mobs[2].extra.mount, Some(41));
+                assert_eq!(game.mobs[0].mount, Some(41));
+                assert_eq!(game.mobs[2].mount, Some(41));
             });
         });
     }
@@ -1105,7 +1105,7 @@ mod tests {
             assert!(!game.entity_start_riding(rider, vehicle, true));
             game.held_out.pop();
             assert!(game.entity_start_riding(rider, vehicle, true));
-            assert_eq!(game.mobs[0].extra.mount, Some(51));
+            assert_eq!(game.mobs[0].mount, Some(51));
         });
     }
 
@@ -1222,7 +1222,7 @@ mod tests {
                 None,
                 "an off-level root is not its resident descendant"
             );
-            game.mob_object_mut(84).unwrap().extra.mount = Some(80);
+            game.mob_object_mut(84).unwrap().mount = Some(80);
             assert_eq!(top.is_passenger_of_same_vehicle(game, apart), Some(true));
             assert_eq!(apart.root_vehicle(game), None);
             assert_eq!(top.is_passenger_of_same_vehicle(game, top), Some(true));
@@ -1241,7 +1241,7 @@ mod tests {
                 .insert(85, super::super::persist::OffLevel::Mob(ghost));
             game.persist.uuids.insert(80, [1, 2, 3, 4]);
             game.persist.uuids.insert(85, [1, 2, 3, 4]);
-            game.mob_object_mut(84).unwrap().extra.mount = Some(85);
+            game.mob_object_mut(84).unwrap().mount = Some(85);
             assert_eq!(
                 top.is_passenger_of_same_vehicle(game, apart),
                 Some(false),
@@ -1252,11 +1252,11 @@ mod tests {
             let mut leaf = root;
             for id in 201..=270 {
                 let rider = add_mob(game, id, "minecraft:pig", Vec3::ZERO);
-                game.mob_object_mut(id).unwrap().extra.mount = Some(leaf.id());
+                game.mob_object_mut(id).unwrap().mount = Some(leaf.id());
                 leaf = rider;
             }
             assert_eq!(leaf.root_vehicle(game), Some(root));
-            game.mob_object_mut(200).unwrap().extra.mount = Some(leaf.id());
+            game.mob_object_mut(200).unwrap().mount = Some(leaf.id());
             assert_eq!(leaf.root_vehicle(game), None, "cycles have no root");
             assert_eq!(root.indirect_passengers(game).unwrap().len(), 70);
         });
@@ -1845,15 +1845,15 @@ mod tests {
             assert!(!game.start_riding_target(Target::Mob(31), Target::Mob(30), true));
             assert!(!game.start_riding_target(Target::Mob(32), Target::Mob(31), false));
             assert!(game.start_riding_target(Target::Mob(32), Target::Mob(31), true));
-            assert_eq!(game.mobs[0].extra.mount, Some(31));
+            assert_eq!(game.mobs[0].mount, Some(31));
             assert_eq!(game.mobs[1].extra.rider, Some(30));
-            assert_eq!(game.mobs[2].extra.mount, Some(31));
+            assert_eq!(game.mobs[2].mount, Some(31));
             game.dismount_mob(30);
-            assert_eq!(game.mobs[0].extra.mount, None);
+            assert_eq!(game.mobs[0].mount, None);
             assert_eq!(game.mobs[0].extra.boarding_cooldown, 60);
             assert!(!game.start_riding_target(Target::Mob(30), Target::Mob(32), false));
             assert!(game.start_riding_target(Target::Mob(30), Target::Mob(32), true));
-            assert_eq!(game.mobs[0].extra.mount, Some(32));
+            assert_eq!(game.mobs[0].mount, Some(32));
         });
     }
 }

@@ -334,7 +334,7 @@ impl CartIndex {
         {
             let mut mounted = FxHashSet::default();
             let grid = SeenGrid::new(mobs.iter().map(|m| {
-                if let Some(v) = m.extra.mount {
+                if let Some(v) = m.mount {
                     mounted.insert(v);
                 }
                 m.bounds()

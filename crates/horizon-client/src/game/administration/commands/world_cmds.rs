@@ -1576,7 +1576,7 @@ impl Game<'_> {
         let id = match t {
             Target::Player => self.riding?,
             Target::Guest(conn) => self.command_guest(conn)?.vehicle?,
-            Target::Mob(id) => self.mobs.iter().find(|m| m.id == id)?.extra.mount?,
+            Target::Mob(id) => self.mobs.iter().find(|m| m.id == id)?.mount?,
             _ => return None,
         };
         Some(if self.boat_object(id).is_some() {
@@ -1624,7 +1624,7 @@ impl Game<'_> {
         let Some(v) = self
             .mob_object(rider)
             .filter(|mob| !mob.removed)
-            .and_then(|mob| mob.extra.mount)
+            .and_then(|mob| mob.mount)
         else {
             return;
         };
@@ -1637,17 +1637,17 @@ impl Game<'_> {
         // A callback can remove or remount the rider. Do not overwrite its decision.
         if self
             .mob_object(rider)
-            .is_none_or(|mob| mob.removed || mob.extra.mount != Some(v))
+            .is_none_or(|mob| mob.removed || mob.mount != Some(v))
         {
             return;
         }
         if let Some(mob) = self.mob_object_mut(rider) {
-            mob.extra.mount = None;
+            mob.mount = None;
         }
         self.unlink_passenger(rider);
         let remaining = self
             .mob_objects()
-            .filter(|m| m.extra.mount == Some(v))
+            .filter(|m| m.mount == Some(v))
             .min_by_key(|m| (m.extra.vehicle_order, m.id))
             .map(|m| m.id);
         if let Some(vehicle) = self.mob_object_mut(v) {

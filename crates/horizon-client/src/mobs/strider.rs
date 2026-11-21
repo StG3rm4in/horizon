@@ -69,7 +69,6 @@ pub fn pre_tick(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     ];
     let in_warm = warm(inside) || warm(m.block_on_legacy(w)) || m.fluids.lava > 0.0;
     let on_warm_strider = m
-        .extra
         .mount
         .and_then(|id| w.seen(id))
         .is_some_and(|v| v.species == Species::Strider && !v.cold_strider);

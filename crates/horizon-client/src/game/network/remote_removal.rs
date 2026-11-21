@@ -26,7 +26,7 @@ impl Game<'_> {
         // Shared/server riding paths can also set these links without a
         // SetPassengers entry. Preserve their cleanup, scanning once per packet.
         for m in &self.mobs {
-            if let Some(id) = m.extra.mount {
+            if let Some(id) = m.mount {
                 include(id);
             }
             if m.extra.rider.is_some() {
@@ -180,7 +180,7 @@ mod tests {
         game.remote_set_passengers(40, &[42]);
         game.remote_set_passengers(41, &[43]);
         assert_eq!(game.armor_stands[0].vehicle, Some(40));
-        assert_eq!(game.mobs[0].extra.mount, Some(41));
+        assert_eq!(game.mobs[0].mount, Some(41));
         game.handle_packet(C::RemoveEntities(play::RemoveEntities {
             ids: vec![44, 40, 46],
         }))
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(r.entities[&42].vehicle, None);
         assert_eq!(game.armor_stands[0].vehicle, None);
         assert_eq!(r.entities[&43].vehicle, Some(41));
-        assert_eq!(game.mobs[0].extra.mount, Some(41));
+        assert_eq!(game.mobs[0].mount, Some(41));
         assert!(game.mobs[0].extra.passenger);
         assert_eq!(r.passenger_vehicles.get(&42), None);
         assert_eq!(r.passenger_vehicles.get(&43), Some(&41));

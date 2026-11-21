@@ -239,7 +239,7 @@ pub(super) fn propose(
             c.species() == Species::Chicken
                 && c.alive()
                 && c.extra.rider.is_none()
-                && c.extra.mount.is_none()
+                && c.mount.is_none()
         })
         .map(|c| (c.id, c.bounds()))
         .collect();
@@ -317,7 +317,7 @@ fn renumber(level: &GameLevel<'_, '_>, made: &mut Made) {
         m.id = id;
     }
     for m in std::iter::once(&mut made.mob).chain(made.created.iter_mut()) {
-        if let Some(l) = m.extra.mount.as_mut()
+        if let Some(l) = m.mount.as_mut()
             && let Some(&id) = links.get(l)
         {
             *l = id;

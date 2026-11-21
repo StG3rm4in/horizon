@@ -75,7 +75,6 @@ impl Game<'_> {
     fn mob_speed(&self, index: usize) -> Vec3 {
         let mut mob = &self.mobs[index];
         while let Some(vehicle) = mob
-            .extra
             .mount
             .and_then(|v| self.mobs.iter().find(|m| m.id == v))
         {
@@ -288,7 +287,7 @@ impl Game<'_> {
             // ...and the attacker stops sprinting.
             self.stop_sprint_after_extra_knockback();
         }
-        let dismounted = dismounts && self.mobs[index].extra.mount.is_some();
+        let dismounted = dismounts && self.mobs[index].mount.is_some();
         if dismounted {
             self.dismount_mob(id);
         }

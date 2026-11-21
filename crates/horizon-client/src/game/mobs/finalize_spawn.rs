@@ -127,7 +127,7 @@ impl Game<'_> {
                 c.species() == Species::Chicken
                     && c.alive()
                     && c.extra.rider.is_none()
-                    && c.extra.mount.is_none()
+                    && c.mount.is_none()
                     && c.bounds().intersects(bounds)
             })
             .map(|c| c.id)

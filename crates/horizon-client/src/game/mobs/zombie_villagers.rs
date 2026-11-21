@@ -92,11 +92,11 @@ impl Game<'_> {
         };
         convert_to_zombie_villager(&old, z);
         for rider in self.mobs.iter_mut() {
-            if rider.extra.mount == Some(old.id) {
-                rider.extra.mount = Some(id);
+            if rider.mount == Some(old.id) {
+                rider.mount = Some(id);
             }
         }
-        if old.extra.mount.is_some() {
+        if old.mount.is_some() {
             self.position_riders();
         }
         if !self.mobs[k].silent {
@@ -171,11 +171,11 @@ impl Game<'_> {
         };
         let drops = convert_to_villager(&old, v, nausea);
         for rider in self.mobs.iter_mut() {
-            if rider.extra.mount == Some(old.id) {
-                rider.extra.mount = Some(vid);
+            if rider.mount == Some(old.id) {
+                rider.mount = Some(vid);
             }
         }
-        if old.extra.mount.is_some() {
+        if old.mount.is_some() {
             self.position_riders();
         }
         for stack in drops {
@@ -290,7 +290,7 @@ fn carry_over(from: &Mob, to: &mut Mob) {
     to.invulnerable_time = from.invulnerable_time;
     to.no_gravity = from.no_gravity;
     to.silent = from.silent;
-    to.extra.mount = from.extra.mount;
+    to.mount = from.mount;
     to.extra.passenger = from.extra.passenger;
     to.fluids.boat = from.fluids.boat;
     to.extra.leash = from.extra.leash;
@@ -477,11 +477,11 @@ mod tests {
         villager.no_gravity = true;
         villager.invulnerable_flag = true;
         villager.extra.left_handed = true;
-        villager.extra.mount = Some(99);
+        villager.mount = Some(99);
         villager.extra.passenger = true;
         let mut zombie = mob(2, Species::ZombieVillager, "minecraft:zombie_villager");
         assert!(!zombie.silent && !zombie.no_ai && !zombie.extra.left_handed);
-        assert_eq!(zombie.extra.mount, None);
+        assert_eq!(zombie.mount, None);
         assert!(!zombie.extra.passenger);
         convert_to_zombie_villager(&villager, &mut zombie);
         assert!(zombie.silent);
@@ -489,7 +489,7 @@ mod tests {
         assert!(zombie.no_gravity);
         assert!(zombie.invulnerable_flag);
         assert!(zombie.extra.left_handed);
-        assert_eq!(zombie.extra.mount, Some(99));
+        assert_eq!(zombie.mount, Some(99));
         assert!(zombie.extra.passenger);
         let mut cured = mob(3, Species::Villager, "minecraft:villager");
         convert_to_villager(&zombie, &mut cured, true);
@@ -498,7 +498,7 @@ mod tests {
         assert!(cured.no_gravity);
         assert!(cured.invulnerable_flag);
         assert!(cured.extra.left_handed);
-        assert_eq!(cured.extra.mount, Some(99));
+        assert_eq!(cured.mount, Some(99));
         assert!(cured.extra.passenger);
         // The cure keeps no equipment: picked-up gear drops, cursed gear goes
         // to the inventory, the rest vanishes.

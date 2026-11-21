@@ -195,7 +195,7 @@ pub struct EntityMemory {
     /// Kept with the level while any live object graph still refers to them.
     pub(super) off_level: HashMap<u32, OffLevel>,
     /// Passengers that ride a vehicle, in load order: live entity IDs or unspawned tags.
-    /// (`passenger_graph.rs`; mob riders also keep `extra.mount`, which stays authoritative
+    /// (`passenger_graph.rs`; mob riders also keep `Mob::mount`, which stays authoritative
     /// for the mob objects above.)
     pub(super) passenger_slots: HashMap<u32, Vec<PassengerSlot>>,
     /// Removed boat/cart objects are never part of level residency.
@@ -1382,7 +1382,7 @@ impl Game<'_> {
     /// The root of a stack of riders (`Entity.getRootVehicle`).
     fn mob_root(&self, mut object: MobObject) -> MobObject {
         for _ in 0..self.mobs.len() + self.persist.off_level.len() {
-            let Some(vehicle) = self.mob_at(object).extra.mount else {
+            let Some(vehicle) = self.mob_at(object).mount else {
                 break;
             };
             let Some(parent) = self.mob_object_slot(vehicle) else {
@@ -1399,7 +1399,7 @@ impl Game<'_> {
         // A mob rider: its mount, when the vehicle is still an object of the level (the
         // object memory also holds riders refused residency).
         if let Some(mob) = self.mob_object(id) {
-            let v = mob.extra.mount?;
+            let v = mob.mount?;
             let there = self.mob_objects().any(|m| m.id == v)
                 || self.boat_object(v).is_some()
                 || self.cart_object(v).is_some()
@@ -1472,7 +1472,7 @@ impl Game<'_> {
         let mounts: Vec<(u32, Option<u32>)> = self
             .mob_objects()
             .filter(|m| !m.removed)
-            .map(|m| (m.id, m.extra.mount))
+            .map(|m| (m.id, m.mount))
             .collect();
         let mut gone = vehicle_tree(root, &mounts);
         // And the riders of other kinds that the slots name.
@@ -2143,7 +2143,7 @@ impl Game<'_> {
         // `Entity.shouldBeSaved`: a passenger saves only under its root, even
         // when that root is a boat or cart retained off-level and never saved.
         let saves = self.mob_root(MobObject::Resident(i)) == MobObject::Resident(i)
-            && m.extra
+            && m
                 .mount
                 .is_none_or(|v| self.boat_object(v).is_none() && self.cart_object(v).is_none())
             && keys.contains(&chunk_of(m.position))
@@ -3856,7 +3856,7 @@ mod invalid_passenger_tests {
         ids[0]
     }
     fn mount(game: &Game<'_>, id: u32) -> Option<u32> {
-        game.mobs.iter().find(|m| m.id == id).unwrap().extra.mount
+        game.mobs.iter().find(|m| m.id == id).unwrap().mount
     }
     /// Each saved passenger of `id` as (id, UUID word 3, first tag), in order;
     /// `None` when the entity saves no Passengers.
@@ -5249,7 +5249,7 @@ mod restored_vehicle_transfer_tests {
                     assert_eq!(restored.by_source[&source], restored.root);
                     let child = restored.by_source[&source_child.unwrap()];
                     assert_eq!(
-                        game.mob_object(child).unwrap().extra.mount,
+                        game.mob_object(child).unwrap().mount,
                         Some(restored.root)
                     );
                     restored.root
@@ -5270,7 +5270,7 @@ mod restored_vehicle_transfer_tests {
                     original_rider
                 );
                 assert_eq!(
-                    game.mob_object(destination_child).unwrap().extra.mount,
+                    game.mob_object(destination_child).unwrap().mount,
                     Some(destination)
                 );
                 assert_eq!(game.mob_passenger_ids(destination), vec![destination_child]);

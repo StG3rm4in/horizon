@@ -103,7 +103,7 @@ fn a_summoned_mob_ignores_a_typed_finalize_marker() {
         let passenger = game
             .mobs
             .iter()
-            .find(|m| m.extra.mount.is_some())
+            .find(|m| m.mount.is_some())
             .expect("the passenger did not ride");
         assert!(
             !finalized(passenger),

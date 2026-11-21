@@ -443,7 +443,7 @@ mod off_level_tests {
                 m.extra.set_body(Some("minecraft:tnt".into()));
                 m.extra.armor_attributes = game.motion.attributes.create(&m.kind.id).map(Box::new);
                 sulfur_cube::adopt_body(&mut m);
-                m.extra.mount = mount;
+                m.mount = mount;
                 game.mobs.push(m);
             }
             let ghost = horizon_client::mobs::Mob::new(72, kind, Vec3::ZERO, 0.0);

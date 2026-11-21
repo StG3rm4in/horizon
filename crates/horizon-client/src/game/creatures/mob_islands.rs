@@ -857,7 +857,7 @@ fn reaches_why(
                 _ => None,
             },
             s.vehicle,
-            m.extra.mount,
+            m.mount,
             m.extra.rider,
             (s.caravan > 0).then(|| s.caravan - 1),
             s.school.0,
@@ -1735,13 +1735,13 @@ mod tests {
                 3 => linked[0].vehicle = Some(100),
                 4 => linked[0].caravan = 101,
                 5 => linked[0].school.0 = Some(100),
-                6 => mobs[0].extra.mount = Some(100),
+                6 => mobs[0].mount = Some(100),
                 _ => mobs[0].extra.rider = Some(100),
             }
             let of = group_of(&plan(&mobs, &linked), mobs.len());
             assert_eq!(of[0], of[100], "relation {relation}");
             assert_ne!(of[0], of[200]);
-            mobs[0].extra.mount = None;
+            mobs[0].mount = None;
             mobs[0].extra.rider = None;
         }
         horizon_client::mobs::raider::state_mut(&mut mobs[0]).raid_id = Some(7);

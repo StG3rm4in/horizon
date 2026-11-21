@@ -146,7 +146,7 @@ impl Game<'_> {
             .collect();
         self.mobs_meeting(near, |_, m, b| {
             let counts = m.pushable() || m.species() == Species::Shulker && m.alive();
-            if !m.removed && m.extra.mount != Some(c.id) && counts {
+            if !m.removed && m.mount != Some(c.id) && counts {
                 boxes.push(b);
             }
         });
@@ -1022,7 +1022,7 @@ impl Game<'_> {
                     if !player
                         && self
                             .mob_object(rider)
-                            .is_some_and(|mob| !mob.removed && mob.extra.mount == Some(c.id))
+                            .is_some_and(|mob| !mob.removed && mob.mount == Some(c.id))
                     {
                         self.dismount_mob_from_cart(rider, c);
                     }
@@ -1172,7 +1172,7 @@ impl Game<'_> {
                 let k = k as usize;
                 self.carts.update(k, |c| {
                     // hasPassenger(mob): a mob in this cart never pushes it.
-                    if self.mobs[j].extra.mount == Some(c.id) || !bb.intersects(c.bounds()) {
+                    if self.mobs[j].mount == Some(c.id) || !bb.intersects(c.bounds()) {
                         return;
                     }
                     let Some((xa, za)) = cart_push_from(feet, c.position) else {
@@ -1286,7 +1286,7 @@ impl Game<'_> {
         // The box first: it turns away nearly every mob of the level.
         near.retain(|&j| {
             let m = &self.mobs[j as usize];
-            !m.removed && m.extra.mount != Some(id) && hitbox.intersects(m.bounds())
+            !m.removed && m.mount != Some(id) && hitbox.intersects(m.bounds())
         });
         let candidates: Vec<u32> = if near.is_empty() {
             Vec::new()
@@ -1311,7 +1311,7 @@ impl Game<'_> {
             let species = self.mobs[j].species();
             let player = &*self.mobs[j].kind.id == "minecraft:player";
             let cooldown = self.mobs[j].extra.boarding_cooldown;
-            let passenger = self.mobs[j].extra.mount.is_some();
+            let passenger = self.mobs[j].mount.is_some();
             if pickup_instead_of_push(species, passenger, occupied) && !player {
                 // Entity.startRiding: a mod may cancel it (EntityMountEvent).
                 if can_ride_cart(species, cooldown)
@@ -1319,7 +1319,7 @@ impl Game<'_> {
                     && let Some(m) = self.mobs.iter_mut().find(|m| m.id == mob)
                 {
                     horizon_client::mobs::shulker::on_start_riding(m);
-                    m.extra.mount = Some(id);
+                    m.mount = Some(id);
                     m.extra.passenger = true;
                     m.ai.nav.stop();
                     m.needs_sync = true;
@@ -1388,7 +1388,7 @@ impl Game<'_> {
             if player
                 || self
                     .mob_object(rider)
-                    .is_none_or(|mob| mob.removed || mob.extra.mount != Some(id))
+                    .is_none_or(|mob| mob.removed || mob.mount != Some(id))
             {
                 continue;
             }
@@ -2806,11 +2806,11 @@ mod cart_push_tests {
         let mut index = super::CartIndex::default();
         game.push_from_cart(0, &mut index);
         assert_eq!(
-            game.mobs[0].extra.mount,
+            game.mobs[0].mount,
             Some(2),
             "the cow boards the empty moving cart"
         );
-        game.mobs[0].extra.mount = None;
+        game.mobs[0].mount = None;
         game.mobs[0].velocity = Vec3::ZERO;
         // The cart's own `never` rule: no boarding and no push.
         let name = game.holder_name(Target::Cart(2)).expect("a cart's UUID");
@@ -2821,7 +2821,7 @@ mod cart_push_tests {
         let mut index = super::CartIndex::default();
         game.push_from_cart(0, &mut index);
         assert_eq!(
-            game.mobs[0].extra.mount, None,
+            game.mobs[0].mount, None,
             "the cart's collisionRule never keeps the cow off"
         );
         assert_eq!(
@@ -2968,7 +2968,7 @@ mod rejected_passenger_tests {
             game.carts
                 .update(0, |c| c.velocity = Vec3::new(0.2, 0.0, 0.0));
             game.pickup_from_cart(0, &mut CartIndex::default());
-            assert_eq!(game.mob_object(candidate).unwrap().extra.mount, None);
+            assert_eq!(game.mob_object(candidate).unwrap().mount, None);
             assert!(!game.interact_cart(Some(InteractTarget {
                 id: cart as i32,
                 location: [0.0; 3]
@@ -2990,7 +2990,7 @@ mod rejected_passenger_tests {
             active.flipped = true;
             game.activate_cart(&mut active, true);
             let rider = game.mob_object(ghost).unwrap();
-            assert_eq!(rider.extra.mount, None);
+            assert_eq!(rider.mount, None);
             assert_eq!(rider.position, Vec3::new(40.0, 70.0 + HEIGHT, 40.0));
             assert_eq!(rider.previous, rider.position);
             let leaf = game.mob_passenger_ids(ghost)[0];
@@ -3021,11 +3021,11 @@ mod rejected_passenger_tests {
             assert!(game.mobs_below_off_level().contains(&leaf));
             game.eject_cart_mobs(0);
             let rider = game.mob_object(ghost).unwrap();
-            assert_eq!(rider.extra.mount, None);
+            assert_eq!(rider.mount, None);
             assert!(!rider.extra.passenger);
             assert_eq!(rider.position.y, 70.0);
             assert_eq!(rider.position, rider.previous);
-            assert_eq!(game.mob_object(leaf).unwrap().extra.mount, Some(ghost));
+            assert_eq!(game.mob_object(leaf).unwrap().mount, Some(ghost));
             assert!(game.mob_object(leaf).unwrap().position.y >= 70.0);
         });
     }
@@ -3084,13 +3084,13 @@ mod hook_mutation_regressions {
                 let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
                 for id in [72, 73, 74] {
                     let mut mob = Mob::new(id, kind.clone(), Vec3::ZERO, 0.0);
-                    mob.extra.mount = (id != 74).then_some(71);
+                    mob.mount = (id != 74).then_some(71);
                     mob.extra.vehicle_order = i64::from(id);
                     game.mobs.push(mob);
                 }
                 let mut active = game.carts[0].clone();
                 game.activate_cart(&mut active, true);
-                assert_eq!(game.mob_object(73).unwrap().extra.mount, Some(74));
+                assert_eq!(game.mob_object(73).unwrap().mount, Some(74));
                 assert_eq!(
                     heard
                         .lock()
@@ -3123,10 +3123,10 @@ mod hook_mutation_regressions {
                 let kind = game.res.mob_types().get("minecraft:pig").unwrap().clone();
                 let original = Vec3::new(2.0, 60.0, 3.0);
                 let mut rider = Mob::new(72, kind.clone(), original, 0.0);
-                rider.extra.mount = Some(71);
+                rider.mount = Some(71);
                 game.mobs.push(rider);
                 let mut child = Mob::new(73, kind, original, 0.0);
-                child.extra.mount = Some(72);
+                child.mount = Some(72);
                 game.mobs.push(child);
                 let mut active = game.carts[0].clone();
                 active.position = Vec3::new(40.0, 70.0, 40.0);

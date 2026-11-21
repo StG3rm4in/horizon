@@ -476,11 +476,7 @@ impl Transport {
         let bx = m.position.x.floor() as i32;
         let by = m.position.y.floor() as i32;
         let bz = m.position.z.floor() as i32;
-        let (h, v): (i32, i32) = if m.extra.mount.is_some() {
-            (1, 1)
-        } else {
-            (32, 8)
-        };
+        let (h, v): (i32, i32) = if m.mount.is_some() { (1, 1) } else { (32, 8) };
         let visited = mem_list(m, false);
         let unreachable = mem_list(m, true);
         let (cx, cz) = (bx >> 4, bz >> 4);

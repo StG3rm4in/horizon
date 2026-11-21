@@ -393,7 +393,7 @@ fn run_output(family: Family, output: Output) {
                             mob.velocity.y = -0.08;
                             mob.ai.nav.speed_modifier = if id == 72 { 3.75 } else { 9.25 };
                             if id == 72 {
-                                mob.extra.mount = Some(71);
+                                mob.mount = Some(71);
                             } else {
                                 mob.extra.rider = Some(72);
                             }

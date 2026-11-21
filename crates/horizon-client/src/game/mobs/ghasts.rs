@@ -70,7 +70,7 @@ impl Game<'_> {
         for (j, m) in self.mobs.iter().enumerate() {
             if stops_movers(m) {
                 boxes.push(m.bounds());
-                roots.push(m.extra.mount.and_then(|_| self.mob_root_vehicle(j)));
+                roots.push(m.mount.and_then(|_| self.mob_root_vehicle(j)));
             }
         }
         for b in &self.boats {

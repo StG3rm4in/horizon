@@ -344,7 +344,7 @@ impl Game<'_> {
                     }
                     if !resuming
                         && !retried
-                        && m.extra.mount.is_some_and(|vehicle| {
+                        && m.mount.is_some_and(|vehicle| {
                             self.persist.removed_vehicles.contains_key(&vehicle)
                         })
                     {
@@ -780,7 +780,7 @@ impl Game<'_> {
                 let mounted: std::collections::HashSet<_> = mobs
                     .iter()
                     .chain(self.mob_objects())
-                    .filter_map(|passenger| passenger.extra.mount)
+                    .filter_map(|passenger| passenger.mount)
                     .collect();
                 for mob in &mobs {
                     let kept = index
@@ -912,7 +912,7 @@ mod off_level_tests {
             let mut vehicle = Mob::new(71, spider, at, 0.0);
             vehicle.extra.rider = Some(72);
             let mut rider = Mob::new(72, skeleton, at, 0.0);
-            rider.extra.mount = Some(71);
+            rider.mount = Some(71);
             rider.age = 19;
             game.mobs.push(vehicle);
             game.persist
@@ -939,9 +939,9 @@ mod off_level_tests {
             );
             let pig = game.res.mob_types().get("minecraft:pig").unwrap().clone();
             let mut parent = Mob::new(72, pig.clone(), Vec3::new(1.0, 80.0, 0.5), 0.0);
-            parent.extra.mount = Some(71);
+            parent.mount = Some(71);
             let mut child = Mob::new(73, pig, parent.position, 0.0);
-            child.extra.mount = Some(72);
+            child.mount = Some(72);
             child.no_ai = true;
             child.age = 19;
             child.fire_ticks = 20;
@@ -953,7 +953,7 @@ mod off_level_tests {
             let child = game.mob_object(73).unwrap();
             assert_eq!(child.age, 19);
             assert_eq!(child.fire_ticks, 20);
-            game.mob_object_mut(73).unwrap().extra.mount = None;
+            game.mob_object_mut(73).unwrap().mount = None;
             game.tick_creature_entities().unwrap();
             assert_eq!(game.mob_object(73).unwrap().age, 20);
         });

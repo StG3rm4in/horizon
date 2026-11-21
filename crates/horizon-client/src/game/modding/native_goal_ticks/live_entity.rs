@@ -209,7 +209,7 @@ impl GoalCx<'_, '_> {
     }
 
     pub(super) fn r_entity_vehicle(&self, entity: EntityRef) -> Option<EntityRef> {
-        let id = self.entity_mob(entity)?.extra.mount?;
+        let id = self.entity_mob(entity)?.mount?;
         self.lookup_entity(id).or_else(|| self.host.entity(id))
     }
 
