@@ -1623,6 +1623,33 @@ fn lava_meets_water() {
     );
 }
 
+/// `Fluid.getTickDelay` of every fluid at a few positions is the delay worked out with the
+/// dimension's fast lava read first, as it was before only lava asked for it.
+#[test]
+fn fluid_tick_delays_read_the_dimension_for_lava_alone() {
+    use crate::fluid::FluidKind;
+    let mut w = world!();
+    let fast = w.level.dimension_type().fast_lava;
+    let sim = w.f.behaviours.sim(&mut w.level, &mut w.ticks);
+    let kinds = [
+        FluidKind::Empty,
+        FluidKind::Water,
+        FluidKind::FlowingWater,
+        FluidKind::Lava,
+        FluidKind::FlowingLava,
+    ];
+    for kind in kinds {
+        for pos in [BlockPos::new(0, 64, 0), BlockPos::new(-17, -3, 40)] {
+            let before = fluid_tick_delay(kind, fast, || None);
+            assert_eq!(
+                sim.fluid_tick_delay(kind, pos),
+                before,
+                "{kind:?} at {pos:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn waterlogged_blocks_schedule_water() {
     let mut w = world!();
