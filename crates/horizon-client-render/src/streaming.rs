@@ -2274,8 +2274,10 @@ impl Streaming {
         columns.clear();
         let mut hz_laps = crate::spans::laps();
         let (protos, finishing) = (&self.protos, &self.finishing);
+        // The final columns first: every loaded column stays in the set, so they are most of it.
+        // The three tests only read, so their order changes nothing but the lookups made.
         self.decorated.retain(|k| {
-            protos.contains_key(k) || finishing.contains(k) || world.chunks.contains_key(k)
+            world.chunks.contains_key(k) || protos.contains_key(k) || finishing.contains(k)
         });
         // Finalize chunks whose neighbourhood is decorated.
         let finalize_candidates: Vec<(i32, i32)> = self.protos.keys().copied().collect();
