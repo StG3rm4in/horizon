@@ -115,7 +115,13 @@ use horizon_core::{
 use horizon_core::{
     connection_kind::ConnectionKind, dimension::Dimension, neighbour_update::NeighbourUpdate,
 };
-use std::{collections::HashMap, io, path::Path, sync::Arc, sync::RwLock};
+use std::{
+    collections::{BTreeSet, HashMap},
+    io,
+    path::Path,
+    sync::Arc,
+    sync::RwLock,
+};
 
 pub use block_maps::BlockMaps;
 pub mod classes;
@@ -692,6 +698,15 @@ pub trait LevelAccess: BlockEntityNeighbors {
         _changed: BlockId,
         _moved: bool,
     ) {
+    }
+    /// Whether the block `state` must not run its template's own behaviour now: a mod block
+    /// whose mod is installed and switched off. Its hooks are off, and the template's ticks,
+    /// shape updates, neighbour reactions, block events and entity contacts would rewrite or
+    /// remove it, so it keeps still until the mod is on again. Only the authoritative level
+    /// answers true: a client replays what its server decided. Asked on hot paths: a vanilla
+    /// block must answer at once. The default is false.
+    fn template_suppressed(&self, _state: BlockStateId) -> bool {
+        false
     }
     /// `BlockState.randomTick` from `ServerLevel.tickChunk`, before the block
     /// handles it. The level may change the block (`Behaviours::set_block`
@@ -1381,6 +1396,8 @@ pub struct Behaviours {
     growth: growth::Growth,
     /// The open world's NeoForge block data maps.
     block_maps: block_maps::Slot,
+    /// [`Self::leaf_distance_at`] of every state, made at the first ask.
+    leaf_distances: std::sync::OnceLock<Box<[u8]>>,
 }
 
 impl Behaviours {
@@ -1421,6 +1438,39 @@ impl Behaviours {
     pub fn facts(&self, state: BlockStateId) -> &StateFacts {
         &self.facts[state.0 as usize]
     }
+    /// The entry of [`Self::leaf_distance_at`]'s table for an answer it does not hold: a mod's
+    /// `distance` property outside 0..=254, read again at each ask.
+    const LEAF_DISTANCE_UNCACHED: u8 = u8::MAX;
+    /// `LeavesBlock.getDistanceAt`: 0 for a block in `prevents_nearby_leaf_decay`, the value of
+    /// its `distance` property for a block that has one, else 7. A leaf's tick asks it of its six
+    /// neighbours, and a leaf's shape update of the neighbour that changed. The answer depends on
+    /// the state alone, and the tags and properties are fixed once loaded: it is read from a table
+    /// of every state's answer, made at the first ask, in place of a tag test and two searches of
+    /// the block's properties.
+    pub(crate) fn leaf_distance_at(&self, state: BlockStateId) -> i32 {
+        let table = self.leaf_distances.get_or_init(|| {
+            (0..self.table.state_count() as u32)
+                .map(|id| {
+                    u8::try_from(self.leaf_distance_uncached(BlockStateId(id)))
+                        .unwrap_or(Self::LEAF_DISTANCE_UNCACHED)
+                })
+                .collect()
+        });
+        match table.get(state.0 as usize) {
+            Some(&distance) if distance != Self::LEAF_DISTANCE_UNCACHED => i32::from(distance),
+            _ => self.leaf_distance_uncached(state),
+        }
+    }
+    /// [`Self::leaf_distance_at`] from the tag and the block's properties.
+    pub(crate) fn leaf_distance_uncached(&self, state: BlockStateId) -> i32 {
+        if self.in_set(state, &self.tags.prevents_nearby_leaf_decay) {
+            0
+        } else if self.table.has(state, self.props.distance) {
+            self.table.int(state, self.props.distance)
+        } else {
+            7
+        }
+    }
     pub fn block_data(&self, block: BlockId) -> &BlockData {
         &self.blocks[block.0 as usize]
     }
@@ -1429,6 +1479,18 @@ impl Behaviours {
     }
     pub fn block(&self, state: BlockStateId) -> BlockId {
         self.table.block(state)
+    }
+    /// The states whose own block template asks the ground it stands on: the live game
+    /// dispatches that ask on `Class::Vegetation` (`Sim::can_survive`, then
+    /// `Sim::may_place_on`, `survive.rs`), whose `canSurvive` asks the soil's parts and
+    /// then the plant's. A block whose chain holds no such class never asks, whatever
+    /// stands under it, so only these states reach a survival table's ground hooks
+    /// (#17943).
+    pub fn states_asking_their_ground(&self) -> BTreeSet<BlockStateId> {
+        (0..self.table.state_count())
+            .map(|id| BlockStateId(id as u32))
+            .filter(|state| self.data(*state).is(classes::Class::Vegetation))
+            .collect()
     }
     pub fn item_binding(&self, item: &str) -> Option<&ItemBinding> {
         self.items.get(item)

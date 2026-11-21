@@ -766,6 +766,7 @@ impl Snapshot {
             occlusion_cache: Default::default(),
             growth: Default::default(),
             block_maps: Default::default(),
+            leaf_distances: Default::default(),
         })
     }
 }

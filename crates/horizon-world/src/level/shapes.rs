@@ -35,6 +35,8 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         neighbour_pos: BlockPos,
         neighbour: BlockStateId,
     ) -> BlockStateId {
+        // Asked before the hooks and again after, as in `tick_due_block`.
+        let suppressed = self.level.template_suppressed(state);
         let mut new = None;
         self.level.before_update_shape(
             self.ticks,
@@ -50,6 +52,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             && (new.0 as usize) < self.b.table.state_count()
         {
             return new;
+        }
+        if suppressed || self.level.template_suppressed(state) {
+            return state;
         }
         self.update_shape_at(0, state, pos, direction, neighbour_pos, neighbour)
     }
@@ -1152,16 +1157,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             b.is_block(state, b.named.tripwire)
         }
     }
-    /// `LeavesBlock.getDistanceAt`.
+    /// `LeavesBlock.getDistanceAt` ([`Behaviours::leaf_distance_at`]).
     pub(crate) fn leaf_distance_at(&self, state: BlockStateId) -> i32 {
-        let b = self.b;
-        if b.in_set(state, &b.tags.prevents_nearby_leaf_decay) {
-            0
-        } else if b.table.has(state, b.props.distance) {
-            b.table.int(state, b.props.distance)
-        } else {
-            7
-        }
+        self.b.leaf_distance_at(state)
     }
     /// `ConcretePowderBlock.touchesLiquid`.
     pub(crate) fn concrete_touches_liquid(&self, pos: BlockPos) -> bool {

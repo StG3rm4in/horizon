@@ -2006,6 +2006,7 @@ mod preview_tests {
             blinks: Default::default(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
             resolved: Default::default(),
         };

@@ -4,6 +4,7 @@
 use super::*;
 use crate::game::creatures::local_difficulty_in;
 use crate::game::creatures::prep;
+use crate::game::structures::structures_reaching_in;
 use horizon_client::mobs::{
     finalize::{self, FinalizeLevel},
     spawn_selection::{self, Lane, Pack},

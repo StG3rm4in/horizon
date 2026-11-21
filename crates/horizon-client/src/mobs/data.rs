@@ -166,6 +166,9 @@ pub struct MobData {
     /// [`MobData::placement`] of each species' entity type (by `Species as
     /// usize`), worked out the first time a spawn asks.
     pub species_placements: std::sync::OnceLock<Vec<Placement>>,
+    /// Each block state's contact bits (`ai::contact_bits`): which of the blocks a mob's contact
+    /// scans look for it is, worked out the first time a mob asks.
+    pub contacts: std::sync::OnceLock<Box<[u8]>>,
     /// The spawn rules mods declared (`RegisterSpawnPlacementsEvent`), by
     /// entity type id: resolved once at load by [`MobData::register_mod_spawn`],
     /// empty with no mod. Their placement type and heightmap sit in
@@ -330,6 +333,7 @@ impl MobData {
             entity_tags: HashMap::new(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
         }
     }
@@ -393,6 +397,7 @@ impl MobData {
             entity_tags: HashMap::new(),
             pois: Default::default(),
             species_placements: Default::default(),
+            contacts: Default::default(),
             mod_spawns: Default::default(),
         }
     }

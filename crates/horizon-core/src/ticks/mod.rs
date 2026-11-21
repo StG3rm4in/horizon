@@ -369,6 +369,165 @@ mod tests {
         while level.next_tick().unwrap().is_some() {}
         level.finish_tick().unwrap();
     }
+    /// `begin_tick` as it was before the due containers carried their heads: every comparison
+    /// peeks both containers in the chunk map, as vanilla's `CONTAINER_DRAIN_ORDER` does.
+    fn begin_tick_peeking(
+        this: &mut LevelTicks,
+        game_time: i64,
+        maximum: i32,
+        mut can_tick: impl FnMut(ChunkPos) -> bool,
+    ) {
+        assert!(!this.collecting);
+        this.collecting = true;
+        let mut containers: Heap<i64> = Heap::default();
+        let chunks = &this.chunks;
+        let compare = |a: i64, b: i64| {
+            chunks[&a]
+                .peek()
+                .unwrap()
+                .intra_cmp(chunks[&b].peek().unwrap())
+        };
+        this.deadlines.visit(|key, deadline| {
+            if *deadline > game_time {
+                return false;
+            }
+            let Some(head) = chunks.get(&key).and_then(ChunkTicks::peek) else {
+                return true;
+            };
+            if head.trigger_tick > game_time {
+                *deadline = head.trigger_tick;
+                return false;
+            }
+            if !can_tick(ChunkPos::unpack(key)) {
+                return false;
+            }
+            containers.push(key, compare);
+            true
+        });
+        let maximum = maximum.max(0) as usize;
+        while this.to_run.len() < maximum {
+            let Some(key) = containers.pop(|a, b| {
+                this.chunks[&a]
+                    .peek()
+                    .unwrap()
+                    .intra_cmp(this.chunks[&b].peek().unwrap())
+            }) else {
+                break;
+            };
+            let chunk = this.chunks.get_mut(&key).unwrap();
+            this.to_run.push_back(chunk.poll().unwrap());
+            let competing = containers.peek().and_then(|key| this.chunks[&key].peek());
+            let chunk = this.chunks.get_mut(&key).unwrap();
+            while this.to_run.len() < maximum {
+                let Some(head) = chunk.peek() else {
+                    break;
+                };
+                if head.trigger_tick > game_time
+                    || competing.is_some_and(|other| head.intra_cmp(other) == Ordering::Greater)
+                {
+                    break;
+                }
+                this.to_run.push_back(chunk.poll().unwrap());
+            }
+            if let Some(head) = chunk.peek() {
+                if head.trigger_tick <= game_time && this.to_run.len() < maximum {
+                    containers.push(key, |a, b| {
+                        this.chunks[&a]
+                            .peek()
+                            .unwrap()
+                            .intra_cmp(this.chunks[&b].peek().unwrap())
+                    });
+                } else {
+                    this.deadlines.put(key, head.trigger_tick);
+                }
+            }
+        }
+        for &key in &containers.values {
+            this.deadlines
+                .put(key, this.chunks[&key].peek().unwrap().trigger_tick);
+        }
+    }
+    /// The cached heads drain as the peeked ones: over many chunks with tied priorities and
+    /// sub-tick orders, chunks that may not tick, budgets that cut a container short and ticks
+    /// scheduled while ticks run, both run the same ticks in the same order and leave the same
+    /// queues (in heap order) and deadlines (in iteration order).
+    #[test]
+    fn cached_container_heads_drain_as_peeked_ones() {
+        let (mut cached, mut peeked) = (LevelTicks::default(), LevelTicks::default());
+        let mut chunks = Vec::new();
+        for x in -3..=3 {
+            for z in -1..=1 {
+                let pos = ChunkPos::new(x, z);
+                chunks.push(pos);
+                cached.add_chunk(pos, ChunkTicks::default()).unwrap();
+                peeked.add_chunk(pos, ChunkTicks::default()).unwrap();
+            }
+        }
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % n
+        };
+        for i in 0..3000 {
+            let t = ScheduledTick {
+                kind: TickTypeId(next(3)),
+                pos: BlockPos::new(next(112) as i32 - 48, next(8) as i32, next(48) as i32 - 16),
+                trigger_tick: i64::from(next(40)),
+                priority: TickPriority::by_value(next(7) as i32 - 3),
+                // Shared sub-tick orders tie heads across chunks.
+                sub_tick_order: i / 4,
+            };
+            assert_eq!(cached.schedule(t), peeked.schedule(t));
+        }
+        let run = |level: &mut LevelTicks, order: &mut i64, time: i64| {
+            let mut ran = Vec::new();
+            while let Some(t) = level.next_tick().unwrap() {
+                ran.push(t);
+                // Some ticks schedule again, as a fluid or a leaf does.
+                if t.pos.y % 2 == 0 {
+                    *order += 1;
+                    level.schedule(ScheduledTick {
+                        trigger_tick: time + 1 + i64::from(t.pos.x & 3),
+                        priority: TickPriority::by_value(t.pos.z % 4),
+                        sub_tick_order: *order,
+                        ..t
+                    });
+                }
+            }
+            level.finish_tick().unwrap();
+            ran
+        };
+        let deadlines = |level: &mut LevelTicks| {
+            let mut rows = Vec::new();
+            level.deadlines.visit(|key, deadline| {
+                rows.push((key, *deadline));
+                false
+            });
+            rows
+        };
+        let (mut cached_order, mut peeked_order) = (10_000, 10_000);
+        for time in 0..60 {
+            let maximum = [1, 3, 17, 65536][time as usize % 4];
+            let can_tick = move |pos: ChunkPos| (pos.x + pos.z + time as i32).rem_euclid(5) != 0;
+            cached.begin_tick(time, maximum, can_tick).unwrap();
+            begin_tick_peeking(&mut peeked, time, maximum, can_tick);
+            assert_eq!(
+                run(&mut cached, &mut cached_order, time),
+                run(&mut peeked, &mut peeked_order, time)
+            );
+            for &pos in &chunks {
+                assert_eq!(
+                    cached.chunk(pos).unwrap().queued(),
+                    peeked.chunk(pos).unwrap().queued()
+                );
+            }
+            assert_eq!(deadlines(&mut cached), deadlines(&mut peeked));
+        }
+        assert_eq!(cached.count(), peeked.count());
+        assert!(cached.containers_to_tick.values.is_empty());
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,11 +569,23 @@ impl std::fmt::Display for TickError {
 }
 impl std::error::Error for TickError {}
 
+/// A due container in [`LevelTicks::begin_tick`]'s heap (vanilla's `containersToTick`): its chunk
+/// key and its head tick. Vanilla's `CONTAINER_DRAIN_ORDER` peeks both containers at every
+/// comparison, which here cost two chunk map lookups and a read of each container's queue. The
+/// head is taken when the container is pushed, and it cannot change while the container waits:
+/// only the container just popped is polled, and it goes back in with its new head. The cached
+/// heads therefore compare as the peeked ones would, and the heap keeps the same order.
+type DueContainer = (i64, ScheduledTick);
+
+fn due_order(a: DueContainer, b: DueContainer) -> Ordering {
+    a.1.intra_cmp(b.1)
+}
+
 #[derive(Default)]
 pub struct LevelTicks {
     chunks: FxHashMap<i64, ChunkTicks>,
     deadlines: DeadlineIndex,
-    containers_to_tick: Heap<i64>,
+    containers_to_tick: Heap<DueContainer>,
     to_run: VecDeque<ScheduledTick>,
     already_run: Vec<ScheduledTick>,
     to_run_set: FxHashSet<(TickTypeId, BlockPos)>,
@@ -526,13 +697,7 @@ impl LevelTicks {
         }
         self.collecting = true;
         let mut containers = std::mem::take(&mut self.containers_to_tick);
-        let chunks = &mut self.chunks;
-        let compare = |a: i64, b: i64| {
-            chunks[&a]
-                .peek()
-                .unwrap()
-                .intra_cmp(chunks[&b].peek().unwrap())
-        };
+        let chunks = &self.chunks;
         self.deadlines.visit(|key, deadline| {
             if *deadline > game_time {
                 return false;
@@ -547,23 +712,18 @@ impl LevelTicks {
             if !can_tick(ChunkPos::unpack(key)) {
                 return false;
             }
-            containers.push(key, compare);
+            containers.push((key, head), due_order);
             true
         });
         let maximum = maximum.max(0) as usize;
         while self.to_run.len() < maximum {
-            let Some(key) = containers.pop(|a, b| {
-                self.chunks[&a]
-                    .peek()
-                    .unwrap()
-                    .intra_cmp(self.chunks[&b].peek().unwrap())
-            }) else {
+            let Some((key, _)) = containers.pop(due_order) else {
                 break;
             };
+            // The popped container is out of the heap, so its competitor is already known.
+            let competing = containers.peek().map(|(_, head)| head);
             let chunk = self.chunks.get_mut(&key).unwrap();
             self.to_run.push_back(chunk.poll().unwrap());
-            let competing = containers.peek().and_then(|key| self.chunks[&key].peek());
-            let chunk = self.chunks.get_mut(&key).unwrap();
             while self.to_run.len() < maximum {
                 let Some(head) = chunk.peek() else {
                     break;
@@ -577,20 +737,14 @@ impl LevelTicks {
             }
             if let Some(head) = chunk.peek() {
                 if head.trigger_tick <= game_time && self.to_run.len() < maximum {
-                    containers.push(key, |a, b| {
-                        self.chunks[&a]
-                            .peek()
-                            .unwrap()
-                            .intra_cmp(self.chunks[&b].peek().unwrap())
-                    });
+                    containers.push((key, head), due_order);
                 } else {
                     self.deadlines.put(key, head.trigger_tick);
                 }
             }
         }
-        for &key in &containers.values {
-            self.deadlines
-                .put(key, self.chunks[&key].peek().unwrap().trigger_tick);
+        for &(key, head) in &containers.values {
+            self.deadlines.put(key, head.trigger_tick);
         }
         containers.values.clear();
         self.containers_to_tick = containers;

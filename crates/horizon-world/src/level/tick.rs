@@ -11,7 +11,7 @@ use horizon_core::{
     geometry::Direction,
     position::{BlockPos, ChunkPos},
     random::RandomSource,
-    ticks::TickTypeId,
+    ticks::{ScheduledTick, TickTypeId},
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -23,6 +23,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
 
     /// `BlockState.tick` (scheduled block tick).
     pub fn tick_block(&mut self, state: BlockStateId, pos: BlockPos) {
+        if self.level.template_suppressed(state) {
+            return;
+        }
         let b = self.b;
         let p = b.props;
         let block = b.block(state);
@@ -271,13 +274,54 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     /// `ServerLevel.tickBlock` once the block at `pos` is the tick's: the
     /// level may handle the tick first, else `BlockState.tick`.
     fn tick_due_block(&mut self, state: BlockStateId, pos: BlockPos) {
+        // The hooks read the mod's switch themselves: asked before them as well as after, a
+        // switch in between can't hand the block to its template with no hook answering.
+        let before = self.level.template_suppressed(state);
         let (mut current, mut handled) = (state, false);
         self.level
             .before_tick_block(self.ticks, pos, &mut current, &mut handled);
         // A block the level changed ticks as it is now, if it is still the
         // tick's block.
-        if !handled && (current == state || self.block_of(current) == self.block_of(state)) {
+        if !handled
+            && (current == state || self.block_of(current) == self.block_of(state))
+            && !self.suppressed_after_hooks(before, state, current)
+        {
             self.tick_block(current, pos);
+        }
+    }
+
+    /// Whether `current`, the block a dispatch that began on `state` reaches its template with,
+    /// must not run it ([`LevelAccess::template_suppressed`]). `before` is the answer for `state`
+    /// from before the hooks; it counts only while the target is still that block, as a hook may
+    /// have put another in its place.
+    fn suppressed_after_hooks(
+        &self,
+        before: bool,
+        state: BlockStateId,
+        current: BlockStateId,
+    ) -> bool {
+        (before && self.block_of(current) == self.block_of(state))
+            || self.level.template_suppressed(current)
+    }
+
+    /// A due block tick from the queue.
+    fn run_due_block_tick(&mut self, tick: ScheduledTick) {
+        let state = self.state(tick.pos);
+        let block = self.b.block(state);
+        horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+        horizon_threads::work::set_block(block.0);
+        if u32::from(block.0) == tick.kind.0 {
+            self.tick_due_block(state, tick.pos);
+        }
+    }
+
+    /// A due fluid tick from the queue.
+    fn run_due_fluid_tick(&mut self, tick: ScheduledTick) {
+        let state = self.state(tick.pos);
+        horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+        horizon_threads::work::set_block(self.b.block(state).0);
+        if TickTypeId(self.b.fluid(state).kind().tick_id()) == tick.kind {
+            self.fluid_tick(tick.pos);
         }
     }
 
@@ -285,24 +329,34 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     pub fn random_tick_at(&mut self, pos: BlockPos) {
         let state = self.state(pos);
         horizon_threads::work::set_block(self.b.block(state).0);
+        // Asked before the hooks as well as after, as in `tick_due_block`.
+        let before = self.level.template_suppressed(state);
         if self.b.is_randomly_ticking(state) {
             let (mut current, mut handled) = (state, false);
             self.level
                 .before_random_tick(self.ticks, pos, &mut current, &mut handled);
             // A block the level changed ticks as it is now, if it still ticks
             // randomly.
-            if !handled && (current == state || self.b.is_randomly_ticking(current)) {
+            if !handled
+                && (current == state || self.b.is_randomly_ticking(current))
+                && !self.suppressed_after_hooks(before, state, current)
+            {
                 self.random_tick_block(current, pos);
             }
         }
         // Only lava's fluid state ticks randomly. A lava block is ticked twice
         // (LiquidBlock.randomTick, then FluidState.randomTick), as in vanilla.
-        if super::fluids::fluid_randomly_ticks(self.b.fluid(state).kind()) {
+        if super::fluids::fluid_randomly_ticks(self.b.fluid(state).kind())
+            && !self.suppressed_after_hooks(before, state, self.state(pos))
+        {
             self.lava_random_tick(pos);
         }
     }
 
     pub fn random_tick_block(&mut self, state: BlockStateId, pos: BlockPos) {
+        if self.level.template_suppressed(state) {
+            return;
+        }
         let b = self.b;
         let p = b.props;
         let block = b.block(state);
@@ -1572,7 +1626,10 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         if info.freezes_below {
             let from = self.state(below_pos);
             let to = b.default_of(b.named.ice);
-            if self.level.allow_block_form(below_pos, from, to) {
+            // A water template's freezing is its own, as below a cauldron's filling.
+            if !self.level.template_suppressed(from)
+                && self.level.allow_block_form(below_pos, from, to)
+            {
                 self.set_block_and_update(below_pos, to);
             }
         }
@@ -1606,6 +1663,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
         }
         if info.kind != PrecipitationKind::None {
             let below_state = self.state(below_pos);
+            if self.level.template_suppressed(below_state) {
+                return;
+            }
             let data = b.data(below_state);
             let chance = match info.kind {
                 PrecipitationKind::Rain => 0.05,
@@ -1864,13 +1924,7 @@ impl Behaviours {
             }
         }
         while let Ok(Some(tick)) = ticks.blocks.next_tick() {
-            let mut sim = self.sim(level, ticks);
-            let state = sim.state(tick.pos);
-            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
-            horizon_threads::work::set_block(self.block(state).0);
-            if u32::from(self.block(state).0) == tick.kind.0 {
-                sim.tick_due_block(state, tick.pos);
-            }
+            self.sim(level, ticks).run_due_block_tick(tick);
         }
         let _ = ticks.blocks.finish_tick();
         {
@@ -1886,14 +1940,7 @@ impl Behaviours {
             }
         }
         while let Ok(Some(tick)) = ticks.fluids.next_tick() {
-            let mut sim = self.sim(level, ticks);
-            let state = sim.state(tick.pos);
-            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
-            horizon_threads::work::set_block(self.block(state).0);
-            let fluid = self.fluid(state).kind();
-            if TickTypeId(fluid.tick_id()) == tick.kind {
-                sim.fluid_tick(tick.pos);
-            }
+            self.sim(level, ticks).run_due_fluid_tick(tick);
         }
         let _ = ticks.fluids.finish_tick();
     }
@@ -1934,25 +1981,12 @@ impl Behaviours {
             let Ok(Some(tick)) = ticks.fluids.next_tick() else {
                 return false;
             };
-            let mut sim = self.sim(level, ticks);
-            let state = sim.state(tick.pos);
-            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
-            horizon_threads::work::set_block(self.block(state).0);
-            let fluid = self.fluid(state).kind();
-            if TickTypeId(fluid.tick_id()) == tick.kind {
-                sim.fluid_tick(tick.pos);
-            }
+            self.sim(level, ticks).run_due_fluid_tick(tick);
         } else {
             let Ok(Some(tick)) = ticks.blocks.next_tick() else {
                 return false;
             };
-            let mut sim = self.sim(level, ticks);
-            let state = sim.state(tick.pos);
-            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
-            horizon_threads::work::set_block(self.block(state).0);
-            if u32::from(self.block(state).0) == tick.kind.0 {
-                sim.tick_due_block(state, tick.pos);
-            }
+            self.sim(level, ticks).run_due_block_tick(tick);
         }
         true
     }
@@ -2146,9 +2180,27 @@ pub enum RandomTickMaskUpdate {
 /// ([`Behaviours::random_tick_candidate`]), one bit each in the section's
 /// index order (`y << 8 | z << 4 | x`). Vanilla reads the block at every drawn
 /// position; most hold stone, dirt or air, and the read is a cache miss.
+///
+/// The 64 words of bits are summed up in one more, `summary`, whose bit `k` says whether word
+/// `k` holds any bit. A section's candidates mostly make one layer of it (the grass, snow or ice
+/// at the surface), so most draws fall in an empty word, which the summary answers without
+/// reading it. The words are mostly out of cache; the summary comes first (`repr(C)`), beside
+/// the counts of the `Rc` the random tick loop has just handed out.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RandomTickMask(pub [u64; 64]);
+#[repr(C)]
+pub struct RandomTickMask {
+    summary: u64,
+    words: [u64; 64],
+}
 impl RandomTickMask {
+    /// The mask whose bits are `words`: index `i` is bit `i & 63` of word `i >> 6`.
+    pub fn from_words(words: [u64; 64]) -> Self {
+        let mut summary = 0;
+        for (k, word) in words.iter().enumerate() {
+            summary |= u64::from(*word != 0) << k;
+        }
+        Self { summary, words }
+    }
     /// The mask of `blocks` (4,096 states in index order).
     pub fn of(blocks: &[u32], mut candidate: impl FnMut(u32) -> bool) -> Self {
         let mut bits = [0u64; 64];
@@ -2164,12 +2216,16 @@ impl RandomTickMask {
             };
             bits[i >> 6] |= u64::from(hit) << (i & 63);
         }
-        Self(bits)
+        Self::from_words(bits)
     }
     #[inline]
     pub fn may_tick(&self, pos: BlockPos) -> bool {
         let i = ((pos.y & 15) << 8 | (pos.z & 15) << 4 | (pos.x & 15)) as usize;
-        self.0[i >> 6] >> (i & 63) & 1 != 0
+        // An empty word is not read.
+        if self.summary >> (i >> 6) & 1 == 0 {
+            return false;
+        }
+        self.words[i >> 6] >> (i & 63) & 1 != 0
     }
 }
 
@@ -2180,6 +2236,49 @@ mod fire_tick_tests;
 #[cfg(test)]
 #[path = "block_maps_tests.rs"]
 mod block_maps_tests;
+
+#[cfg(test)]
+mod random_tick_mask_tests {
+    use super::RandomTickMask;
+    use horizon_core::position::BlockPos;
+
+    /// The summary word changes no answer: in sections where nothing, everything, two corners,
+    /// one layer, the top bit of every word or scattered blocks tick, every position gets its own
+    /// block's answer, in sections on both sides of zero.
+    #[test]
+    fn the_summary_word_answers_as_the_bits() {
+        let mut seed = 0x2545_f491_u32;
+        let mut scattered = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed.is_multiple_of(97)
+        };
+        let sections: Vec<Vec<u32>> = vec![
+            vec![0; 4096],
+            vec![1; 4096],
+            (0..4096).map(|i| u32::from(i == 0 || i == 4095)).collect(),
+            (0..4096).map(|i| u32::from(i >> 8 == 5)).collect(),
+            (0..4096).map(|i| u32::from(i & 63 == 63)).collect(),
+            (0..4096).map(|_| u32::from(scattered())).collect(),
+        ];
+        for blocks in &sections {
+            let mask = RandomTickMask::of(blocks, |state| state == 1);
+            for (i, &state) in blocks.iter().enumerate() {
+                let i = i as i32;
+                let (x, y, z) = (i & 15, i >> 8, (i >> 4) & 15);
+                for (cx, cy, cz) in [(0, 0, 0), (-1, -4, 3), (7, 19, -8)] {
+                    let pos = BlockPos::new(cx * 16 + x, cy * 16 + y, cz * 16 + z);
+                    assert_eq!(mask.may_tick(pos), state == 1, "{pos:?}");
+                }
+            }
+        }
+        assert_eq!(
+            RandomTickMask::from_words([0; 64]),
+            RandomTickMask::of(&[1; 4096], |_| false)
+        );
+    }
+}
 
 #[cfg(test)]
 mod first_stage_tests {

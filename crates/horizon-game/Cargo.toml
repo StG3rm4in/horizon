@@ -24,7 +24,8 @@ path = "src/main.rs"
 test = false
 
 [features]
-default = ["audio", "controllers", "horizon-extras", "cuda"]
+# horizon-client/client-lib-default: one build of the game whether or not horizon-client-lib is also named.
+default = ["audio", "controllers", "horizon-extras", "cuda", "horizon-client/client-lib-default"]
 # CUDA for the GPU stages (horizon-gpu). The server build (`--no-default-features`) adds it with
 # `--features cuda`.
 cuda = ["horizon-client/cuda"]

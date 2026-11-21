@@ -293,6 +293,43 @@ impl<'w> SceneCollisions<'w, '_> {
             },
         )?)
     }
+    /// Whether moving the box `bounds` by `movement` resolves to no move because the box rests on
+    /// a full block: the move is straight down (no horizontal part, as gravity's on a mob at rest),
+    /// the box's bottom is at a whole height, no entity box is in the way, and the block under the
+    /// box's centre collides, for the box's own context, as the full cube (asked as the collision
+    /// scan asks it). A collision never moves a box up, and a move without a horizontal part meets
+    /// neither a step nor the border's walls: [`Self::resolve_in_border_with`] would give no move
+    /// at all, +0 on every axis (a -0.0 horizontal part comes back +0 too).
+    pub fn rests_on_full_block(
+        &mut self,
+        bounds: Aabb,
+        movement: Vec3,
+        entities: &[Aabb],
+    ) -> io::Result<bool> {
+        let (lo, hi) = (bounds.min_position(), bounds.max_position());
+        let bottom = lo.y;
+        if movement.x != 0.0
+            || movement.z != 0.0
+            || movement.y.is_nan()
+            || movement.y >= 0.0
+            || !entities.is_empty()
+            || !bottom.is_finite()
+            || bottom != bottom.floor()
+        {
+            return Ok(false);
+        }
+        let under = Vec3::new((lo.x + hi.x) / 2.0, bottom - 0.5, (lo.z + hi.z) / 2.0);
+        let p = BlockPos::containing(under);
+        let Some(chunk) = self.collision_chunk(ChunkPos::new(p.x >> 4, p.z >> 4))? else {
+            return Ok(false);
+        };
+        let block = self.collision_block(chunk, p)?;
+        if block.moving_piston || block.empty_shape {
+            return Ok(false);
+        }
+        let context = self.context(bounds);
+        Ok(self.context_shape(block, p, &context)?.is_block())
+    }
     fn context(&self, bounds: Aabb) -> CollisionContext<'w> {
         let y = bounds.min_position().y;
         let Some(subject) = self.subject else {
@@ -1179,6 +1216,98 @@ mod section_tests {
         assert!(
             skipped > 500 && resolved > 500,
             "{skipped} skipped, {resolved} resolved"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rest_tests {
+    use super::*;
+
+    /// Boxes over full blocks (stone, glass, a closed shulker box), partial ones (a slab, soul
+    /// sand, honey, a fence), blocks whose shape depends on the entity (powder snow, scaffolding)
+    /// and air: wherever `rests_on_full_block` says the box rests, the full resolution gives no
+    /// move, to the bit; a box over stone or glass does rest. Needs the prepared resources.
+    #[test]
+    fn resting_on_a_full_block_leaves_no_move_as_resolving_does() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
+        if !root.join("cached-collision.nbt").exists() {
+            eprintln!("no prepared resources: skipped");
+            return;
+        }
+        let assets = crate::assets::Assets::load(&root).unwrap();
+        let render = assets
+            .reload(&horizon_assets::resource_source::ResourceRoot::directory(
+                root.to_path_buf(),
+            ))
+            .unwrap();
+        let binding = load(&root, assets.registry).unwrap();
+        let mut world = World::test_scene(&assets, &render, 3).unwrap();
+        let state = |name: &str| assets.registry.default_state(name).unwrap();
+        // The scene's stone floor fills y 0..4: each block stands on it, a box on each block.
+        let blocks = [
+            "minecraft:stone",
+            "minecraft:glass",
+            "minecraft:shulker_box",
+            "minecraft:oak_slab",
+            "minecraft:soul_sand",
+            "minecraft:honey_block",
+            "minecraft:oak_fence",
+            "minecraft:powder_snow",
+            "minecraft:scaffolding",
+            "minecraft:air",
+        ];
+        for (i, name) in blocks.iter().enumerate() {
+            world.set(2 + 3 * i as i32, 5, 5, state(name)).unwrap();
+        }
+        let gravity = Vec3::new(0.0, -0.0784, 0.0);
+        let moves = [
+            (6.0, gravity),
+            (5.5, gravity),
+            (6.0 + 1.0e-9, gravity),
+            (6.0, Vec3::new(0.01, -0.0784, 0.0)),
+            (6.0, Vec3::new(-0.0, -0.08, -0.0)),
+            (6.0, Vec3::new(0.0, 0.1, 0.0)),
+        ];
+        let mut rested = Vec::new();
+        for (i, name) in blocks.iter().enumerate() {
+            let x = f64::from(2 + 3 * i as i32) + 0.5;
+            for (bottom, movement) in moves {
+                let bounds = Aabb::new(
+                    Vec3::new(x - 0.45, bottom, 5.05),
+                    Vec3::new(x + 0.45, bottom + 1.4, 5.95),
+                );
+                let scene = || SceneCollisions {
+                    world: &world,
+                    binding: &binding,
+                    subject: None,
+                };
+                if !scene().rests_on_full_block(bounds, movement, &[]).unwrap() {
+                    continue;
+                }
+                rested.push(*name);
+                let resolved = scene()
+                    .resolve_in_border_with(bounds, movement, 0.6, true, None, &[])
+                    .unwrap();
+                let none = Vec3::ZERO;
+                assert_eq!(
+                    [resolved.x, resolved.y, resolved.z].map(f64::to_bits),
+                    [none.x, none.y, none.z].map(f64::to_bits),
+                    "{name}: a box at {bottom} moved by {movement:?}"
+                );
+            }
+        }
+        assert!(
+            rested.contains(&"minecraft:stone") && rested.contains(&"minecraft:glass"),
+            "{rested:?}"
+        );
+        assert!(
+            !rested
+                .iter()
+                .any(|n| n.contains("slab") || n.contains("snow") || n.contains("scaffolding")),
+            "{rested:?}"
         );
     }
 }

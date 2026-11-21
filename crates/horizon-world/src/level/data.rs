@@ -1138,6 +1138,7 @@ fn build_with_gameplay<G: GameplayStateSource>(
         occlusion_cache: Default::default(),
         growth: Default::default(),
         block_maps: Default::default(),
+        leaf_distances: Default::default(),
     })
 }
 

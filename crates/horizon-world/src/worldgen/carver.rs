@@ -11,7 +11,8 @@ use super::{
 };
 pub use canyon::{CanyonCarver, CanyonShape, PlannedCanyon};
 pub use generation::{
-    CarverCatalog, MaskGenerationError, WorldCarver, generate_carving_mask, large_feature_random,
+    CarverCatalog, LEFT_OUT, MaskGenerationError, WorldCarver, generate_carving_mask,
+    large_feature_random,
 };
 
 /// One item of a carver call planned without its target (`WorldCarver::plan`): what `carve` draws

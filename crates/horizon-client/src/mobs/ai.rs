@@ -1310,6 +1310,78 @@ pub fn finish_tick(
     // level's entity list in this tick, after the rest of its tick ran.
     !(m.removed && m.species() == Species::TraderLlama)
 }
+
+/// A block the walk of [`effects_from_blocks`] acts on (`MobInside::entity_inside`: powder snow,
+/// cactus, the two campfires, cobweb, sweet berry bush, honey block), by its name. A block added
+/// to that walk must be added here too, or a mob beside it would skip the walk.
+pub(crate) const CONTACT_INSIDE: u8 = 1;
+/// `minecraft:fire` or `minecraft:soul_fire`, as `fire_contact` names them.
+pub(crate) const CONTACT_FIRE: u8 = 2;
+/// `minecraft:powder_snow`, as `in_powder_snow` names it.
+pub(crate) const CONTACT_POWDER_SNOW: u8 = 4;
+
+/// The contact bits of a block name.
+fn contact_bits_of(name: &str) -> u8 {
+    match name {
+        "minecraft:powder_snow" => CONTACT_INSIDE | CONTACT_POWDER_SNOW,
+        "minecraft:cactus"
+        | "minecraft:campfire"
+        | "minecraft:soul_campfire"
+        | "minecraft:cobweb"
+        | "minecraft:sweet_berry_bush"
+        | "minecraft:honey_block" => CONTACT_INSIDE,
+        "minecraft:fire" | "minecraft:soul_fire" => CONTACT_FIRE,
+        _ => 0,
+    }
+}
+
+/// `state`'s contact bits, each from the name its scan reads: the walk and the powder snow test
+/// read `MobWorld::facts`, `fire_contact` the registry.
+fn contact_bits_named(w: &MobWorld, state: horizon_world::registry::BlockStateId) -> u8 {
+    let walked = CONTACT_INSIDE | CONTACT_POWDER_SNOW;
+    let facts = contact_bits_of(&w.facts.get(state).name) & walked;
+    let registry = w
+        .registry
+        .state(state)
+        .map_or(0, |d| contact_bits_of(&d.name) & CONTACT_FIRE);
+    facts | registry
+}
+
+/// [`contact_bits_named`] from a table of every state's, made the first time a mob asks
+/// (`MobData::contacts`), as the villagers' POI table is.
+pub(crate) fn contact_bits(w: &MobWorld, state: horizon_world::registry::BlockStateId) -> u8 {
+    let table = w.data.contacts.get_or_init(|| {
+        (0..w.registry.len())
+            .map(|i| contact_bits_named(w, horizon_world::registry::BlockStateId(i as u32)))
+            .collect()
+    });
+    table
+        .get(state.0 as usize)
+        .copied()
+        .unwrap_or_else(|| contact_bits_named(w, state))
+}
+
+/// Whether a block of the cells `lo..=hi` may have one of the contact `bits`, from the palettes
+/// of the sections they reach (`World::may_hold`, which reads a missing chunk and the heights
+/// outside the world as `World::block` does): `false` means none of the cells has.
+pub(crate) fn may_contact(w: &MobWorld, lo: [i32; 3], hi: [i32; 3], bits: u8) -> bool {
+    w.world
+        .may_hold(lo, hi, |state| contact_bits(w, state) & bits != 0)
+}
+
+/// `fire_contact` for a mob's box, 0 without a read of its cells where no section they reach may
+/// hold fire (the most it finds is then 0 too).
+fn mob_fire_contact(m: &Mob, w: &MobWorld) -> f32 {
+    let b = m.bounds().deflate(Vec3::new(1e-5, 1e-5, 1e-5));
+    let (lo, hi) = (b.min_position(), b.max_position());
+    let lo = [lo.x, lo.y, lo.z].map(|v| v.floor() as i32);
+    let hi = [hi.x, hi.y, hi.z].map(|v| v.floor() as i32);
+    if !may_contact(w, lo, hi, CONTACT_FIRE) {
+        return 0.0;
+    }
+    crate::motion::environment::fire_contact(w.world, w.registry, m.bounds())
+}
+
 /// `LivingEntity.aiStep` -> `Entity.applyEffectsFromBlocks` for the blocks
 /// that hurt, hold or slide a mob: the cactus (`CactusBlock.entityInside`, 1),
 /// the cobweb (stuck at 0.25, 0.05, 0.25), the sweet berry bush
@@ -1360,6 +1432,30 @@ pub(crate) fn effects_from_blocks(
             && level.random().next_int_bound(100).unwrap_or(1) == 0
         {
             events.push(MobEvent::CrackTurtleEgg { pos: [x, y, z] });
+        }
+    }
+    // The walk below acts only on the blocks of `CONTACT_INSIDE` and on the states a mod
+    // listens to, and every cell it visits lies in the box at the tick's start or end, or
+    // between them. With no part listening to entity contacts (`any_inside`: the hooks
+    // themselves are installed at every start) and no section there that may hold such a
+    // block, it would read every cell and act on none: it is skipped. (A move of more than a chunk or two,
+    // a teleport, walks as before rather than look at every section in between.)
+    if crate::block_contact::HOOKS
+        .get()
+        .is_none_or(|hooks| !(hooks.any_inside)())
+    {
+        let (a, b) = (m.bounds_at(tick_from), m.bounds_at(tick_to));
+        let (a0, a1, b0, b1) = (
+            a.min_position(),
+            a.max_position(),
+            b.min_position(),
+            b.max_position(),
+        );
+        let lo = [a0.x.min(b0.x), a0.y.min(b0.y), a0.z.min(b0.z)].map(|v| v.floor() as i32 - 1);
+        let hi = [a1.x.max(b1.x), a1.y.max(b1.y), a1.z.max(b1.z)].map(|v| v.floor() as i32 + 1);
+        let near = (hi[0] >> 4) - (lo[0] >> 4) <= 2 && (hi[2] >> 4) - (lo[2] >> 4) <= 2;
+        if near && !may_contact(w, lo, hi, CONTACT_INSIDE) {
+            return;
         }
     }
     // `Entity.checkInsideBlocks` itself, the shared walk: each axis of the
@@ -1644,6 +1740,40 @@ impl crate::block_contact::InsideWalk for MobInside<'_, '_, '_> {
 }
 
 #[cfg(test)]
+mod contact_bits_tests {
+    use super::*;
+
+    /// Every state's contact bits are those of its names (the table answers as the names do),
+    /// and the blocks the scans look for get theirs.
+    #[test]
+    #[ignore = "daily"]
+    fn contact_bits_follow_the_block_names() {
+        let ran = crate::mobs::world::with_test_world(&[], |w, _| {
+            for i in 0..w.registry.len() {
+                let state = horizon_world::registry::BlockStateId(i as u32);
+                assert_eq!(contact_bits(w, state), contact_bits_named(w, state), "{i}");
+            }
+            for (name, bits) in [
+                ("minecraft:cobweb", CONTACT_INSIDE),
+                ("minecraft:honey_block", CONTACT_INSIDE),
+                (
+                    "minecraft:powder_snow",
+                    CONTACT_INSIDE | CONTACT_POWDER_SNOW,
+                ),
+                ("minecraft:fire", CONTACT_FIRE),
+                ("minecraft:soul_fire", CONTACT_FIRE),
+                ("minecraft:stone", 0),
+                ("minecraft:water", 0),
+            ] {
+                let state = w.registry.default_state(name).unwrap();
+                assert_eq!(contact_bits(w, state), bits, "{name}");
+            }
+        });
+        assert!(ran, "the vanilla test resources must be available");
+    }
+}
+
+#[cfg(test)]
 mod powder_snow_particle_tests {
     use super::*;
 
@@ -1899,7 +2029,7 @@ fn base_tick(
     if m.species() == Species::Drowned {
         super::undead::drowned_update_swimming(m, w);
     }
-    let fire = crate::motion::environment::fire_contact(w.world, w.registry, m.bounds());
+    let fire = mob_fire_contact(m, w);
     let lava = m.fluids.in_lava;
     let contact_at = m.position;
     if fire > 0.0 {
@@ -2042,10 +2172,7 @@ fn base_tick(
     let (fire, lava) = if m.position == contact_at {
         (fire, lava)
     } else {
-        (
-            crate::motion::environment::fire_contact(w.world, w.registry, m.bounds()),
-            touches_lava(m, w),
-        )
+        (mob_fire_contact(m, w), touches_lava(m, w))
     };
     block_contact_damage(m, w, level, fire, lava);
     // Enderman.hurtServer and Shulker.hurtServer teleport inside the hurt

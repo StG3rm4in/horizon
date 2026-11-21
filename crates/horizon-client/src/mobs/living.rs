@@ -773,7 +773,7 @@ impl Mob {
         }
         let step = self.kind.step_height as f32;
         let from = self.position;
-        let scene = SceneCollisions {
+        let mut scene = SceneCollisions {
             world: w.world,
             binding: w.collision,
             subject: Some(self.collision_subject()),
@@ -782,17 +782,27 @@ impl Mob {
         // do the entities it may not pass through.
         let border = w.border.map(|b| (b, [self.position.x, self.position.z]));
         let entities = self.entity_collisions(w, wanted);
-        let moved = crate::move_gate::scene_resolve_in_border_with(
-            gate,
-            scene,
-            self.bounds(),
-            wanted,
-            step,
-            self.on_ground,
-            border,
-            &entities,
-        )
-        .unwrap_or(Vec3::ZERO);
+        // A mob at rest on a full block, its move gravity's alone: the block under it stops the
+        // move, as the collision would find (`SceneCollisions::rests_on_full_block`), without the
+        // scan of every cell around it.
+        let resting = scene
+            .rests_on_full_block(self.bounds(), wanted, &entities)
+            .unwrap_or(false);
+        let moved = if resting {
+            Vec3::ZERO
+        } else {
+            crate::move_gate::scene_resolve_in_border_with(
+                gate,
+                scene,
+                self.bounds(),
+                wanted,
+                step,
+                self.on_ground,
+                border,
+                &entities,
+            )
+            .unwrap_or(Vec3::ZERO)
+        };
         let length = moved.x * moved.x + moved.y * moved.y + moved.z * moved.z;
         let wanted_length = wanted.x * wanted.x + wanted.y * wanted.y + wanted.z * wanted.z;
         if length > 1.0e-7 || wanted_length - length < 1.0e-7 {
