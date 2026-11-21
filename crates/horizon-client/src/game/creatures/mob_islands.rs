@@ -130,10 +130,12 @@ fn lanes() -> usize {
 }
 
 /// The machine's available parallelism, asked once: the standard library reads the cgroup's
-/// quota files on every call, and the loop asks on every tick.
+/// quota files on every call, and the loop asks on every tick. It is the count fixed before
+/// `HORIZON_TICK_CPU` pins this thread to one CPU (`horizon_threads::machine_threads`), where
+/// `available_parallelism` would answer one.
 fn hardware() -> Option<usize> {
     static HARDWARE: OnceLock<Option<usize>> = OnceLock::new();
-    *HARDWARE.get_or_init(|| std::thread::available_parallelism().ok().map(usize::from))
+    *HARDWARE.get_or_init(|| Some(horizon_threads::machine_threads()))
 }
 
 /// At most as many lanes as the tick's helpers and this thread: each lane runs on a thread of its

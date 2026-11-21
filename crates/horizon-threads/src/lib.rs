@@ -9,6 +9,7 @@ pub mod allocator_stats;
 #[cfg(target_os = "windows")]
 pub mod boot_paint;
 pub mod callgrind;
+pub mod core_reserve;
 pub mod heap_census;
 #[cfg(target_os = "linux")]
 pub mod heap_sample;
@@ -39,6 +40,14 @@ use std::sync::{
 /// than a run should take; a value that isn't a positive number is ignored.
 /// Each pool keeps its own share of the count (the streaming pool all but one,
 /// far decoration a third of it).
+/// The CPUs the machine gives this process (`available_parallelism`), asked once: fixed before
+/// the server thread keeps a CPU to itself (`core_reserve`), after which `available_parallelism`
+/// answers one on that thread.
+pub fn machine_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 pub fn worker_count() -> usize {
     static COUNT: OnceLock<usize> = OnceLock::new();
     *COUNT.get_or_init(|| {

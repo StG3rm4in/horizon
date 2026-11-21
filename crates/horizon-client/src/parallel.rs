@@ -336,6 +336,8 @@ fn pool() -> &'static rayon::ThreadPool {
                 horizon_threads::sizing::Pool::TickHelper,
             ))
             .thread_name(|i| format!("tick-helper-{i}"))
+            // Started by the server thread, a helper would inherit the CPU it keeps.
+            .start_handler(|_| horizon_threads::core_reserve::leave_server_core())
             .build()
             .expect("the tick's helper threads start")
     })

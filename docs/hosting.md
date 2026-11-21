@@ -844,6 +844,18 @@ them than the machine has threads can generate faster: on 6 cores and 12 threads
 generation ran 4 to 5 % faster with 18 (17 chunk workers) than with the default, for 5 to 7 % more CPU per
 chunk.
 
+### The server thread's own CPU: `HORIZON_TICK_CPU`
+
+Unset by default. On Linux, the environment variable `HORIZON_TICK_CPU=2` makes the dedicated server's tick
+thread keep CPU 2 to itself from its first tick: it runs there only, its SMT sibling is left idle, and every
+other thread of the game runs on the remaining CPUs (a thread started later is moved there within a
+second). The tick then never migrates nor waits for its core behind a chunk worker. On 6 cores and 12
+threads with 100 players and `HORIZON_PARALLEL_TICK=exact`, it took the tick from 62.6 to 57.9 ms and its 99th
+percentile from 80-84 to 71-76 ms (native build, cores at 4.9 GHz, two runs each); the same pinning done from
+outside with `taskset` took a PGO build from 52.8 to 49.8 ms, and from 40.5 to 38.8 ms with the parallel tick.
+It costs the other threads a whole core, and a few ticks a minute ran slower than any without it (up to 133 ms
+against 99). A value that isn't one of the process's CPUs leaves the tick unpinned, with a warning in the log.
+
 ### Parallel tick: `parallel_tick`
 
 Off by default. Under `[engine]`, `parallel_tick = true` starts the game with its parallel tick on: the

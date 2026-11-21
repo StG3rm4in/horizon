@@ -907,7 +907,7 @@ impl Sleep {
             m.position.y.floor() as i32,
             m.position.z.floor() as i32,
         );
-        w.daylight
+        w.bright_outside()
             && has_shelter(m, w)
             && !alertable(m, w)
             && w.block_name(x, y, z) != "minecraft:powder_snow"
@@ -1368,7 +1368,7 @@ impl Goal for SeekShelter {
             self.interval = 100;
             // `ServerLevel.isVillage(pos)`: a section of a village POI or its
             // neighbour's, where the fox keeps strolling in the sun.
-            cx.w.daylight
+            cx.w.bright_outside()
                 && sees_sky
                 && sections_to_village(&village_sections(m, cx.w), section_of(at)) > 1
                 && self.set_wanted_pos(m, cx.w)

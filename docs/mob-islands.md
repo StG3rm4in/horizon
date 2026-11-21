@@ -127,11 +127,11 @@ brain, the iron golem (`golem.rs`), the fox (`fox.rs`) and `undead::MoveThroughV
 is in the goal sets of the zombie, the husk and the zombie villager only (`undead::register`), as
 `Zombie.addBehaviourGoals` adds it and `Drowned` and `ZombifiedPiglin` override that method
 without it. It is a night goal: `can_use` returns before reading while `undead::bright_for_night_goals` holds
-(the level's `daylight`, the same for every turn of a tick), and `can_continue`, `start` and `stop`
-don't read villages. So `reads_villages`, which asks the same function, takes the villagers, golems
-and foxes always, the zombies, husks and zombie villagers on a night tick, and never a drowned or a
-zombified piglin. Vanilla's `isBrightOutside` also keeps a fixed-time dimension (the End) dark,
-which `bright_for_night_goals` doesn't yet: fixing it there fixes the plan too. The raiders' own
+(`MobWorld::bright_outside`, vanilla's `isBrightOutside`, the same for every turn of a tick), and
+`can_continue`, `start` and `stop` don't read villages. So `reads_villages`, which asks the same
+function, takes the villagers, golems and foxes always, the zombies, husks and zombie villagers on a
+tick that isn't bright, and never a drowned or a zombified piglin. A dimension with a fixed time (the
+End) is never bright, so there the zombies read the villages and the plan joins them. The raiders' own
 `MoveThroughVillage` walks to their raid's homes, inside the raid's island. Regressions:
 `actual_reaches_cover_links_villages_and_bounded_moves` checks each kind's village reach by day and
 by night; `zombies_read_the_villages_by_night_only` ticks zombies and husks by day, zombies by

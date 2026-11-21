@@ -195,7 +195,7 @@ fn drowned_can_attack(_m: &Mob, w: &super::MobWorld) -> bool {
     let Some(p) = w.selected_player() else {
         return false;
     };
-    !w.daylight || in_water_at(w, p.position)
+    !w.bright_outside() || in_water_at(w, p.position)
 }
 /// The target's isInWater, from the water at its feet.
 fn in_water_at(w: &super::MobWorld, p: Vec3) -> bool {
@@ -205,7 +205,7 @@ fn in_water_at(w: &super::MobWorld, p: Vec3) -> bool {
 /// Drowned.okTarget for the current target.
 fn drowned_ok_target(m: &Mob, w: &super::MobWorld) -> bool {
     m.target_info(w)
-        .is_some_and(|t| !w.daylight || in_water_at(w, t.position))
+        .is_some_and(|t| !w.bright_outside() || in_water_at(w, t.position))
 }
 // Drowned state: `flag` wantsToSwim (target in water), `flag2` searchingForLand.
 /// Drowned.wantsToSwim
@@ -420,7 +420,7 @@ impl Goal for DrownedGoToBeach {
         }
         self.0.next_start = super::goals::reduced(200 + m.random.next_int_bound(200).unwrap_or(0));
         self.0.find_nearest(m, cx.w, beach_target)
-            && !cx.w.daylight
+            && !cx.w.bright_outside()
             && m.fluids.in_water
             && m.position.y >= f64::from(cx.w.sea_level - 3)
     }
@@ -449,7 +449,7 @@ impl Goal for DrownedSwimUp {
         "DrownedSwimUpGoal"
     }
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
-        !cx.w.daylight && m.fluids.in_water && m.position.y < f64::from(cx.w.sea_level - 2)
+        !cx.w.bright_outside() && m.fluids.in_water && m.position.y < f64::from(cx.w.sea_level - 2)
     }
     fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
         self.can_use(m, cx) && !self.stuck
@@ -1017,7 +1017,7 @@ impl Goal for DrownedGoToWater {
     }
     /// `Drowned.DrownedGoToWaterGoal.canUse`.
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
-        if !cx.w.daylight || m.fluids.in_water {
+        if !cx.w.bright_outside() || m.fluids.in_water {
             return false;
         }
         let (bx, by, bz) = (
@@ -1084,12 +1084,11 @@ impl MoveThroughVillage {
     }
 }
 /// Whether night goals (`MoveThroughVillage` with `only_at_night`: zombies, husks and zombie
-/// villagers) give up on a tick of `w`: `Level.isBrightOutside` as they read it, the level's
-/// `daylight`. Vanilla also keeps a fixed-time dimension (the End) dark here, which this doesn't
-/// yet. The mob islands' planner asks the same (`mob_islands::reads_villages`), so a change here
-/// changes which mobs it joins with the villagers.
+/// villagers) give up on a tick of `w`: `Level.isBrightOutside` (`MobWorld::bright_outside`, never
+/// in a dimension with a fixed time). The mob islands' planner asks the same
+/// (`mob_islands::reads_villages`), so a change here changes which mobs it joins with the villagers.
 pub fn bright_for_night_goals(w: &super::MobWorld) -> bool {
-    w.daylight
+    w.bright_outside()
 }
 impl Goal for MoveThroughVillage {
     goal_clone!();
