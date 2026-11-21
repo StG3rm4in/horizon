@@ -150,8 +150,8 @@ impl Game<'_> {
             }
         };
         // As the borrowed loop ends its pass: the mobs that go leave the list, then every mob
-        // left takes the pushes given to it after its turn.
-        state.mobs.put_rows(group.mobs.take_rows());
+        // left takes the pushes given to it after its turn. The groups left the mobs in the rows.
+        state.mobs.put_rows(rows);
         let mut keep = std::mem::take(&mut group.keep).into_iter();
         state.mobs.retain(|_| keep.next().unwrap_or(true));
         for m in state.mobs.iter_mut() {

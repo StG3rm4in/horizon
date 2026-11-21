@@ -317,8 +317,9 @@ impl Islands<'_> {
     }
 
     /// The loop's turns in the plan's groups, each on its own thread, put back together as the
-    /// serial loop's one group would have left them. The groups take the mobs out of `mobs`; a
-    /// turn's panic puts them all back into it, as far as their turns got, before it goes on.
+    /// serial loop's one group would have left them. The groups take the mobs out of `mobs` and
+    /// put them all back into it in the list's order, as far as their turns got, also when a
+    /// turn panics (before the panic goes on); the group returned holds the rest, without mobs.
     pub(super) fn run(
         &self,
         plan: Plan,
@@ -472,9 +473,11 @@ impl Islands<'_> {
             }
         }
         let Board { frozen, .. } = board;
+        // The mobs stay in the rows, which the caller puts back into its pass: moved into a list
+        // of the result's own, they would only be moved out of it again.
         in_list_order(groups, n, mobs);
         let mut merged = Group::new(
-            std::mem::take(mobs),
+            Vec::new(),
             Vec::new(),
             Start {
                 random: LevelRandom::for_level(draws.finish()),
@@ -486,7 +489,7 @@ impl Islands<'_> {
         merged.guest_events = guest_events;
         merged.credit_expired = credit_expired;
         if let Some((serial, seeds)) = serial {
-            let diff = difference(&serial, &merged)
+            let diff = difference(&serial, &merged, mobs.as_slice())
                 .or_else(|| (!seeds.complete()).then(|| "new RNG allocation counts differ".into()));
             report_check(diff, lanes);
         }
@@ -1569,17 +1572,18 @@ fn without_counters(m: &Mob) -> Mob {
     m
 }
 
-/// The first difference between the serial loop's result and the groups', if any.
-fn difference(serial: &Group, grouped: &Group) -> Option<String> {
-    if serial.mobs.len() != grouped.mobs.len() {
+/// The first difference between the serial loop's result and the groups', whose mobs are
+/// `grouped_mobs`, if any.
+fn difference(serial: &Group, grouped: &Group, grouped_mobs: &[Mob]) -> Option<String> {
+    if serial.mobs.len() != grouped_mobs.len() {
         return Some(format!(
             "{} mobs serially, {} in groups",
             serial.mobs.len(),
-            grouped.mobs.len()
+            grouped_mobs.len()
         ));
     }
     let plain = |m: &Mob| format!("{:?}", without_counters(m));
-    for (ma, mb) in serial.mobs.iter().zip(&grouped.mobs) {
+    for (ma, mb) in serial.mobs.iter().zip(grouped_mobs) {
         let (a, b) = (plain(ma), plain(mb));
         if a != b {
             let at = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
@@ -1600,10 +1604,9 @@ fn difference(serial: &Group, grouped: &Group) -> Option<String> {
             g.events, g.dead, g.corpses, g.gone, g.guest_events,
         )
     };
-    let pushed = |g: &Group| {
+    let pushed = |g: &Group, mobs: &[Mob]| {
         let mut pushes = g.pushes.clone();
-        g.mobs
-            .iter()
+        mobs.iter()
             .zip(&g.keep)
             .filter(|(_, keep)| **keep)
             .map(|(m, _)| {
@@ -1650,7 +1653,7 @@ fn difference(serial: &Group, grouped: &Group) -> Option<String> {
             "the snapshot entries",
         ),
         (
-            pushed(serial) != pushed(grouped),
+            pushed(serial, &serial.mobs) != pushed(grouped, grouped_mobs),
             "the pending pushes' results",
         ),
     ]
@@ -1821,11 +1824,15 @@ mod tests {
             ticked: Default::default(),
         };
         let serial = Group::new(mobs.clone(), snapshot.clone(), start.clone());
-        let mut grouped = Group::new(mobs, snapshot, start);
-        assert_eq!(difference(&serial, &grouped), None);
+        let mut grouped = Group::new(Vec::new(), snapshot, start);
+        assert_eq!(difference(&serial, &grouped, &mobs), None);
+        assert_eq!(
+            difference(&serial, &grouped, &[]),
+            Some("1 mobs serially, 0 in groups".into())
+        );
         grouped.snapshot[0].position.x += 1.0;
         assert_eq!(
-            difference(&serial, &grouped),
+            difference(&serial, &grouped, &mobs),
             Some("the snapshot entries differ".into())
         );
         grouped.snapshot[0] = serial.snapshot[0].clone();
@@ -1833,7 +1840,7 @@ mod tests {
         grouped.random.next_gaussian();
         assert_eq!(serial.random.state(), grouped.random.state());
         assert_eq!(
-            difference(&serial, &grouped),
+            difference(&serial, &grouped, &mobs),
             Some("the level random differ".into())
         );
     }
@@ -2404,7 +2411,10 @@ mod tests {
         let expected: FxHashSet<_> = [10, 11, 12].into_iter().collect();
         assert_eq!(serial.ticked, expected);
         assert_eq!(grouped.ticked, expected);
-        assert_eq!(difference(&serial, &grouped), None);
+        // The mobs are back in the rows, in the list's order; the result holds none.
+        assert!(grouped.mobs.is_empty());
+        assert_eq!(mobs.iter().map(|m| m.id).collect::<Vec<_>>(), [10, 11, 12, 13]);
+        assert_eq!(difference(&serial, &grouped, &mobs), None);
     }
 
     /// The loop stays serial with too few ticking mobs, one island holding most of them, or one
