@@ -273,6 +273,7 @@ pub(super) fn propose(
             structure_starts: Default::default(),
             spawner: None,
             checked: Default::default(),
+            spawn_lists: Default::default(),
         };
         let mut lane = Lane::new(state);
         // Whatever an earlier part left on this thread is not this part's.

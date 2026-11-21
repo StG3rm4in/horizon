@@ -395,6 +395,14 @@ pub trait NaturalLevel: SpawnLevel {
     fn mob_type(&self, entity: &str) -> Option<MobType>;
     /// The `natural_mob_spawns` lists by category at a position.
     fn biome_spawns(&self, x: i32, y: i32, z: i32) -> Option<&HashMap<String, Vec<SpawnEntry>>>;
+    /// The `natural_mob_spawns` list of `category` at a position: [`Self::biome_spawns`]' list
+    /// for the category's name, or none. `mobsAt` reads it at every spawn attempt, and a level may
+    /// keep its biomes' lists by category ([`BiomeSpawnLists`]).
+    fn biome_category_spawns(&self, category: Category, x: i32, y: i32, z: i32) -> &[SpawnEntry] {
+        self.biome_spawns(x, y, z)
+            .and_then(|b| b.get(category.name()))
+            .map_or(&[], Vec::as_slice)
+    }
     /// The `natural_mob_spawns` spawn cost of a type at a position.
     fn spawn_cost(&self, entity: &str, x: i32, y: i32, z: i32) -> Option<SpawnCost>;
     /// The `creature_world_gen_spawn_probability` attribute at a position.
@@ -824,6 +832,34 @@ pub fn fortress_enemies() -> &'static [SpawnEntry] {
     &ENEMIES
 }
 
+/// Every biome's `natural_mob_spawns` lists by category, by biome id: `mobsAt` reads the list of
+/// the biome at every spawn attempt, and a biome keeps its lists by the category's name. A
+/// biome's lists are read the first time one of them is asked for.
+pub struct BiomeSpawnLists<'b> {
+    biomes: &'b [crate::biome::BiomeInfo],
+    rows: Vec<std::cell::OnceCell<[&'b [SpawnEntry]; 8]>>,
+}
+impl<'b> BiomeSpawnLists<'b> {
+    /// The lists of a biome table's entries, by id.
+    pub fn new(biomes: &'b [crate::biome::BiomeInfo]) -> Self {
+        let rows = biomes.iter().map(|_| std::cell::OnceCell::new()).collect();
+        Self { biomes, rows }
+    }
+    /// A biome's list for `category`, or an empty one.
+    pub fn of(biome: &'b crate::biome::BiomeInfo, category: Category) -> &'b [SpawnEntry] {
+        let list = biome.spawns.get(category.name());
+        list.map_or(&[], Vec::as_slice)
+    }
+    /// [`Self::of`] the table's biome `id`; None past the table.
+    pub fn get(&self, id: u16, category: Category) -> Option<&'b [SpawnEntry]> {
+        let (biomes, id) = (self.biomes, usize::from(id));
+        let row = self.rows.get(id)?;
+        let of = move |c| Self::of(&biomes[id], c);
+        let lists = row.get_or_init(|| Category::ALL.map(of));
+        Some(lists[category.index()])
+    }
+}
+
 /// `NaturalSpawner.mobsAt`: the fortress bounds on nether bricks, then
 /// `ChunkGenerator.getMobsAt` (the first referenced structure whose override
 /// for the category holds the position), else the biome's list, as mods
@@ -877,9 +913,7 @@ fn vanilla_mobs_at<L: NaturalLevel>(
             return &o.spawns;
         }
     }
-    l.biome_spawns(x, y, z)
-        .and_then(|b| b.get(category.name()))
-        .map_or(&[], Vec::as_slice)
+    l.biome_category_spawns(category, x, y, z)
 }
 
 fn total_weight(list: &[SpawnEntry]) -> i64 {
