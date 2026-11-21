@@ -235,7 +235,7 @@ impl RandomTickSections {
             for (i, &id) in ids.iter().enumerate() {
                 bits[i >> 6] |= u64::from(candidates[id as usize]) << (i & 63);
             }
-            RandomTickMask(bits)
+            RandomTickMask::from_words(bits)
         } else {
             let mut states = [0u32; 4096];
             blocks.unpack(&mut states);

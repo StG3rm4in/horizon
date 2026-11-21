@@ -2119,9 +2119,27 @@ pub enum RandomTickMaskUpdate {
 /// ([`Behaviours::random_tick_candidate`]), one bit each in the section's
 /// index order (`y << 8 | z << 4 | x`). Vanilla reads the block at every drawn
 /// position; most hold stone, dirt or air, and the read is a cache miss.
+///
+/// The 64 words of bits are summed up in one more, `summary`, whose bit `k` says whether word
+/// `k` holds any bit. A section's candidates mostly make one layer of it (the grass, snow or ice
+/// at the surface), so most draws fall in an empty word, which the summary answers without
+/// reading it. The words are mostly out of cache; the summary comes first (`repr(C)`), beside
+/// the counts of the `Rc` the random tick loop has just handed out.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RandomTickMask(pub [u64; 64]);
+#[repr(C)]
+pub struct RandomTickMask {
+    summary: u64,
+    words: [u64; 64],
+}
 impl RandomTickMask {
+    /// The mask whose bits are `words`: index `i` is bit `i & 63` of word `i >> 6`.
+    pub fn from_words(words: [u64; 64]) -> Self {
+        let mut summary = 0;
+        for (k, word) in words.iter().enumerate() {
+            summary |= u64::from(*word != 0) << k;
+        }
+        Self { summary, words }
+    }
     /// The mask of `blocks` (4,096 states in index order).
     pub fn of(blocks: &[u32], mut candidate: impl FnMut(u32) -> bool) -> Self {
         let mut bits = [0u64; 64];
@@ -2137,12 +2155,16 @@ impl RandomTickMask {
             };
             bits[i >> 6] |= u64::from(hit) << (i & 63);
         }
-        Self(bits)
+        Self::from_words(bits)
     }
     #[inline]
     pub fn may_tick(&self, pos: BlockPos) -> bool {
         let i = ((pos.y & 15) << 8 | (pos.z & 15) << 4 | (pos.x & 15)) as usize;
-        self.0[i >> 6] >> (i & 63) & 1 != 0
+        // An empty word is not read.
+        if self.summary >> (i >> 6) & 1 == 0 {
+            return false;
+        }
+        self.words[i >> 6] >> (i & 63) & 1 != 0
     }
 }
 
@@ -2153,6 +2175,49 @@ mod fire_tick_tests;
 #[cfg(test)]
 #[path = "block_maps_tests.rs"]
 mod block_maps_tests;
+
+#[cfg(test)]
+mod random_tick_mask_tests {
+    use super::RandomTickMask;
+    use horizon_core::position::BlockPos;
+
+    /// The summary word changes no answer: in sections where nothing, everything, two corners,
+    /// one layer, the top bit of every word or scattered blocks tick, every position gets its own
+    /// block's answer, in sections on both sides of zero.
+    #[test]
+    fn the_summary_word_answers_as_the_bits() {
+        let mut seed = 0x2545_f491_u32;
+        let mut scattered = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed.is_multiple_of(97)
+        };
+        let sections: Vec<Vec<u32>> = vec![
+            vec![0; 4096],
+            vec![1; 4096],
+            (0..4096).map(|i| u32::from(i == 0 || i == 4095)).collect(),
+            (0..4096).map(|i| u32::from(i >> 8 == 5)).collect(),
+            (0..4096).map(|i| u32::from(i & 63 == 63)).collect(),
+            (0..4096).map(|_| u32::from(scattered())).collect(),
+        ];
+        for blocks in &sections {
+            let mask = RandomTickMask::of(blocks, |state| state == 1);
+            for (i, &state) in blocks.iter().enumerate() {
+                let i = i as i32;
+                let (x, y, z) = (i & 15, i >> 8, (i >> 4) & 15);
+                for (cx, cy, cz) in [(0, 0, 0), (-1, -4, 3), (7, 19, -8)] {
+                    let pos = BlockPos::new(cx * 16 + x, cy * 16 + y, cz * 16 + z);
+                    assert_eq!(mask.may_tick(pos), state == 1, "{pos:?}");
+                }
+            }
+        }
+        assert_eq!(
+            RandomTickMask::from_words([0; 64]),
+            RandomTickMask::of(&[1; 4096], |_| false)
+        );
+    }
+}
 
 #[cfg(test)]
 mod first_stage_tests {
