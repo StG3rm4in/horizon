@@ -47,6 +47,11 @@ use std::{
 const MIN_TICKING: usize = 256;
 /// The plan's cell size, in blocks.
 const CELL: f64 = 16.0;
+/// The size of the cells the plan finds a column's boxes by ([`Cells`]), in blocks. Any size finds
+/// every box that meets the one asked about, and each is then tested: a column's read, some 90
+/// blocks wide, spans three or four of these a side where it would span six or seven of `CELL`,
+/// and a column's bodies seldom span more than two.
+const INDEX_CELL: f64 = 32.0;
 /// Cell visits one plan may spend before the tick runs serially instead.
 const PLAN_BUDGET: usize = 2_000_000;
 /// The least a mob reads around itself: the widest fixed query box of the mob code (`others_near`
@@ -1102,8 +1107,8 @@ impl Sets {
     }
 }
 
-/// The cells of `CELL` blocks a box covers, as (x0, z0, x1, z1).
-fn cells(b: Aabb) -> Option<(i32, i32, i32, i32)> {
+/// The cells of `size` blocks a box covers, as (x0, z0, x1, z1).
+fn cells(b: Aabb, size: f64) -> Option<(i32, i32, i32, i32)> {
     let (x0, x1, z0, z1) = (
         b.min(Axis::X),
         b.max(Axis::X),
@@ -1113,26 +1118,39 @@ fn cells(b: Aabb) -> Option<(i32, i32, i32, i32)> {
     if !(x0.is_finite() && x1.is_finite() && z0.is_finite() && z1.is_finite()) {
         return None;
     }
-    let c = |v: f64| (v / CELL).floor() as i32;
+    let c = |v: f64| (v / size).floor() as i32;
     Some((c(x0), c(z0), c(x1), c(z1)))
 }
 
-/// Boxes by the cells they cover, each visit paid from a budget.
-#[derive(Default)]
+/// Boxes by the cells of `size` blocks they cover, each visit paid from a budget.
 struct Cells {
     map: FxHashMap<(i32, i32), Vec<u32>>,
+    size: f64,
 }
 impl Cells {
-    /// How many cells `b` covers; None when that is no count.
-    fn count(b: Aabb) -> Option<usize> {
-        let (x0, z0, x1, z1) = cells(b)?;
+    /// No boxes yet, in cells of `size` blocks, with room for `capacity` cells (the map is only
+    /// looked up, never walked).
+    fn new(size: f64, capacity: usize) -> Self {
+        Self {
+            map: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            size,
+        }
+    }
+    /// How many cells of `size` blocks `b` covers; None when that is no count.
+    fn count(b: Aabb, size: f64) -> Option<usize> {
+        let (x0, z0, x1, z1) = cells(b, size)?;
         let n =
             (i64::from(x1) - i64::from(x0) + 1).checked_mul(i64::from(z1) - i64::from(z0) + 1)?;
         usize::try_from(n).ok()
     }
-    fn visit(b: Aabb, budget: &mut usize, mut f: impl FnMut((i32, i32))) -> Option<()> {
-        let (x0, z0, x1, z1) = cells(b)?;
-        *budget = budget.checked_sub(Self::count(b)?)?;
+    fn visit(
+        b: Aabb,
+        size: f64,
+        budget: &mut usize,
+        mut f: impl FnMut((i32, i32)),
+    ) -> Option<()> {
+        let (x0, z0, x1, z1) = cells(b, size)?;
+        *budget = budget.checked_sub(Self::count(b, size)?)?;
         for x in x0..=x1 {
             for z in z0..=z1 {
                 f((x, z));
@@ -1141,11 +1159,12 @@ impl Cells {
         Some(())
     }
     fn insert(&mut self, i: u32, b: Aabb, budget: &mut usize) -> Option<()> {
-        Self::visit(b, budget, |cell| self.map.entry(cell).or_default().push(i))
+        let (map, size) = (&mut self.map, self.size);
+        Self::visit(b, size, budget, |cell| map.entry(cell).or_default().push(i))
     }
     fn query(&self, b: Aabb, budget: &mut usize, mut f: impl FnMut(u32)) -> Option<()> {
         let mut found = 0usize;
-        Self::visit(b, budget, |cell| {
+        Self::visit(b, self.size, budget, |cell| {
             if let Some(list) = self.map.get(&cell) {
                 found += list.len();
                 list.iter().copied().for_each(&mut f);
@@ -1265,6 +1284,18 @@ fn islands_why(
     lanes: usize,
     census: &mut Census,
 ) -> std::result::Result<Plan, Verdict> {
+    islands_in_cells(reaches, lanes, census, INDEX_CELL)
+}
+
+/// [`islands_why`], finding the boxes a column reads by cells of `index_cell` blocks: the size
+/// changes how many cells a query looks up and how many boxes it then tests, not which boxes meet,
+/// so the plan is the same at any size (only the budget a query spends differs).
+fn islands_in_cells(
+    reaches: &[Reach],
+    lanes: usize,
+    census: &mut Census,
+    index_cell: f64,
+) -> std::result::Result<Plan, Verdict> {
     let ticking = reaches.iter().filter(|r| r.ticking).count();
     census.ticking = ticking;
     if lanes < 2 {
@@ -1295,9 +1326,12 @@ fn islands_why(
         (Some(a), Some(b)) => Some(union_box(a, b)),
         (a, b) => a.or(b),
     };
-    let mut columns: Vec<Column> = Vec::new();
-    let mut column_of = FxHashMap::<(i32, i32), u32>::default();
-    let mut index = FxHashMap::<u32, u32>::default();
+    // Sized for the mobs from the start: these maps are only looked up, never walked.
+    let mut columns: Vec<Column> = Vec::with_capacity(n);
+    let mut column_of: FxHashMap<(i32, i32), u32> =
+        FxHashMap::with_capacity_and_hasher(n, Default::default());
+    let mut index: FxHashMap<u32, u32> =
+        FxHashMap::with_capacity_and_hasher(n, Default::default());
     for (i, r) in reaches.iter().enumerate() {
         index.entry(r.id).or_insert(i as u32);
         // Where it stands, then where a teleport can take it, each in its own column.
@@ -1329,7 +1363,8 @@ fn islands_why(
         }
     }
     // Columns by the cells their boxes cover, and the columns that claim.
-    let (mut bodies, mut claims) = (Cells::default(), Cells::default());
+    let mut bodies = Cells::new(index_cell, columns.len());
+    let mut claims = Cells::new(index_cell, 0);
     let mut claiming = Vec::new();
     for (c, col) in columns.iter().enumerate() {
         bodies
@@ -1342,9 +1377,16 @@ fn islands_why(
             claiming.push(c as u32);
         }
     }
-    for col in &columns {
+    // The column whose read last met each column: one whose bodies span several of the cells a
+    // read looks up is tested once, as a second test would find the same.
+    let mut met = vec![u32::MAX; columns.len()];
+    for (c, col) in columns.iter().enumerate() {
+        let c = c as u32;
         bodies
             .query(col.sense, &mut budget, |j| {
+                if std::mem::replace(&mut met[j as usize], c) == c {
+                    return;
+                }
                 let other = &columns[j as usize];
                 if other.body.intersects(col.sense) {
                     sets.join(col.first, other.first);
@@ -1358,9 +1400,9 @@ fn islands_why(
                     sets.join(col.first, other.first);
                 }
             };
-            // A village read covers some four hundred cells, and a level has few claiming
-            // columns: testing each of them finds the same ones for less.
-            if claiming.len() < Cells::count(reads).ok_or(Verdict::OverBudget)? {
+            // A village read covers some hundred cells, and a level has few claiming columns:
+            // testing each of them finds the same ones for less.
+            if claiming.len() < Cells::count(reads, index_cell).ok_or(Verdict::OverBudget)? {
                 budget = budget
                     .checked_sub(claiming.len())
                     .ok_or(Verdict::OverBudget)?;
@@ -1796,8 +1838,89 @@ mod tests {
     #[test]
     fn extreme_plan_boxes_fall_back_without_overflow_or_visits() {
         let b = Aabb::new(Vec3::new(-1e30, 0.0, -1e30), Vec3::new(1e30, 1.0, 1e30));
-        let mut budget = PLAN_BUDGET;
-        assert!(Cells::visit(b, &mut budget, |_| panic!("over budget")).is_none());
+        for size in [CELL, INDEX_CELL] {
+            let mut budget = PLAN_BUDGET;
+            assert!(Cells::visit(b, size, &mut budget, |_| panic!("over budget")).is_none());
+        }
+    }
+
+    /// Mobs of a random scene: herds and strays far apart, faster mobs and wider reads, a few
+    /// villagers claiming far away, village readers, pets near an owner elsewhere, links by id
+    /// (to mobs of the list or not) and raids. Unique ids; most mobs tick.
+    fn random_scene(seed: u64) -> Vec<Reach> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move |n: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % n
+        };
+        let mut list = Vec::new();
+        for _ in 0..4 + next(6) {
+            let (cx, cz) = (next(6000) as f64 - 3000.0, next(6000) as f64 - 3000.0);
+            let spread = 8 + next(200);
+            for _ in 0..60 + next(80) {
+                let id = 3 * list.len() as u32 + 1;
+                let x = cx + next(spread) as f64 - spread as f64 / 2.0 + next(100) as f64 / 100.0;
+                let z = cz + next(spread) as f64 - spread as f64 / 2.0 + next(100) as f64 / 100.0;
+                let mut r = at(id, x, z);
+                r.ticking = next(10) > 0;
+                r.body = grow(r.body, (next(3) * next(8)) as f64);
+                r.sense = grow(r.body, MIN_SENSE + 16.0 * next(2) as f64 + SLACK);
+                match next(200) {
+                    0 | 1 => {
+                        let (dx, dz) = (next(1000) as i32 - 500, next(1000) as i32 - 500);
+                        let poi = point_box([x as i32 + dx, 64, z as i32 + dz]);
+                        r.claims = Some(union_box(grow(r.body, POI_CLAIM), poi));
+                    }
+                    2 | 3 => r.village_reads = Some(grow(r.body, VILLAGE_SENSE)),
+                    4 => {
+                        let (ax, az) = (next(6000) as f64 - 3000.0, next(6000) as f64 - 3000.0);
+                        let body = grow(point_box([ax as i32, 64, az as i32]), 4.0);
+                        r.away = Some(Away {
+                            at: (ax, az),
+                            body,
+                            sense: grow(body, MIN_SENSE + SLACK),
+                            village_reads: None,
+                        });
+                    }
+                    5 => r.links.push(3 * next(1500) as u32 + 1),
+                    6 => r.raid = Some(next(3) as i32),
+                    _ => {}
+                }
+                list.push(r);
+            }
+        }
+        list
+    }
+
+    /// The plan does not depend on the size of the cells it finds the boxes by: at the columns'
+    /// own size (`CELL`, which it used before `INDEX_CELL`) and at smaller and larger ones, every
+    /// random scene gives the same groups, or keeps the tick serial for the same reason, and its
+    /// census finds the same islands.
+    #[test]
+    fn the_plan_is_the_same_whatever_cells_find_the_boxes() {
+        let (mut cases, mut grouped) = (0, 0);
+        for seed in 0..48 {
+            let list = random_scene(seed);
+            for lanes in [2, 4, 7] {
+                let plan = |cell: f64| {
+                    let mut census = Census::default();
+                    let plan = islands_in_cells(&list, lanes, &mut census, cell);
+                    let found = (census.ticking, census.islands, census.largest);
+                    (plan.map(|p| p.groups), found)
+                };
+                let expected = plan(CELL);
+                assert_ne!(expected.0, Err(Verdict::OverBudget), "seed {seed}: too big a scene");
+                cases += 1;
+                grouped += usize::from(expected.0.is_ok());
+                for cell in [24.0, INDEX_CELL, 64.0, 128.0] {
+                    let found = plan(cell);
+                    assert_eq!(found, expected, "seed {seed}, {lanes} lanes, cells of {cell}");
+                }
+            }
+        }
+        assert!(grouped * 4 > cases, "too few scenes split ({grouped} of {cases})");
     }
 
     /// A mob with a one-block body at (x, z), reading 34 blocks around it (`MIN_SENSE` + `SLACK`).
