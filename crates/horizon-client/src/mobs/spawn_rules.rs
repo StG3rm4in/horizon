@@ -577,6 +577,24 @@ fn slime_rules<L: SpawnLevel>(
     false
 }
 
+impl super::MobWorld<'_> {
+    /// [`SpawnLevel::sky_light`] of a block whose light byte `light` reads (asked only where the
+    /// level has sky light), for a level that finds the block's chunk itself.
+    pub fn sky_light_from(&self, light: impl FnOnce() -> u8) -> i32 {
+        // Kept as before: vanilla's End has sky light, but Horizon reads 0 there.
+        if matches!(
+            self.dimension_type.id.as_str(),
+            "minecraft:the_nether" | "minecraft:the_end"
+        ) {
+            return 0;
+        }
+        i32::from(light() >> 4)
+    }
+    /// [`SpawnLevel::block_light`] of a block whose light byte is `light`.
+    pub fn block_light_from(light: u8) -> i32 {
+        i32::from(light & 15)
+    }
+}
 impl SpawnLevel for super::MobWorld<'_> {
     fn within_world_border(&self, x: i32, z: i32) -> bool {
         self.border
@@ -605,17 +623,10 @@ impl SpawnLevel for super::MobWorld<'_> {
             .is_some_and(|members| members.contains(biome))
     }
     fn sky_light(&self, x: i32, y: i32, z: i32) -> i32 {
-        // Kept as before: vanilla's End has sky light, but Horizon reads 0 there.
-        if matches!(
-            self.dimension_type.id.as_str(),
-            "minecraft:the_nether" | "minecraft:the_end"
-        ) {
-            return 0;
-        }
-        i32::from(self.world.light(x, y, z) >> 4)
+        self.sky_light_from(|| self.world.light(x, y, z))
     }
     fn block_light(&self, x: i32, y: i32, z: i32) -> i32 {
-        i32::from(self.world.light(x, y, z) & 15)
+        super::MobWorld::block_light_from(self.world.light(x, y, z))
     }
     fn sky_darken(&self) -> i32 {
         super::MobWorld::sky_darken(self)
