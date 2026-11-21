@@ -1039,6 +1039,29 @@ const BROADCAST: &[&str] = &[
     "commands.whitelist.remove.success",
 ];
 
+/// `HORIZON_TICK_CPU`: the calling thread keeps that CPU to itself (`core_reserve`), or a warning
+/// says why not.
+fn keep_tick_cpu() {
+    match horizon_threads::core_reserve::tick_cpu() {
+        None => {}
+        Some(Err(value)) => {
+            log::warn!("Horizon: HORIZON_TICK_CPU={value} is not a CPU number: ignored");
+        }
+        Some(Ok(cpu)) => match horizon_threads::core_reserve::reserve_core_for_current(cpu) {
+            Ok(kept) => log::info!(
+                "Horizon: the server thread keeps CPU {} to itself (SMT siblings {:?} left idle); \
+                 the other threads run on CPUs {:?}",
+                kept.cpu,
+                kept.siblings,
+                kept.others
+            ),
+            Err(why) => {
+                log::warn!("Horizon: HORIZON_TICK_CPU={cpu}: {why}; the server thread runs anywhere");
+            }
+        },
+    }
+}
+
 impl Game<'_> {
     /// DedicatedServer.initServer and MinecraftServer.runServer.
     // The epoch starts at world open; failures before that send no lifecycle event.
@@ -1496,6 +1519,9 @@ impl Game<'_> {
         self.fns.permission = Some(props.function_permission_level.clamp(0, 4) as u8);
         let watchdog = Watchdog::start(props.max_tick_time);
         let _stop_watchdog = StopWatchdog(watchdog.clone());
+        // `HORIZON_TICK_CPU=<cpu>` (Linux): this thread, which ticks, keeps that CPU to itself
+        // from the first tick on, and every other thread leaves it and its SMT siblings.
+        keep_tick_cpu();
         let mut braked = Instant::now();
         let mut overload_warned: Option<Instant> = None;
         // The exactness harness (tick_digest.rs): a digest of every tick, a fixture run.
