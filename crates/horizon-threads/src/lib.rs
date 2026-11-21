@@ -32,14 +32,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-/// The worker threads the machine offers this process: `available_parallelism`'s
-/// answer (its share of the cores — CPU affinity, a container's quota), resolved
-/// once, since it doesn't change under a run and asking again on a later path
-/// can only disagree with the pools already started. `HORIZON_WORKER_THREADS`
-/// sets it instead, to cap every pool on a machine whose OS reports more cores
-/// than a run should take; a value that isn't a positive number is ignored.
-/// Each pool keeps its own share of the count (the streaming pool all but one,
-/// far decoration a third of it).
 /// The CPUs the machine gives this process (`available_parallelism`), asked once: fixed before
 /// the server thread keeps a CPU to itself (`core_reserve`), after which `available_parallelism`
 /// answers one on that thread.
@@ -48,6 +40,14 @@ pub fn machine_threads() -> usize {
     *THREADS.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
+/// The worker threads the machine offers this process: `available_parallelism`'s
+/// answer (its share of the cores — CPU affinity, a container's quota), resolved
+/// once, since it doesn't change under a run and asking again on a later path
+/// can only disagree with the pools already started. `HORIZON_WORKER_THREADS`
+/// sets it instead, to cap every pool on a machine whose OS reports more cores
+/// than a run should take; a value that isn't a positive number is ignored.
+/// Each pool keeps its own share of the count (the streaming pool all but one,
+/// far decoration a third of it).
 pub fn worker_count() -> usize {
     static COUNT: OnceLock<usize> = OnceLock::new();
     *COUNT.get_or_init(|| {
