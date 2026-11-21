@@ -2142,63 +2142,149 @@ impl Behaviours {
 
 /// How [`Behaviours::tick_chunk_random_masked`] should update the current
 /// section mask. `Keep` reuses the mask already held by the tick loop, so a
-/// callback can answer repeated asks without cloning its `Rc`.
+/// callback can answer repeated asks without handing it out again.
 #[derive(Debug)]
 pub enum RandomTickMaskUpdate {
     Keep,
-    Replace(Option<Rc<RandomTickMask>>),
+    Replace(Option<RandomTickMask>),
 }
 
 /// Which of a section's 4,096 blocks a random tick can do anything for
 /// ([`Behaviours::random_tick_candidate`]), one bit each in the section's
-/// index order (`y << 8 | z << 4 | x`). Vanilla reads the block at every drawn
+/// index order (`y << 8 | z << 4 | x`), 64 words of 64. Vanilla reads the block at every drawn
 /// position; most hold stone, dirt or air, and the read is a cache miss.
 ///
-/// The 64 words of bits are summed up in one more, `summary`, whose bit `k` says whether word
-/// `k` holds any bit. A section's candidates mostly make one layer of it (the grass, snow or ice
-/// at the surface), so most draws fall in an empty word, which the summary answers without
-/// reading it. The words are mostly out of cache; the summary comes first (`repr(C)`), beside
-/// the counts of the `Rc` the random tick loop has just handed out.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[repr(C)]
+/// Held compact ([`Self::push_compact`]): two summary words, `any` (bit `k`: word `k` holds a
+/// bit) and `full` (bit `k`: it holds all 64), then only the words that are neither, in order; a
+/// draw that needs its word finds it by counting the summary bits below it. A section's
+/// candidates mostly make one layer of it (the grass, snow or ice at the surface, whole words
+/// where it is flat) or fill it (lava), so most draws are answered from the two summaries, and a
+/// surface section's mask is a few words instead of the 65 (nine cache lines) of every word.
+///
+/// A mask is a handle into a table of masks laid out one after the other ([`Self::in_table`]),
+/// which all of a chunk's ticking sections share: handing one out counts a reference to that one
+/// allocation, not to one per section, and copies nothing. A table is not changed once shared,
+/// so a handle answers for the blocks it was built from for as long as it is held.
+#[derive(Clone)]
 pub struct RandomTickMask {
-    summary: u64,
-    words: [u64; 64],
+    table: Rc<[u64]>,
+    /// Where the mask's `any` word is in `table`.
+    at: usize,
 }
 impl RandomTickMask {
     /// The mask whose bits are `words`: index `i` is bit `i & 63` of word `i >> 6`.
     pub fn from_words(words: [u64; 64]) -> Self {
-        let mut summary = 0;
-        for (k, word) in words.iter().enumerate() {
-            summary |= u64::from(*word != 0) << k;
+        let mut table = Vec::new();
+        Self::push_compact(&words, &mut table);
+        Self {
+            table: table.into(),
+            at: 0,
         }
-        Self { summary, words }
     }
     /// The mask of `blocks` (4,096 states in index order).
-    pub fn of(blocks: &[u32], mut candidate: impl FnMut(u32) -> bool) -> Self {
-        let mut bits = [0u64; 64];
-        let mut last = None;
-        for (i, &state) in blocks.iter().enumerate().take(4096) {
-            let hit = match last {
-                Some((s, hit)) if s == state => hit,
-                _ => {
-                    let hit = candidate(state);
-                    last = Some((state, hit));
-                    hit
-                }
-            };
-            bits[i >> 6] |= u64::from(hit) << (i & 63);
-        }
-        Self::from_words(bits)
+    pub fn of(blocks: &[u32], candidate: impl FnMut(u32) -> bool) -> Self {
+        Self::from_words(Self::words_of(blocks, candidate))
     }
+    /// The bits of [`Self::of`], as [`Self::from_words`] takes them: `candidate` is asked once
+    /// per run of one state.
+    pub fn words_of(blocks: &[u32], mut candidate: impl FnMut(u32) -> bool) -> [u64; 64] {
+        let mut words = [0u64; 64];
+        let mut last = None;
+        for (word, blocks) in words.iter_mut().zip(blocks.chunks(64)) {
+            // A word at a time, in a register: or-ing each block into the array made each wait
+            // for the store of the one before.
+            let mut bits = 0;
+            for (j, &state) in blocks.iter().enumerate() {
+                let hit = match last {
+                    Some((s, hit)) if s == state => hit,
+                    _ => {
+                        let hit = candidate(state);
+                        last = Some((state, hit));
+                        hit
+                    }
+                };
+                bits |= u64::from(hit) << j;
+            }
+            *word = bits;
+        }
+        words
+    }
+    /// Appends to `table`, after the masks already there, the compact form of the mask whose
+    /// bits are `words`: `any`, `full`, then the words neither empty nor full, in order.
+    pub fn push_compact(words: &[u64; 64], table: &mut Vec<u64>) {
+        let (mut any, mut full) = (0u64, 0u64);
+        for (k, &word) in words.iter().enumerate() {
+            any |= u64::from(word != 0) << k;
+            full |= u64::from(word == u64::MAX) << k;
+        }
+        table.reserve(2 + (any & !full).count_ones() as usize);
+        table.extend([any, full]);
+        table.extend(words.iter().copied().filter(|&w| w != 0 && w != u64::MAX));
+    }
+    /// The length of the compact mask that begins at `table[at]`, if it ends within `table`.
+    fn len_at(table: &[u64], at: usize) -> Option<usize> {
+        let (&any, &full) = (table.get(at)?, table.get(at + 1)?);
+        let len = 2 + (any & !full).count_ones() as usize;
+        (at + len <= table.len()).then_some(len)
+    }
+    /// Where each mask of `table` is, in order, as [`Self::push_compact`] laid them out one
+    /// after the other, up to the first that does not fit.
+    pub fn ranges(table: &[u64]) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+        let mut at = 0;
+        std::iter::from_fn(move || {
+            let len = Self::len_at(table, at)?;
+            at += len;
+            Some(at - len..at)
+        })
+    }
+    /// Whether `words` is one compact mask, as [`Self::push_compact`] writes one.
+    pub fn is_compact(words: &[u64]) -> bool {
+        Self::len_at(words, 0) == Some(words.len())
+    }
+    /// The mask that begins at `table[at]` (the start of one of [`Self::ranges`]), sharing the
+    /// table; `None` when no mask fits there.
+    pub fn in_table(table: &Rc<[u64]>, at: usize) -> Option<Self> {
+        Self::len_at(table, at)?;
+        Some(Self {
+            table: Rc::clone(table),
+            at,
+        })
+    }
+    /// The mask's compact form ([`Self::push_compact`]).
+    pub fn compact(&self) -> &[u64] {
+        let len = Self::len_at(&self.table, self.at).unwrap_or(0);
+        &self.table[self.at..self.at + len]
+    }
+    /// Whether the bit of the block at `pos` (in the mask's section) is set.
     #[inline]
     pub fn may_tick(&self, pos: BlockPos) -> bool {
         let i = ((pos.y & 15) << 8 | (pos.z & 15) << 4 | (pos.x & 15)) as usize;
-        // An empty word is not read.
-        if self.summary >> (i >> 6) & 1 == 0 {
+        let (k, mask) = (i >> 6, &self.table[self.at..]);
+        // An empty word is not stored, nor a full one: the summaries answer for them.
+        let (any, full) = (mask[0], mask[1]);
+        if any >> k & 1 == 0 {
             return false;
         }
-        self.words[i >> 6] >> (i & 63) & 1 != 0
+        if full >> k & 1 != 0 {
+            return true;
+        }
+        // The words stored before word `k`'s: the ones below it, neither empty nor full.
+        let before = (any & !full & ((1 << k) - 1)).count_ones() as usize;
+        mask[2 + before] >> (i & 63) & 1 != 0
+    }
+}
+/// The same bits, wherever the masks are stored: a mask has one compact form.
+impl PartialEq for RandomTickMask {
+    fn eq(&self, other: &Self) -> bool {
+        self.compact() == other.compact()
+    }
+}
+impl Eq for RandomTickMask {}
+impl std::fmt::Debug for RandomTickMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RandomTickMask")
+            .field(&self.compact())
+            .finish()
     }
 }
 
@@ -2214,6 +2300,7 @@ mod block_maps_tests;
 mod random_tick_mask_tests {
     use super::RandomTickMask;
     use horizon_core::position::BlockPos;
+    use std::rc::Rc;
 
     /// The summary word changes no answer: in sections where nothing, everything, two corners,
     /// one layer, the top bit of every word or scattered blocks tick, every position gets its own
@@ -2250,6 +2337,69 @@ mod random_tick_mask_tests {
             RandomTickMask::from_words([0; 64]),
             RandomTickMask::of(&[1; 4096], |_| false)
         );
+    }
+
+    /// The compact form answers as the summary and the 64 words did: masks of empty, full,
+    /// sparse and dense words in changing proportions, each alone and all of them in one table,
+    /// answer every position of a section, on either side of zero, as the form before, and equal
+    /// bits make equal masks wherever they are stored.
+    #[test]
+    fn compact_masks_answer_as_the_whole_words() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut masks: Vec<[u64; 64]> = vec![[0; 64], [u64::MAX; 64]];
+        for _ in 0..200 {
+            let mix = next();
+            masks.push(std::array::from_fn(|k| match mix >> (k % 32 * 2) & 3 {
+                0 => 0,
+                1 => u64::MAX,
+                2 => next() & next() & next(),
+                _ => next() | next(),
+            }));
+        }
+        let mut table = Vec::new();
+        for words in &masks {
+            RandomTickMask::push_compact(words, &mut table);
+        }
+        let table: Rc<[u64]> = table.into();
+        let ranges: Vec<_> = RandomTickMask::ranges(&table).collect();
+        assert_eq!(ranges.len(), masks.len());
+        assert_eq!(ranges.last().map(|r| r.end), Some(table.len()));
+        for (words, range) in masks.iter().zip(ranges) {
+            // The form before: a summary of the non-empty words, then the word itself.
+            let summary =
+                (words.iter().enumerate()).fold(0u64, |s, (k, &w)| s | u64::from(w != 0) << k);
+            let whole =
+                |i: usize| summary >> (i >> 6) & 1 != 0 && words[i >> 6] >> (i & 63) & 1 != 0;
+            let alone = RandomTickMask::from_words(*words);
+            let shared = RandomTickMask::in_table(&table, range.start).unwrap();
+            let stored = words.iter().filter(|&&w| w != 0 && w != u64::MAX).count();
+            assert_eq!(alone.compact().len(), 2 + stored);
+            assert!(RandomTickMask::is_compact(alone.compact()));
+            assert_eq!(shared.compact(), &table[range]);
+            assert_eq!(alone, shared);
+            for i in 0..4096 {
+                let j = i as i32;
+                let (x, y, z) = (j & 15, j >> 8, (j >> 4) & 15);
+                for (cx, cy, cz) in [(0, 0, 0), (-1, -4, 3)] {
+                    let pos = BlockPos::new(cx * 16 + x, cy * 16 + y, cz * 16 + z);
+                    assert_eq!(alone.may_tick(pos), whole(i), "{pos:?}");
+                    assert_eq!(shared.may_tick(pos), whole(i), "{pos:?}");
+                }
+            }
+        }
+        assert_ne!(
+            RandomTickMask::from_words(masks[0]),
+            RandomTickMask::from_words(masks[1])
+        );
+        // No mask begins at the table's end, nor where its words would run past it.
+        assert!(RandomTickMask::in_table(&table, table.len()).is_none());
+        assert!(!RandomTickMask::is_compact(&[1, 0]));
     }
 }
 
