@@ -1152,16 +1152,9 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             b.is_block(state, b.named.tripwire)
         }
     }
-    /// `LeavesBlock.getDistanceAt`.
+    /// `LeavesBlock.getDistanceAt` ([`Behaviours::leaf_distance_at`]).
     pub(crate) fn leaf_distance_at(&self, state: BlockStateId) -> i32 {
-        let b = self.b;
-        if b.in_set(state, &b.tags.prevents_nearby_leaf_decay) {
-            0
-        } else if b.table.has(state, b.props.distance) {
-            b.table.int(state, b.props.distance)
-        } else {
-            7
-        }
+        self.b.leaf_distance_at(state)
     }
     /// `ConcretePowderBlock.touchesLiquid`.
     pub(crate) fn concrete_touches_liquid(&self, pos: BlockPos) -> bool {

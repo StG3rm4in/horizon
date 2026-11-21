@@ -1379,6 +1379,8 @@ pub struct Behaviours {
     growth: growth::Growth,
     /// The open world's NeoForge block data maps.
     block_maps: block_maps::Slot,
+    /// [`Self::leaf_distance_at`] of every state, made at the first ask.
+    leaf_distances: std::sync::OnceLock<Box<[u8]>>,
 }
 
 impl Behaviours {
@@ -1418,6 +1420,39 @@ impl Behaviours {
     }
     pub fn facts(&self, state: BlockStateId) -> &StateFacts {
         &self.facts[state.0 as usize]
+    }
+    /// The entry of [`Self::leaf_distance_at`]'s table for an answer it does not hold: a mod's
+    /// `distance` property outside 0..=254, read again at each ask.
+    const LEAF_DISTANCE_UNCACHED: u8 = u8::MAX;
+    /// `LeavesBlock.getDistanceAt`: 0 for a block in `prevents_nearby_leaf_decay`, the value of
+    /// its `distance` property for a block that has one, else 7. A leaf's tick asks it of its six
+    /// neighbours, and a leaf's shape update of the neighbour that changed. The answer depends on
+    /// the state alone, and the tags and properties are fixed once loaded: it is read from a table
+    /// of every state's answer, made at the first ask, in place of a tag test and two searches of
+    /// the block's properties.
+    pub(crate) fn leaf_distance_at(&self, state: BlockStateId) -> i32 {
+        let table = self.leaf_distances.get_or_init(|| {
+            (0..self.table.state_count() as u32)
+                .map(|id| {
+                    u8::try_from(self.leaf_distance_uncached(BlockStateId(id)))
+                        .unwrap_or(Self::LEAF_DISTANCE_UNCACHED)
+                })
+                .collect()
+        });
+        match table.get(state.0 as usize) {
+            Some(&distance) if distance != Self::LEAF_DISTANCE_UNCACHED => i32::from(distance),
+            _ => self.leaf_distance_uncached(state),
+        }
+    }
+    /// [`Self::leaf_distance_at`] from the tag and the block's properties.
+    pub(crate) fn leaf_distance_uncached(&self, state: BlockStateId) -> i32 {
+        if self.in_set(state, &self.tags.prevents_nearby_leaf_decay) {
+            0
+        } else if self.table.has(state, self.props.distance) {
+            self.table.int(state, self.props.distance)
+        } else {
+            7
+        }
     }
     pub fn block_data(&self, block: BlockId) -> &BlockData {
         &self.blocks[block.0 as usize]

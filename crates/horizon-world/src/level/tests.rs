@@ -1908,6 +1908,25 @@ fn crops_grow_and_leaves_decay() {
     assert_eq!(w.prop(BlockPos::new(9, 5, 5), "distance"), "1");
 }
 
+/// The table of `LeavesBlock.getDistanceAt` answers as the tag and the properties do, for every
+/// state: blocks in `prevents_nearby_leaf_decay` (0), leaves of each distance, other blocks with
+/// a `distance` (scaffolding) and blocks without one (7).
+#[test]
+fn the_leaf_distance_table_answers_as_the_tag_and_properties() {
+    let Some(f) = fixture() else {
+        return;
+    };
+    let b = &f.behaviours;
+    let mut seen = HashSet::new();
+    for id in 0..b.table.state_count() as u32 {
+        let state = BlockStateId(id);
+        let (distance, name) = (b.leaf_distance_uncached(state), b.table.name(state));
+        assert_eq!(b.leaf_distance_at(state), distance, "{name}");
+        seen.insert(distance);
+    }
+    assert!((0..=7).all(|d| seen.contains(&d)), "{seen:?}");
+}
+
 impl World<'_> {
     /// Right-click `item` on the `face` of `clicked`, hitting the face centre
     /// (offset vertically by `dy`), looking with `yaw`/`pitch`.
