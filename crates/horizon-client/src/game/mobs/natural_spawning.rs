@@ -491,6 +491,9 @@ pub(super) struct SpawnHost<'g> {
     pub(super) items: &'g horizon_client::items::Items,
     pub(super) camel_husk_size: (f32, f32),
 }
+/// The structure starts a level keeps, by chunk and category ([`Level::structure_starts`]).
+type KeptStarts =
+    horizon_client::fast_hash::FxHashMap<((i32, i32), Category), super::structures::ChunkStarts>;
 /// The game level as natural spawning reads it.
 pub(super) type GameLevel<'g, 'a> = Level<'g, &'g Game<'a>>;
 pub(super) struct Level<'g, H> {
@@ -534,12 +537,19 @@ pub(super) struct Level<'g, H> {
     /// nether's few): for any other the cost is none wherever it stands, and
     /// spawning asks for one for every loaded mob each tick.
     pub(super) costed: Vec<&'g str>,
+    /// The structure starts of the chunks the spawn attempts asked `mobsAt` about, by chunk and
+    /// category, kept from the first attempt of each ([`NaturalLevel::category_structures_at`]):
+    /// the chunks and their references do not change while the level holds the game.
+    structure_starts: std::cell::RefCell<KeptStarts>,
     /// The spawner block whose tick this pass is, told to the spawn checks;
     /// None for natural spawning and the other passes.
     pub(super) spawner: Option<mod_api::Spawner>,
     /// The mob a listened position check created and lent, which the spawn
     /// that follows takes rather than creating it again ([`Checked`]).
     checked: std::cell::RefCell<Option<Checked>>,
+    /// Every biome's spawn lists by category, made when `mobsAt` first reads one
+    /// ([`NaturalLevel::biome_category_spawns`]).
+    spawn_lists: std::cell::OnceCell<spawn_selection::BiomeSpawnLists<'g>>,
 }
 /// The mob a listened `mob_spawn_position_check` created for its lend, held
 /// until the spawn takes it, and the provisional count before it was
@@ -550,6 +560,9 @@ struct Checked {
     provisional: u32,
 }
 const SCANNED_QUERIES: u32 = 8;
+/// A natural spawning pass over this many candidate chunks (a player's square) or more builds
+/// the mobs' grid before its first box query ([`Level::build_boxes`]).
+const GRID_FIRST_CHUNKS: usize = 289;
 /// A mob not removed: its index in `Game::mobs`, box, alive, and whether
 /// it is a living shulker.
 type MobBox = (usize, Aabb, bool, bool);
@@ -612,6 +625,15 @@ impl<H: LevelHost> Level<'_, H> {
                 .near(area),
         )
     }
+    /// Builds the grid of the game's mobs now, for a pass that will ask so many box queries that
+    /// the scans [`Self::mobs_near`] starts with would only add to the build (each works out
+    /// every mob's box): a natural spawning pass over many chunks asks one for nearly every
+    /// attempt that finds room. The mobs do not change while the level holds the game.
+    fn build_boxes(&self) {
+        if self.shared_boxes.is_none() {
+            self.boxes.get_or_init(|| MobBoxes::new(self.game.mobs()));
+        }
+    }
     fn biome(&self, x: i32, y: i32, z: i32) -> Option<&BiomeInfo> {
         Some(self.w.biomes.get(self.w.world.noise_biome(x, y, z)?))
     }
@@ -622,6 +644,11 @@ impl<H: LevelHost> Level<'_, H> {
         [qx << 2, qy << 2, qz << 2]
     }
     fn zoomed_biome(&self, x: i32, y: i32, z: i32) -> Option<&BiomeInfo> {
+        let id = self.zoomed_biome_id(x, y, z)?;
+        Some(self.w.biomes.get(id))
+    }
+    /// The biome table index of the noise cell `BiomeManager.getBiome` reads at a block.
+    fn zoomed_biome_id(&self, x: i32, y: i32, z: i32) -> Option<u16> {
         // `BiomeManager.getBiome` reads one of the eight noise cells around the block
         // (`BiomeZoom::quart_at_block`): where their sections hold one biome alone, it is that one
         // whichever the zoom picks, so its hashing is skipped.
@@ -630,10 +657,10 @@ impl<H: LevelHost> Level<'_, H> {
             [q << 2, q.wrapping_add(1) << 2]
         };
         if let Some(biome) = (self.w.world).uniform_noise_biome(cells(x), cells(y), cells(z)) {
-            return Some(self.w.biomes.get(biome));
+            return Some(biome);
         }
         let [x, y, z] = self.zoomed(x, y, z);
-        self.biome(x, y, z)
+        self.w.world.noise_biome(x, y, z)
     }
     /// A provisional id, distinct within the pass and mapped to a real one
     /// by [`Game::add_spawned`].
@@ -846,10 +873,14 @@ impl<H: LevelHost> SpawnLevel for Level<'_, H> {
     fn block_tag(&self, tag: &str, block: &str) -> bool {
         self.w.block_tag(tag, block)
     }
-    // Level.getBiome: the zoomed biome.
+    // Level.getBiome: the zoomed biome, found as `zoomed_biome` finds it (most blocks lie in
+    // sections of one biome), with `MobWorld::biome_tag`'s test of its name.
     fn biome_tag(&self, tag: &str, x: i32, y: i32, z: i32) -> bool {
-        let [x, y, z] = self.zoomed(x, y, z);
-        self.w.biome_tag(tag, x, y, z)
+        let Some(id) = self.zoomed_biome_id(x, y, z) else {
+            return false;
+        };
+        let name = &self.w.biomes.get(id).name;
+        self.w.data.biome_has(tag.trim_start_matches('#'), name)
     }
     fn sky_light(&self, x: i32, y: i32, z: i32) -> i32 {
         self.w.sky_light(x, y, z)
@@ -886,6 +917,14 @@ impl<H: LevelHost> SpawnLevel for Level<'_, H> {
         self.players.iter().any(|p| {
             p.alive && !p.creative && !p.spectator && p.distance_sqr(x, y, z) < distance * distance
         })
+    }
+}
+/// A structure a position is in, as natural spawning reads it.
+fn structure_at(reach: super::structures::Reach) -> StructureAt {
+    StructureAt {
+        id: reach.name,
+        in_piece: reach.in_piece,
+        in_bounds: reach.in_box,
     }
 }
 impl<H: LevelHost> NaturalLevel for Level<'_, H> {
@@ -937,6 +976,19 @@ impl<H: LevelHost> NaturalLevel for Level<'_, H> {
     fn biome_spawns(&self, x: i32, y: i32, z: i32) -> Option<&HashMap<String, Vec<SpawnEntry>>> {
         self.zoomed_biome(x, y, z).map(|b| &b.spawns)
     }
+    /// The list in the level's table of the biomes' lists by category, for the biome
+    /// [`Self::biome_spawns`] finds.
+    fn biome_category_spawns(&self, category: Category, x: i32, y: i32, z: i32) -> &[SpawnEntry] {
+        let Some(id) = self.zoomed_biome_id(x, y, z) else {
+            return &[];
+        };
+        let biomes = self.w.biomes;
+        let new = move || spawn_selection::BiomeSpawnLists::new(&biomes.list);
+        let lists = self.spawn_lists.get_or_init(new);
+        lists
+            .get(id, category)
+            .unwrap_or_else(|| spawn_selection::BiomeSpawnLists::of(biomes.get(id), category))
+    }
     fn spawn_cost(&self, entity: &str, x: i32, y: i32, z: i32) -> Option<SpawnCost> {
         if !self.costed.contains(&entity) {
             return None;
@@ -960,12 +1012,40 @@ impl<H: LevelHost> NaturalLevel for Level<'_, H> {
             wanted,
         )
         .into_iter()
-        .map(|reach| StructureAt {
-            id: reach.name,
-            in_piece: reach.in_piece,
-            in_bounds: reach.in_box,
-        })
+        .map(structure_at)
         .collect()
+    }
+    /// [`Self::structures_at`] from the starts the level keeps for the position's chunk and
+    /// `category`, looked up by the chunk's first attempt: the same starts in the same order, each
+    /// tested at the position as [`reaches_in`] tests it. Most chunks refer to no structure and
+    /// keep nothing.
+    fn category_structures_at(
+        &self,
+        category: Category,
+        x: i32,
+        y: i32,
+        z: i32,
+        wanted: &dyn Fn(&str) -> bool,
+    ) -> Vec<StructureAt> {
+        let chunk = (x >> 4, z >> 4);
+        let world = self.w.world;
+        if world
+            .chunks
+            .get(&chunk)
+            .is_none_or(|c| c.structure_refs.is_empty())
+        {
+            return Vec::new();
+        }
+        let mut kept = self.structure_starts.borrow_mut();
+        let starts = kept.entry((chunk, category)).or_insert_with(|| {
+            super::structures::ChunkStarts::in_world(
+                world,
+                &|| self.host.locator.clone(),
+                chunk,
+                wanted,
+            )
+        });
+        starts.reaching([x, y, z]).into_iter().map(structure_at).collect()
     }
     fn structure_spawns(&self) -> &StructureSpawns {
         self.host.structure_spawns
@@ -1156,8 +1236,10 @@ impl<'a> Game<'a> {
             box_queries: Default::default(),
             group: Default::default(),
             costed: spawn_cost_types(world_biomes!(self)),
+            structure_starts: Default::default(),
             spawner: None,
             checked: Default::default(),
+            spawn_lists: Default::default(),
         }
     }
     /// Gives a spawn pass's provisional mobs (the `u32::MAX - n` ids
@@ -1476,6 +1558,9 @@ impl<'a> Game<'a> {
                 }
             }
             if lanes.is_none() && !categories.is_empty() {
+                if scratch.candidates.len() >= GRID_FIRST_CHUNKS {
+                    level.build_boxes();
+                }
                 for chunk in scratch.candidates.drain(..) {
                     // ServerChunkCache.tickSpawningChunk gates the initial chunk too.
                     if !level.can_spawn_in_chunk(chunk.0, chunk.1) {
@@ -2997,5 +3082,135 @@ mod tests {
             ["spawn_raids", "spawn_natural", "spawn_custom"],
             "ServerLevel.tick ticks the raids before the chunk source's spawns"
         );
+    }
+
+    /// The level's table of the biomes' spawn lists gives each biome's list for each category
+    /// as the biome's own map does (past the table, plains'), and at each position the list of
+    /// the biome `biome_spawns` finds there, in sections of one biome and of many, below, in and
+    /// above the level's range and where no chunk is loaded; the biome tags read the zoomed
+    /// biome as the zoom does.
+    #[test]
+    #[ignore = "daily"]
+    fn biome_lists_and_tags_read_the_zoomed_biome() {
+        use super::super::native_entity_refs::tests::with_game;
+        use horizon_client::chunk::Chunk;
+        // The same slice of the same list (empty lists may sit anywhere).
+        let same = |a: &[SpawnEntry], b: &[SpawnEntry]| {
+            a.len() == b.len() && (a.is_empty() || std::ptr::eq(a, b))
+        };
+        with_game(|game| {
+            let count = world_biomes!(game).list.len() as u16;
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = |m: u64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % m
+            };
+            // Sections of one biome and sections of a biome a cell.
+            for cx in -1..=1 {
+                for cz in -1..=1 {
+                    let mut chunk = Chunk::empty(cx, cz);
+                    for s in 0..chunk.sections.len() as i32 {
+                        let one = (next(2) == 0).then(|| next(u64::from(count)) as u16);
+                        for qy in s * 4..s * 4 + 4 {
+                            for qz in 0..4 {
+                                for qx in 0..4 {
+                                    let id = one.unwrap_or_else(|| next(u64::from(count)) as u16);
+                                    chunk.set_biome_cell(qx, qy, qz, id);
+                                }
+                            }
+                        }
+                    }
+                    game.world.chunks.insert((cx, cz), Arc::new(chunk));
+                }
+            }
+            let level = game.natural_level();
+            let biomes = level.w.biomes;
+            let lists = spawn_selection::BiomeSpawnLists::new(&biomes.list);
+            for id in 0..count + 2 {
+                for category in Category::ALL {
+                    let by_name = biomes.get(id).spawns.get(category.name());
+                    let by_name = by_name.map_or(&[][..], Vec::as_slice);
+                    let listed = lists.get(id, category).unwrap_or_else(|| {
+                        spawn_selection::BiomeSpawnLists::of(biomes.get(id), category)
+                    });
+                    assert!(same(listed, by_name), "biome {id}, {category:?}");
+                }
+            }
+            let tags = &level.w.data.biome_tags;
+            let mut asked: Vec<String> = tags.keys().take(8).map(|t| format!("#{t}")).collect();
+            asked.extend(tags.keys().take(8).cloned());
+            asked.push("minecraft:no_such_tag".into());
+            let min_y = game.world.shape.min_y;
+            for _ in 0..4000 {
+                let (x, z) = (next(48) as i32 - 24, next(48) as i32 - 24);
+                let y = min_y - 4 + next(392) as i32;
+                for category in Category::ALL {
+                    let by_name = level.biome_spawns(x, y, z);
+                    let by_name = by_name.and_then(|b| b.get(category.name()));
+                    let by_name = by_name.map_or(&[][..], Vec::as_slice);
+                    let listed = level.biome_category_spawns(category, x, y, z);
+                    assert!(same(listed, by_name), "{category:?} at {x} {y} {z}");
+                }
+                let [zx, zy, zz] = level.zoomed(x, y, z);
+                for tag in &asked {
+                    let zoomed = level.w.biome_tag(tag, zx, zy, zz);
+                    assert_eq!(level.biome_tag(tag, x, y, z), zoomed, "{tag} at {x} {y} {z}");
+                }
+            }
+        });
+    }
+
+    /// A level that builds its mobs' grid before the first box query answers every query as one
+    /// that starts by scanning the mobs: room (the shulkers' solid boxes), obstruction and a
+    /// spawner's counts.
+    #[test]
+    #[ignore = "daily"]
+    fn a_grid_built_first_answers_as_the_first_scans() {
+        use super::super::creatures::SpawnSite;
+        use super::super::native_entity_refs::tests::with_game;
+        use horizon_client::mobs::spawner::SpawnerLevel;
+        with_game(|game| {
+            spawn_check_world(game, Vec3::new(0.5, 64.0, 0.5));
+            let kinds = [
+                "minecraft:zombie",
+                "minecraft:shulker",
+                "minecraft:cow",
+                "minecraft:spider",
+            ];
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            let mut next = |m: f64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % 1_000_000) as f64 / 1_000_000.0 * m
+            };
+            for i in 0..160 {
+                let at = [next(48.0), 64.0 + next(4.0), next(48.0)];
+                let _ = game.spawn_mob(kinds[i % kinds.len()], at, false, SpawnSite::Plain);
+            }
+            assert!(game.mobs.len() >= 40, "{} mobs joined", game.mobs.len());
+            let built = game.natural_level();
+            built.build_boxes();
+            let (mut asked, mut obstructed) = (0, 0);
+            for _ in 0..300 {
+                // A fresh level for each box, whose queries all scan.
+                let scanning = game.natural_level();
+                let (x, y, z) = (next(48.0), 63.0 + next(6.0), next(48.0));
+                let b = spawn_selection::spawn_box(x, y, z, 0.3 + next(2.0) as f32, 1.8);
+                assert_eq!(scanning.no_collision(b), built.no_collision(b), "{b:?}");
+                let unobstructed = scanning.unobstructed(b);
+                assert_eq!(unobstructed, built.unobstructed(b), "{b:?}");
+                for kind in kinds {
+                    let count = scanning.count_entities(kind, b);
+                    assert_eq!(count, built.count_entities(kind, b), "{kind} in {b:?}");
+                }
+                assert!(scanning.boxes.get().is_none(), "the fresh level scanned");
+                asked += 1;
+                obstructed += usize::from(!unobstructed);
+            }
+            assert!(obstructed > 0 && obstructed < asked, "{obstructed} of {asked}");
+        });
     }
 }

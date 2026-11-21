@@ -395,6 +395,14 @@ pub trait NaturalLevel: SpawnLevel {
     fn mob_type(&self, entity: &str) -> Option<MobType>;
     /// The `natural_mob_spawns` lists by category at a position.
     fn biome_spawns(&self, x: i32, y: i32, z: i32) -> Option<&HashMap<String, Vec<SpawnEntry>>>;
+    /// The `natural_mob_spawns` list of `category` at a position: [`Self::biome_spawns`]' list
+    /// for the category's name, or none. `mobsAt` reads it at every spawn attempt, and a level may
+    /// keep its biomes' lists by category ([`BiomeSpawnLists`]).
+    fn biome_category_spawns(&self, category: Category, x: i32, y: i32, z: i32) -> &[SpawnEntry] {
+        self.biome_spawns(x, y, z)
+            .and_then(|b| b.get(category.name()))
+            .map_or(&[], Vec::as_slice)
+    }
     /// The `natural_mob_spawns` spawn cost of a type at a position.
     fn spawn_cost(&self, entity: &str, x: i32, y: i32, z: i32) -> Option<SpawnCost>;
     /// The `creature_world_gen_spawn_probability` attribute at a position.
@@ -408,6 +416,20 @@ pub trait NaturalLevel: SpawnLevel {
         z: i32,
         wanted: &dyn Fn(&str) -> bool,
     ) -> Vec<StructureAt>;
+    /// [`Self::structures_at`] for `mobsAt` of `category`, whose `wanted` takes the structures
+    /// that can change the category's list and depends on nothing else: a level may keep the
+    /// starts a chunk's references name for a category and answer the chunk's positions from
+    /// them.
+    fn category_structures_at(
+        &self,
+        _category: Category,
+        x: i32,
+        y: i32,
+        z: i32,
+        wanted: &dyn Fn(&str) -> bool,
+    ) -> Vec<StructureAt> {
+        self.structures_at(x, y, z, wanted)
+    }
     fn structure_spawns(&self) -> &StructureSpawns;
     /// Where the players `getNearestPlayer(x, y, z, -1, false)` measures to
     /// are: every one that is not a spectator.
@@ -810,6 +832,34 @@ pub fn fortress_enemies() -> &'static [SpawnEntry] {
     &ENEMIES
 }
 
+/// Every biome's `natural_mob_spawns` lists by category, by biome id: `mobsAt` reads the list of
+/// the biome at every spawn attempt, and a biome keeps its lists by the category's name. A
+/// biome's lists are read the first time one of them is asked for.
+pub struct BiomeSpawnLists<'b> {
+    biomes: &'b [crate::biome::BiomeInfo],
+    rows: Vec<std::cell::OnceCell<[&'b [SpawnEntry]; 8]>>,
+}
+impl<'b> BiomeSpawnLists<'b> {
+    /// The lists of a biome table's entries, by id.
+    pub fn new(biomes: &'b [crate::biome::BiomeInfo]) -> Self {
+        let rows = biomes.iter().map(|_| std::cell::OnceCell::new()).collect();
+        Self { biomes, rows }
+    }
+    /// A biome's list for `category`, or an empty one.
+    pub fn of(biome: &'b crate::biome::BiomeInfo, category: Category) -> &'b [SpawnEntry] {
+        let list = biome.spawns.get(category.name());
+        list.map_or(&[], Vec::as_slice)
+    }
+    /// [`Self::of`] the table's biome `id`; None past the table.
+    pub fn get(&self, id: u16, category: Category) -> Option<&'b [SpawnEntry]> {
+        let (biomes, id) = (self.biomes, usize::from(id));
+        let row = self.rows.get(id)?;
+        let of = move |c| Self::of(&biomes[id], c);
+        let lists = row.get_or_init(|| Category::ALL.map(of));
+        Some(lists[category.index()])
+    }
+}
+
 /// `NaturalSpawner.mobsAt`: the fortress bounds on nether bricks, then
 /// `ChunkGenerator.getMobsAt` (the first referenced structure whose override
 /// for the category holds the position), else the biome's list, as mods
@@ -843,7 +893,7 @@ fn vanilla_mobs_at<L: NaturalLevel>(
     // most chunks are mineshafts, which override nothing).
     let overrides = l.structure_spawns();
     let monster = category == Category::Monster;
-    let structures = l.structures_at(x, y, z, &|id| {
+    let structures = l.category_structures_at(category, x, y, z, &|id| {
         (monster && id == "minecraft:fortress") || overrides.get(id, category.name()).is_some()
     });
     // The structures first: both sides are plain reads, and the list is almost always empty,
@@ -863,9 +913,7 @@ fn vanilla_mobs_at<L: NaturalLevel>(
             return &o.spawns;
         }
     }
-    l.biome_spawns(x, y, z)
-        .and_then(|b| b.get(category.name()))
-        .map_or(&[], Vec::as_slice)
+    l.biome_category_spawns(category, x, y, z)
 }
 
 fn total_weight(list: &[SpawnEntry]) -> i64 {
@@ -968,6 +1016,54 @@ impl PlayerCells {
         }
         out.sort_unstable();
     }
+    /// [`Self::within_8`] from the players of the three by three squares around the chunk's
+    /// square, which `unions` keeps for these cells: every chunk of a square looks in the same
+    /// nine squares, so a pass gathers and orders their players once a square rather than once a
+    /// chunk, and each chunk takes those within 8 of it, in the players' order.
+    fn within_8_kept(&self, cx: i32, cz: i32, unions: &mut CellUnions, out: &mut Vec<usize>) {
+        let (x0, x1) = (cx.saturating_sub(8) >> 3, cx.saturating_add(8) >> 3);
+        let (z0, z1) = (cz.saturating_sub(8) >> 3, cz.saturating_add(8) >> 3);
+        // At the ends of the coordinates the clamped range is narrower: no square to share.
+        if x1 - x0 != 2 || z1 - z0 != 2 {
+            self.within_8(cx, cz, out);
+            return;
+        }
+        let CellUnions { runs, list } = unions;
+        let (start, len) = *runs.entry((x0, z0)).or_insert_with(|| {
+            let start = list.len();
+            for kx in x0..=x1 {
+                for kz in z0..=z1 {
+                    if let Some(players) = self.cells.get(&(kx, kz)) {
+                        list.extend_from_slice(players);
+                    }
+                }
+            }
+            list[start..].sort_unstable_by_key(|&(i, _, _)| i);
+            (start as u32, (list.len() - start) as u32)
+        });
+        out.clear();
+        out.extend(
+            list[start as usize..(start + len) as usize]
+                .iter()
+                .filter(|&&(_, px, pz)| (px - cx).abs().max((pz - cz).abs()) <= 8)
+                .map(|&(i, _, _)| i as usize),
+        );
+    }
+}
+
+/// The players of the three by three squares of a [`PlayerCells`] around each square asked
+/// about ([`PlayerCells::within_8_kept`]), in the players' order: each square's run in `list`.
+/// Kept for one set of cells.
+#[derive(Clone, Debug, Default)]
+struct CellUnions {
+    runs: FxHashMap<(i32, i32), (u32, u32)>,
+    list: Vec<(u32, i32, i32)>,
+}
+impl CellUnions {
+    fn clear(&mut self) {
+        self.runs.clear();
+        self.list.clear();
+    }
 }
 
 /// A player as the spawn caps see it.
@@ -996,6 +1092,8 @@ pub struct SpawnState {
     /// Scratch for [`Nearest`] and `players_near`, kept to be reused.
     nearby: Vec<[f64; 3]>,
     tracked: Vec<usize>,
+    /// The players of the squares of `cells` around each square `players_near` asked about.
+    unions: CellUnions,
     /// The position and charge of the last `can_spawn`; `after_spawn` always
     /// follows it for the same type and position.
     last_checked: Option<([i32; 3], f64)>,
@@ -1011,6 +1109,7 @@ pub struct SpawnBuffers {
     player_counts: Vec<[i32; 8]>,
     nearby: Vec<[f64; 3]>,
     tracked: Vec<usize>,
+    unions: CellUnions,
 }
 impl SpawnState {
     /// `getSpawnableChunkCount` and `getMobCategoryCounts` (by
@@ -1086,6 +1185,7 @@ impl SpawnState {
         buffers.near_list.clear();
         buffers.player_counts.clear();
         buffers.player_counts.resize(players.len(), [0; 8]);
+        buffers.unions.clear();
         Self {
             spawnable_chunks,
             limits: SpawnLimits::VANILLA,
@@ -1098,6 +1198,7 @@ impl SpawnState {
             near_list: buffers.near_list,
             nearby: buffers.nearby,
             tracked: buffers.tracked,
+            unions: buffers.unions,
             last_checked: None,
         }
     }
@@ -1119,6 +1220,7 @@ impl SpawnState {
             player_counts: self.player_counts,
             nearby: self.nearby,
             tracked: self.tracked,
+            unions: self.unions,
         };
         (self.players, buffers)
     }
@@ -1132,12 +1234,12 @@ impl SpawnState {
     /// non-spectators within 128 blocks of the chunk's centre.
     fn players_near(&mut self, cx: i32, cz: i32) -> std::ops::Range<usize> {
         let (list, players, cells) = (&mut self.near_list, &self.players, &self.cells);
-        let tracked = &mut self.tracked;
+        let (tracked, unions) = (&mut self.tracked, &mut self.unions);
         let (start, len) = *self.players_near.entry((cx, cz)).or_insert_with(|| {
             let start = list.len() as u32;
             // Every player within 128 blocks of the chunk's centre stands in
             // a chunk within 8 of it: those 8 chunks hold every answer.
-            cells.within_8(cx, cz, tracked);
+            cells.within_8_kept(cx, cz, unions, tracked);
             if !tracked.is_empty() {
                 let (x, z) = (f64::from(cx * 16 + 8), f64::from(cz * 16 + 8));
                 list.extend(tracked.iter().copied().filter(|&i| {
@@ -2087,6 +2189,91 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(found, scan, "chunk ({cx}, {cz})");
+            }
+        }
+    }
+
+    /// The squares' gathered players answer every chunk as [`PlayerCells::within_8`] does, the
+    /// chunks of a square sharing them, at the ends of the coordinates too; and the spawn state's
+    /// players near a chunk are the non-spectators within 128 blocks of its centre, in the
+    /// players' order, as a look at every player finds them.
+    #[test]
+    fn gathered_squares_find_what_within_8_finds() {
+        let mut seed = 0x517C_C1B7_2722_0A95u64;
+        let mut next = |m: f64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 1_000_000) as f64 / 1_000_000.0 * 2.0 * m - m
+        };
+        // Spread over 6 000 blocks, a cluster of forty, and players on chunk and square edges.
+        let mut players: Vec<(f64, f64)> =
+            (0..120).map(|_| (next(3_000.0), next(3_000.0))).collect();
+        players.extend((0..40).map(|_| (100.0 + next(60.0), -200.0 + next(60.0))));
+        players.extend([
+            (0.0, 0.0),
+            (-0.5, 127.9),
+            (128.0, -128.0),
+            (2047.99, -2048.0),
+        ]);
+        let cells = PlayerCells::new(players.iter().copied());
+        let mut unions = CellUnions::default();
+        let (mut kept, mut found) = (Vec::new(), Vec::new());
+        let chunk = |(x, z): (f64, f64)| ((x.floor() as i32) >> 4, (z.floor() as i32) >> 4);
+        for &(x, z) in players.iter().step_by(3) {
+            let (pcx, pcz) = chunk((x, z));
+            for dx in -12..=12 {
+                for dz in [-12, -9, -8, -1, 0, 7, 8, 9, 12] {
+                    let (cx, cz) = (pcx + dx, pcz + dz);
+                    cells.within_8_kept(cx, cz, &mut unions, &mut kept);
+                    cells.within_8(cx, cz, &mut found);
+                    assert_eq!(kept, found, "chunk ({cx}, {cz})");
+                }
+            }
+        }
+        assert!(unions.runs.len() > 1 && !unions.list.is_empty());
+        // Where the range is clamped the chunk looks for itself; just inside, it shares.
+        let ends = [(f64::from(i32::MAX), 0.0), (f64::from(i32::MIN), 0.0)];
+        let far = PlayerCells::new(ends);
+        let mut far_unions = CellUnions::default();
+        for cx in [
+            i32::MAX,
+            i32::MAX - 7,
+            i32::MAX - 20,
+            i32::MIN,
+            i32::MIN + 9,
+        ] {
+            far.within_8_kept(cx, 0, &mut far_unions, &mut kept);
+            far.within_8(cx, 0, &mut found);
+            assert_eq!(kept, found, "chunk ({cx}, 0)");
+        }
+        let spawn_players: Vec<SpawnPlayer> = players
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, z))| SpawnPlayer {
+                position: [x, 64.0, z],
+                spectator: i % 7 == 0,
+            })
+            .collect();
+        let mut state = SpawnState::uncounted(289, spawn_players.clone());
+        for &(x, z) in players.iter().step_by(5) {
+            let (pcx, pcz) = chunk((x, z));
+            for (cx, cz) in [
+                (pcx, pcz),
+                (pcx + 8, pcz - 3),
+                (pcx - 9, pcz),
+                (pcx + 5, pcz + 7),
+            ] {
+                let near = state.players_near(cx, cz);
+                let centre = (f64::from(cx * 16 + 8), f64::from(cz * 16 + 8));
+                let scan: Vec<usize> = (0..spawn_players.len())
+                    .filter(|&i| {
+                        let p = &spawn_players[i];
+                        let (dx, dz) = (centre.0 - p.position[0], centre.1 - p.position[2]);
+                        !p.spectator && dx * dx + dz * dz < 16384.0
+                    })
+                    .collect();
+                assert_eq!(state.near_list[near], scan[..], "chunk ({cx}, {cz})");
             }
         }
     }
