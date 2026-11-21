@@ -1,7 +1,7 @@
 //! The creaking heart block entity in the game: `mobs::creaking_heart`
 //! ticks each heart (spawning, letting go of and bleeding for its creaking)
 //! and this applies what it reports to the world, the mobs and the speakers.
-use super::{Game, creatures::seen, persist::EntityUuids};
+use super::{Game, block_entity_ticks::Ticked, creatures::seen, persist::EntityUuids};
 use horizon_client::{
     Result,
     chunk_map::{ChunkMap, ChunkMembershipDelta},
@@ -105,14 +105,17 @@ impl Game<'_> {
     }
     /// Runs `f` on the heart at `key` with the game's mobs and level random,
     /// then applies what the heart reported. `others`: whether `f` reads the
-    /// mob world, which is then built with the other mobs (`f` gets None
-    /// otherwise: the world reads every player, the teams and the weather, and
-    /// most heart ticks need none of it).
+    /// mob world (`f` gets None otherwise: the world reads every player, the
+    /// teams and the weather, and most heart ticks need none of it).
+    /// `mobs_seen`: whether that world holds the other mobs, a snapshot of
+    /// every one (the update of a heart without a protector reads only blocks,
+    /// the time and the player).
     fn with_heart(
         &mut self,
         key: Pos,
         heart: &mut CreakingHeart,
         others: bool,
+        mobs_seen: bool,
         f: impl FnOnce(
             &mut CreakingHeart,
             Option<&horizon_client::mobs::MobWorld>,
@@ -130,7 +133,7 @@ impl Game<'_> {
         let spawning = self.spawning_monsters();
         let creaking = self.res.mob_types().get("minecraft:creaking").cloned();
         let player_uuid = self.level.player_uuid;
-        let snapshot: Vec<_> = if others {
+        let snapshot: Vec<_> = if others && mobs_seen {
             mobs.iter()
                 .map(|m| seen(m, player_uuid, world_items!(self)))
                 .collect()
@@ -201,7 +204,7 @@ impl Game<'_> {
         else {
             return;
         };
-        let _ = self.with_heart(key, &mut heart, true, |h, w, lr, host, out| {
+        let _ = self.with_heart(key, &mut heart, true, true, |h, w, lr, host, out| {
             if let Some(w) = w {
                 creaking_heart::creaking_hurt(h, home, w, lr, host, out);
             }
@@ -276,7 +279,7 @@ impl Game<'_> {
         else {
             return;
         };
-        let _ = self.with_heart(key, &mut heart, false, |h, _, _, host, out| {
+        let _ = self.with_heart(key, &mut heart, false, false, |h, _, _, host, out| {
             creaking_heart::remove_protector(h, host, true, out);
         });
         let state = self.world.block(key.0, key.1, key.2);
@@ -312,29 +315,89 @@ impl Game<'_> {
     }
     /// `CreakingHeartBlockEntity.serverTick` of the heart at `key`. Its slot
     /// stays while uprooted, so that a heart whose block went away is still
-    /// found here and lets go of its protector.
-    pub(super) fn tick_creaking_heart(&mut self, key: Pos) -> Result<()> {
+    /// found here and lets go of its protector. A heart with nothing to do but
+    /// count its ticks only waits ([`Self::heart_waits`]).
+    pub(super) fn tick_creaking_heart(&mut self, key: Pos) -> Result<Ticked> {
+        if self.heart_waits(key) {
+            return Ok(Ticked::Waited);
+        }
+        self.tick_creaking_heart_fully(key)?;
+        Ok(Ticked::Ran)
+    }
+    /// The creaking heart block in `state` (by its facts' name): whether it is uprooted (its
+    /// `creaking_heart_state`), read from the registry by name; `None` for a block that is no
+    /// heart's.
+    pub(super) fn heart_block_state(&self, state: BlockStateId) -> Option<bool> {
+        if horizon_client::block_entity_types::factory_block(&self.res.facts().get(state).name)
+            != "minecraft:creaking_heart"
+        {
+            return None;
+        }
+        Some(self.heart_state_name(state) == "uprooted")
+    }
+    /// [`Self::heart_block_state`], from the pass's table (`WaitingBlocks`).
+    fn heart_block(&self, state: BlockStateId) -> Option<bool> {
+        match self.waiting_blocks.get(self.pack.assets.registry, state) {
+            Some(block) => block.heart,
+            None => self.heart_block_state(state),
+        }
+    }
+    /// Whether the heart at `key` only waits this tick. An uprooted heart has no ticker (the
+    /// whole tick takes it out and puts it back), and one with no protector, no hurt effect
+    /// running, no signal to drop and no update due (`tick_updates`) only counts its ticks in
+    /// `server_tick_start`, which this does in place: the whole tick would take it out of the map
+    /// and lend it the game's mobs for that. A heart whose block is gone lets go of its protector
+    /// in the whole tick.
+    fn heart_waits(&mut self, key: Pos) -> bool {
+        let state = self.world.block(key.0, key.1, key.2);
+        let Some(uprooted) = self.heart_block(state) else {
+            return false;
+        };
+        // `get_mut` wakes it, as the whole tick's take does when this answers no.
+        let heart = match self.world.block_entities.get_mut(&key) {
+            Some(BlockEntity::CreakingHeart(heart)) => heart,
+            _ => return false,
+        };
+        if uprooted {
+            return true;
+        }
+        if heart.creaking.is_some()
+            || heart.emitter > 0
+            || heart.output_signal != 0
+            || creaking_heart::tick_updates(heart)
+        {
+            return false;
+        }
+        heart.ticks_existed += 1;
+        heart.ticker -= 1;
+        true
+    }
+    /// [`Self::tick_creaking_heart`] without its shortcut: the heart taken out of the map for its
+    /// tick, its block read from the registry by name.
+    pub(super) fn tick_creaking_heart_fully(&mut self, key: Pos) -> Result<()> {
         let Some((lease, BlockEntity::CreakingHeart(mut heart))) =
             self.world.block_entities.take(&key)
         else {
             return Ok(());
         };
         let state = self.world.block(key.0, key.1, key.2);
-        if horizon_client::block_entity_types::factory_block(&self.res.facts().get(state).name)
-            != "minecraft:creaking_heart"
-        {
+        let Some(uprooted) = self.heart_block_state(state) else {
             // The block is gone: preRemoveSideEffects.
             self.world.block_entities.forget(&key);
-            self.with_heart(key, &mut heart, false, |h, _, _, host, out| {
+            self.with_heart(key, &mut heart, false, false, |h, _, _, host, out| {
                 creaking_heart::remove_protector(h, host, false, out);
             })?;
             return Ok(());
-        }
+        };
         // getTicker: none once uprooted.
-        if self.heart_state_name(state) != "uprooted" {
+        if !uprooted {
             let pos = [key.0, key.1, key.2];
             let others = creaking_heart::tick_updates(&heart);
-            self.with_heart(key, &mut heart, others, |h, w, lr, host, out| {
+            // Without a protector, which `server_tick_start` never finds for a heart that has
+            // none, the update never reads the other mobs (`server_tick_update` spawns one from
+            // blocks and the player, or changes the heart's state): no snapshot of them is made.
+            let mobs_seen = heart.creaking.is_some();
+            self.with_heart(key, &mut heart, others, mobs_seen, |h, w, lr, host, out| {
                 if creaking_heart::server_tick_start(h, pos, lr, host, out) {
                     debug_assert!(w.is_some(), "tick_updates said no update");
                     if let Some(w) = w {
@@ -576,6 +639,7 @@ mod nested_spawn_tests {
                         game.with_heart(
                             (0, 80, 0),
                             &mut heart,
+                            others,
                             others,
                             |_, world, _, _, events| {
                                 assert_eq!(world.is_some(), others);
