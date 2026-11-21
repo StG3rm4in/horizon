@@ -79,6 +79,11 @@ pub(super) struct SpawnScratch {
     stale: Vec<bool>,
     /// The spawn state's allocations, reused across passes.
     spawn_buffers: SpawnBuffers,
+    /// The grid of the mobs' boxes the last serial pass built, which the next fills again
+    /// ([`MobBoxes::refill`]), and the map of kept structure starts, emptied after each pass:
+    /// their allocations, reused rather than made anew every tick.
+    boxes: MobBoxes,
+    structure_starts: KeptStarts,
 }
 impl SpawnScratch {
     fn chunk(p: &LevelPlayer) -> (i32, i32) {
@@ -583,11 +588,20 @@ fn mob_box(i: usize, m: &Mob) -> MobBox {
     )
 }
 /// The boxes of the game's mobs not removed, and a grid over them.
+#[derive(Default)]
 pub(super) struct MobBoxes {
     entries: Vec<MobBox>,
     grid: SeenGrid,
 }
 impl MobBoxes {
+    /// [`Self::new`] in place, over the allocations of the boxes this held before: the entries
+    /// and the grid a new one of `mobs` would have.
+    fn refill(&mut self, mobs: &[Mob]) {
+        self.entries.clear();
+        let live = mobs.iter().enumerate().filter(|(_, m)| !m.removed);
+        self.entries.extend(live.map(|(i, m)| mob_box(i, m)));
+        self.grid.refill(self.entries.iter().map(|e| e.1));
+    }
     fn new(mobs: &[Mob]) -> Self {
         let entries: Vec<_> = mobs
             .iter()
@@ -635,10 +649,14 @@ impl<H: LevelHost> Level<'_, H> {
     /// Builds the grid of the game's mobs now, for a pass that will ask so many box queries that
     /// the scans [`Self::mobs_near`] starts with would only add to the build (each works out
     /// every mob's box): a natural spawning pass over many chunks asks one for nearly every
-    /// attempt that finds room. The mobs do not change while the level holds the game.
-    fn build_boxes(&self) {
+    /// attempt that finds room. The mobs do not change while the level holds the game. The grid
+    /// is built in `kept`, one an earlier pass built, whose allocations are reused.
+    fn build_boxes(&self, mut kept: MobBoxes) {
         if self.shared_boxes.is_none() {
-            self.boxes.get_or_init(|| MobBoxes::new(self.game.mobs()));
+            self.boxes.get_or_init(|| {
+                kept.refill(self.game.mobs());
+                kept
+            });
         }
     }
     fn biome(&self, x: i32, y: i32, z: i32) -> Option<&BiomeInfo> {
@@ -1533,7 +1551,9 @@ impl<'a> Game<'a> {
         let mut pending = Vec::new();
         let last_state;
         let extras = {
-            let level = self.natural_level();
+            let mut level = self.natural_level();
+            // The map of kept structure starts, which the last pass emptied.
+            *level.structure_starts.get_mut() = std::mem::take(&mut scratch.structure_starts);
             laps.lap("sn_level");
             let counted: Vec<Counted> = self
                 .mobs
@@ -1591,7 +1611,7 @@ impl<'a> Game<'a> {
             }
             if lanes.is_none() && !categories.is_empty() {
                 if scratch.candidates.len() >= GRID_FIRST_CHUNKS {
-                    level.build_boxes();
+                    level.build_boxes(std::mem::take(&mut scratch.boxes));
                 }
                 for chunk in scratch.candidates.drain(..) {
                     // ServerChunkCache.tickSpawningChunk gates the initial chunk too.
@@ -1618,6 +1638,13 @@ impl<'a> Game<'a> {
                 }
             }
             scratch.spawn_buffers = state.into_parts().1;
+            // The grid and the map of kept starts go back for the next pass, the starts emptied:
+            // they are this pass's alone.
+            if let Some(boxes) = level.boxes.take() {
+                scratch.boxes = boxes;
+            }
+            scratch.structure_starts = std::mem::take(level.structure_starts.get_mut());
+            scratch.structure_starts.clear();
             let created = std::mem::take(&mut *level.spawned.borrow_mut());
             let rides = std::mem::take(&mut *level.rides.borrow_mut());
             (created, rides)
@@ -3276,9 +3303,9 @@ mod tests {
         });
     }
 
-    /// A level that builds its mobs' grid before the first box query answers every query as one
-    /// that starts by scanning the mobs: room (the shulkers' solid boxes), obstruction and a
-    /// spawner's counts.
+    /// A level that builds its mobs' grid before the first box query, filling again a grid built
+    /// before over other mobs, answers every query as one that starts by scanning the mobs: room
+    /// (the shulkers' solid boxes), obstruction and a spawner's counts.
     #[test]
     #[ignore = "daily"]
     fn a_grid_built_first_answers_as_the_first_scans() {
@@ -3306,7 +3333,7 @@ mod tests {
             }
             assert!(game.mobs.len() >= 40, "{} mobs joined", game.mobs.len());
             let built = game.natural_level();
-            built.build_boxes();
+            built.build_boxes(MobBoxes::new(&game.mobs[..game.mobs.len() / 2]));
             let (mut asked, mut obstructed) = (0, 0);
             for _ in 0..300 {
                 // A fresh level for each box, whose queries all scan.
