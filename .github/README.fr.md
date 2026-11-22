@@ -1,4 +1,6 @@
-# Horizon, génération du monde sur GPU et tick serveur accéléré
+# Horizon GPU
+
+La génération du monde sur le GPU et un tick serveur accéléré, pour Horizon.
 
 [English](README.md)
 

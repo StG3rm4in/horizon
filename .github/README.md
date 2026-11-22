@@ -1,4 +1,6 @@
-# Horizon, GPU world generation and a faster server tick
+# Horizon GPU
+
+World generation on the GPU and a faster server tick, for Horizon.
 
 [Français](README.fr.md)
 
