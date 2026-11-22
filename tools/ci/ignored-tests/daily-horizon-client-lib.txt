@@ -118,6 +118,7 @@ horizon-client-lib mobs::ai::bed_wake_tests::a_sleeper_without_ai_still_stands_w
 horizon-client-lib mobs::ai::burn_and_rose_tests::a_burning_zombie_in_powder_snow_breaks_the_block_and_is_put_out lib daily resources
 horizon-client-lib mobs::ai::burn_and_rose_tests::a_mob_falling_past_a_wither_rose_gets_wither_and_one_beside_it_does_not lib daily resources
 horizon-client-lib mobs::ai::burn_and_rose_tests::powder_snow_keeps_a_zombie_from_burning_in_daylight lib daily resources
+horizon-client-lib mobs::ai::burn_and_rose_tests::the_flower_check_skips_only_sweeps_that_meet_no_flower lib daily resources
 horizon-client-lib mobs::ai::burn_and_rose_tests::wither_rose_applies_wither_whatever_the_hit_timer_and_local_difficulty lib daily resources
 horizon-client-lib mobs::ai::contact_bits_tests::contact_bits_follow_the_block_names lib daily resources
 horizon-client-lib mobs::ai::cramming_tests::a_ridden_horse_is_not_counted_for_cramming lib daily resources
