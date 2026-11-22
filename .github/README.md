@@ -12,7 +12,7 @@ adds two things, under the same rule as upstream: **nothing may differ from vani
    sections and biomes run on an NVIDIA GPU (CUDA), in the Overworld, the Nether and the End. Every chunk comes
    out identical, block for block, to the CPU path, which is itself identical to vanilla.
 2. **A faster dedicated server tick with 100 players.** Each optimization keeps the tick bit-identical to the
-   code before it, which a tick-by-tick harness checks.
+   code before it, which a tick-by-tick harness checks on a fixed scene (see below).
 
 ## Results
 
@@ -47,11 +47,18 @@ taken in A B B A order. The first row includes upstream's own progress since, wh
 
 - **World generation:** the generated chunks are compared with the vanilla server jar's at seed 12345 (785
   chunks across 27 biomes and 74 structure sites: 0 differences, on the GPU and on the CPU), and a probe compares
-  the CPU and the GPU paths in the three dimensions.
-- **Server tick:** a tick-digest harness runs 600 ticks with 100 simulated players and hashes, every tick, the
-  random draws, the block writes, the scheduled ticks, the entities, the players, the packets each player is
-  sent and the loaded chunks (and every 50 ticks the blocks and light of every section). Two builds must give the
-  same lines, serially and with the parallel tick (`HORIZON_PARALLEL_TICK=exact`).
+  the CPU and the GPU paths in the three dimensions. One seed is compared with vanilla; the GPU stages also
+  have test modes that compare each result with the CPU's.
+- **Server tick:** a tick-digest harness runs a fixed scene, 600 ticks with 100 simulated players, and hashes,
+  every tick, the level random's state, the block writes, the scheduled ticks, the entities (id, type, position,
+  velocity, rotation), the players (position), the packets each player is sent and the loaded chunks (and every
+  50 ticks the blocks and light of every section). Two builds must give the same lines, serially and with the
+  parallel tick (`HORIZON_PARALLEL_TICK=exact`).
+
+  This shows that an optimization changes nothing against the build before it, on that scene; it is not a
+  comparison with vanilla. The scene's players are in creative mode and fly in the Overworld, in daytime; the
+  entities' health, AI and inventories and the block entities are not hashed, and the packets only since
+  22/11/2026. Widening the harness is being studied.
 - **Mob islands:** `HORIZON_PARALLEL_TICK=verify` ticks the mobs both in groups and serially, and compares them.
 
 ## What was optimized

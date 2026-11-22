@@ -29,17 +29,29 @@ variables (the tool sets them):
 | `HORIZON_TICK_FIXTURE_TICKS=N` | the fixture mode: N ticks back to back, then the server stops |
 | `HORIZON_TICK_FIXTURE_COMMANDS=FILE` | console commands run before given ticks (lines `TICK COMMAND`) |
 | `HORIZON_TICK_FIXTURE_PLAYERS=N` | simulated players, one every `HORIZON_TICK_FIXTURE_JOIN_EVERY` ticks (default 10) |
+| `HORIZON_TICK_DIGEST_SKIP_PACKETS=IDS` | more packet ids (hex, comma-separated) for the `packets` part to leave out, to find the packet that differs between two runs |
 
 A digest line holds, for the level in place once the tick ends (the Overworld while nobody is in
 another dimension): the game time, the level random's state, `Level.randValue`, the block writes of the
 tick (position and new state, in order), every scheduled tick (sorted, with its sub-tick order), every
 entity of the entity lists in their order (id, type, position, velocity, rotation, as bits), the
 players (uuid, entity id, position), the chunks that random tick, the chunks whose entities are still
-pending, the chunk map's walk order, the loaded chunks, the chunk results applied (fixture mode) and,
-every `FULL` ticks, the decoded blocks and light of every loaded section.
+pending, the chunk map's walk order, the loaded chunks, the chunk results applied (fixture mode), the
+packets the fixture's players were sent during the tick (each player's bodies in its order of sending,
+the players in the order they joined; since 22/11/2026) and, every `FULL` ticks, the decoded blocks and
+light of every loaded section.
 
-Not in the digest: entity NBT beyond the motion (health, AI memories, inventories), block entity
-contents (only their count), the levels that are not in place, what is sent to the players.
+Two packets are set aside in the `packets` part, as their bodies differ between two runs of one build:
+`UPDATE_ADVANCEMENTS`, whose criteria carry the date they were met, and `ADD_ENTITY`'s UUID, which is
+random (`save::random_uuid`) and is zeroed before hashing.
+
+Not in the digest: entity NBT beyond the motion (health, AI memories, inventories), block entities (the
+`full` part adds `chunk.block_entities.len()`, which is 0 on the server: a column's block entities are
+moved out when it is installed), the levels that are not in place, the advancements packet, and the
+packets sent while the fixture's commands run (each player's channel is emptied after them). The
+fixture's players are in creative mode and fly 24 blocks above their spawn; the 100-player check runs
+600 ticks of daytime in the Overworld. So the digest shows that a change keeps what that scene does; it
+is not a comparison with vanilla, and survival play, nights, the Nether and the End are less covered.
 
 ## The fixture mode
 
