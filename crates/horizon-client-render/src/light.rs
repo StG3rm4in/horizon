@@ -890,6 +890,16 @@ pub fn gpu_light_submit(
     sky_light: bool,
 ) -> Result<horizon_gpu::LightJob, String> {
     let sections = region[1][1].ok_or("no centre chunk")?.sections.len();
+    // A `dynamic_light` state emits its chunk's stored answer (`Chunk::dynamic_emission`), which the
+    // job doesn't carry: a region that may hold one (none does in vanilla) is lit on the CPU.
+    if region
+        .iter()
+        .flatten()
+        .flatten()
+        .any(|chunk| tables.holds_dynamic(chunk))
+    {
+        return Err("a dynamic_light state: lit on the CPU".into());
+    }
     let mut top_section = 0;
     for chunk in region.iter().flatten().flatten() {
         if chunk.sections.len() != sections {
