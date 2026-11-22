@@ -3146,7 +3146,9 @@ mod tests {
     /// The level's reads from the chunk it kept from its last read answer as the world's own
     /// reads, whichever chunk was read before: blocks, the surface and the other heightmaps,
     /// light, whether a chunk can spawn and whether it refers to a structure, in loaded chunks
-    /// read in turn, in unloaded ones, and above and below the column.
+    /// read in turn, in unloaded ones, and above and below the column. The light is checked
+    /// against `World::light` itself, in the Overworld and in a level whose dimension has no sky
+    /// light (the Nether), where the sky light is 0 whatever the chunk holds.
     #[test]
     #[ignore = "daily"]
     fn reads_from_the_kept_chunk_answer_as_the_world() {
@@ -3177,51 +3179,73 @@ mod tests {
                 let y = next(200) as i32 - 64;
                 game.world.set(x, y, z, states[next(4) as usize]).unwrap();
             }
-            let level = game.natural_level();
-            let (world, facts) = (&game.world, game.res.facts());
             let kinds = [
                 Heightmap::WorldSurface,
                 Heightmap::OceanFloor,
                 Heightmap::MotionBlocking,
                 Heightmap::MotionBlockingNoLeaves,
             ];
-            let (mut x, mut y, mut z) = (0, 64, 0);
-            for step in 0..20_000 {
-                // Attempts wander a few blocks from a start; now and then the reads move to
-                // another chunk, loaded or not, at any height.
-                if step % 40 == 0 {
-                    (x, z) = (next(176) as i32 - 64, next(176) as i32 - 64);
-                    y = next(460) as i32 - 120;
-                } else {
-                    x += next(11) as i32 - 5;
-                    z += next(11) as i32 - 5;
-                }
-                let at = format!("{x} {y} {z}");
-                assert_eq!(SpawnLevel::state(&level, x, y, z), world.block(x, y, z), "{at}");
-                let surface = world.world_surface(x, z, |id| facts.is_air(id));
-                assert_eq!(SpawnLevel::world_surface(&level, x, z), surface, "{at}");
-                let sky = SpawnLevel::sky_light(&level.w, x, y, z);
-                assert_eq!(SpawnLevel::sky_light(&level, x, y, z), sky, "{at}");
-                let block = SpawnLevel::block_light(&level.w, x, y, z);
-                assert_eq!(SpawnLevel::block_light(&level, x, y, z), block, "{at}");
-                let (cx, cz) = (x >> 4, z >> 4);
-                let can = world.chunks.contains_key(&(cx, cz))
-                    && level.within_world_border(cx << 4, cz << 4)
-                    && level.within_world_border((cx << 4) + 15, (cz << 4) + 15);
-                assert_eq!(level.can_spawn_in_chunk(cx, cz), can, "{at}");
-                // No chunk here refers to a structure.
-                let wanted = |_: &str| true;
-                let reach = level.category_structures_at(Category::Monster, x, y, z, &wanted);
-                assert!(reach.is_empty(), "{at}");
-                if step % 10 == 0 {
-                    // A level of its own reads each chunk afresh.
-                    let fresh = game.natural_level();
-                    for kind in kinds {
-                        let height = fresh.heightmap(kind, x, z);
-                        assert_eq!(level.heightmap(kind, x, z), height, "{kind:?} at {at}");
+            // The Overworld, then a level whose dimension has no sky light (the Nether): there
+            // the sky light is 0 without a look at the chunk, also where an unloaded chunk or the
+            // air above a column answers full daylight, and the level's other reads go on from
+            // the chunk it kept before.
+            for (dim, sky_lit) in [(Dim::Overworld, true), (Dim::Nether, false)] {
+                game.dim = dim;
+                let level = game.natural_level();
+                let (world, facts) = (&game.world, game.res.facts());
+                let nether = level.w.dimension_type.id == "minecraft:the_nether";
+                assert_eq!(nether, !sky_lit, "the level's dimension type");
+                // The reads in the Nether whose light byte had sky light to drop.
+                let mut dropped = 0;
+                let (mut x, mut y, mut z) = (0, 64, 0);
+                for step in 0..20_000 {
+                    // Attempts wander a few blocks from a start; now and then the reads move to
+                    // another chunk, loaded or not, at any height.
+                    if step % 40 == 0 {
+                        (x, z) = (next(176) as i32 - 64, next(176) as i32 - 64);
+                        y = next(460) as i32 - 120;
+                    } else {
+                        x += next(11) as i32 - 5;
+                        z += next(11) as i32 - 5;
+                    }
+                    let at = format!("{x} {y} {z}");
+                    assert_eq!(SpawnLevel::state(&level, x, y, z), world.block(x, y, z), "{at}");
+                    let surface = world.world_surface(x, z, |id| facts.is_air(id));
+                    assert_eq!(SpawnLevel::world_surface(&level, x, z), surface, "{at}");
+                    // `World::light` itself: the world view's light shares the level's dimension
+                    // rule and nibbles (`sky_light_from`, `block_light_from`).
+                    let light = world.light(x, y, z);
+                    let sky = if sky_lit { i32::from(light >> 4) } else { 0 };
+                    dropped += usize::from(!sky_lit && light >> 4 != 0);
+                    assert_eq!(SpawnLevel::sky_light(&level, x, y, z), sky, "{at}");
+                    assert_eq!(SpawnLevel::sky_light(&level.w, x, y, z), sky, "{at}");
+                    let block = i32::from(light & 15);
+                    assert_eq!(SpawnLevel::block_light(&level, x, y, z), block, "{at}");
+                    assert_eq!(SpawnLevel::block_light(&level.w, x, y, z), block, "{at}");
+                    let (cx, cz) = (x >> 4, z >> 4);
+                    let can = world.chunks.contains_key(&(cx, cz))
+                        && level.within_world_border(cx << 4, cz << 4)
+                        && level.within_world_border((cx << 4) + 15, (cz << 4) + 15);
+                    assert_eq!(level.can_spawn_in_chunk(cx, cz), can, "{at}");
+                    // No chunk here refers to a structure.
+                    let wanted = |_: &str| true;
+                    let reach = level.category_structures_at(Category::Monster, x, y, z, &wanted);
+                    assert!(reach.is_empty(), "{at}");
+                    if step % 10 == 0 {
+                        // A level of its own reads each chunk afresh.
+                        let fresh = game.natural_level();
+                        for kind in kinds {
+                            let height = fresh.heightmap(kind, x, z);
+                            assert_eq!(level.heightmap(kind, x, z), height, "{kind:?} at {at}");
+                        }
                     }
                 }
+                assert!(
+                    sky_lit || dropped > 0,
+                    "no read in the Nether had sky light to drop"
+                );
             }
+            game.dim = Dim::Overworld;
         });
     }
 

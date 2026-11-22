@@ -1,0 +1,1 @@
+horizon-client-lib mobs::seen_box_tests::a_snapshot_has_the_mobs_own_box_hitbox_and_eyes lib daily resources

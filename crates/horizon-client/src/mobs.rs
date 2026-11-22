@@ -6469,17 +6469,58 @@ mod totem_tests {
 mod seen_box_tests {
     use super::*;
 
-    /// The snapshot's box, hitbox and eyes, from one `dims()`, are the mob's own `bounds()`,
-    /// `hitbox()` and `eye_y()`, to the bit: for species whose boxes follow their state, at
-    /// several sizes, scales and poses, seated on a vehicle, then no longer on it.
-    #[test]
-    fn a_snapshot_has_the_mobs_own_box_hitbox_and_eyes() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client")
-            .join(horizon_core::VANILLA_VERSION);
-        if !root.join("entity-types.json").exists() {
-            return;
+    /// `Mob::bounds_at` as it was before its arithmetic moved into `box_of`, which `bounds()` and
+    /// the snapshot now share: the reference for the snapshot's box, as a check against
+    /// `bounds()` alone would compare `box_of` with itself.
+    fn bounds_before_box_of(m: &Mob, position: Vec3) -> Aabb {
+        // Shulker.makeBoundingBox: the lid's lift, not the dimensions.
+        if m.kind.species == Species::Shulker {
+            return shulker::bounds_at(m, position);
         }
+        let (width, height, _) = m.dims();
+        let w = f64::from(width as f32) / 2.0;
+        Aabb::new(
+            Vec3::new(position.x - w, position.y, position.z - w),
+            Vec3::new(
+                position.x + w,
+                position.y + f64::from(height as f32),
+                position.z + w,
+            ),
+        )
+    }
+    /// `Mob::hitbox` as it was before `hitbox_of`, on the box of [`bounds_before_box_of`].
+    fn hitbox_before_box_of(m: &Mob) -> Aabb {
+        let b = bounds_before_box_of(m, m.position);
+        match m.extra.seat.filter(|s| m.mount == Some(s.0)) {
+            Some((_, offset, _)) => {
+                let (lo, hi) = (b.min_position(), b.max_position());
+                let y = (m.position.y + offset).max(lo.y);
+                Aabb::new(Vec3::new(lo.x, y, lo.z), hi)
+            }
+            None => b,
+        }
+    }
+
+    /// The snapshot's box, hitbox and eyes, from one `dims()`, are the mob's own `bounds()`,
+    /// `hitbox()` and `eye_y()`, and the box and hitbox of the arithmetic before `box_of`, to the
+    /// bit: for species whose boxes follow their state, at several sizes, scales and poses,
+    /// seated on a vehicle, then no longer on it. It needs the prepared entity types, so it is a
+    /// daily test, and it fails without them rather than pass having checked nothing.
+    #[test]
+    #[ignore = "daily"]
+    fn a_snapshot_has_the_mobs_own_box_hitbox_and_eyes() {
+        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client")
+                    .join(horizon_core::VANILLA_VERSION)
+            });
+        assert!(
+            root.join("entity-types.json").exists(),
+            "no entity-types.json in {}: set HORIZON_TEST_RESOURCES to prepared resources",
+            root.display()
+        );
         let types =
             MobTypes::load_for_server(&root, &MobTypes::root_catalog(&root).unwrap()).unwrap();
         let bits = |b: Aabb| {
@@ -6524,11 +6565,21 @@ mod seen_box_tests {
                     m.seated(9, offset, vehicle);
                 }
                 let seen = m.seen(None, &items);
-                assert_eq!(bits(seen.bounds), bits(m.bounds()), "{id}");
-                assert_eq!(bits(seen.hitbox), bits(m.hitbox()), "{id}");
+                let old = bits(bounds_before_box_of(&m, m.position));
+                assert_eq!(bits(seen.bounds), old, "{id}");
+                assert_eq!(bits(m.bounds()), old, "{id}");
+                let old_hitbox = bits(hitbox_before_box_of(&m));
+                assert_eq!(bits(seen.hitbox), old_hitbox, "{id}");
+                assert_eq!(bits(m.hitbox()), old_hitbox, "{id}");
                 assert_eq!(seen.eye_y.to_bits(), m.eye_y().to_bits(), "{id}");
+                // `bounds_at` elsewhere than the mob's feet, as collisions and pushes ask it.
+                let far = Vec3::new(-29_999_983.7, -63.9, 1.0e-3);
+                let far_box = bits(bounds_before_box_of(&m, far));
+                assert_eq!(bits(m.bounds_at(far)), far_box, "{id}");
                 m.mount = None;
-                assert_eq!(bits(m.seen(None, &items).hitbox), bits(m.hitbox()), "{id}");
+                let unseated = bits(m.seen(None, &items).hitbox);
+                assert_eq!(unseated, bits(hitbox_before_box_of(&m)), "{id}");
+                assert_eq!(unseated, bits(m.hitbox()), "{id}");
                 checked += 1;
             }
         }
