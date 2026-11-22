@@ -1904,30 +1904,265 @@ mod tests {
         list
     }
 
+    /// The plan as it was before `INDEX_CELL` (`islands_why` before the commit "mob islands: the
+    /// plan finds a column's boxes by cells of 32 blocks"): the columns' boxes found by cells of
+    /// `CELL` blocks, a column met in several of the cells a read covers tested again in each,
+    /// and the maps grown from empty. It is kept whole here, its cell index included, so that the
+    /// plan at every cell size is checked against the old one rather than against itself.
+    fn plan_before_index_cells(
+        reaches: &[Reach],
+        lanes: usize,
+        census: &mut Census,
+    ) -> std::result::Result<Plan, Verdict> {
+        /// The cells of `CELL` blocks a box covers, as (x0, z0, x1, z1).
+        fn cells(b: Aabb) -> Option<(i32, i32, i32, i32)> {
+            let (x0, x1, z0, z1) = (
+                b.min(Axis::X),
+                b.max(Axis::X),
+                b.min(Axis::Z),
+                b.max(Axis::Z),
+            );
+            if !(x0.is_finite() && x1.is_finite() && z0.is_finite() && z1.is_finite()) {
+                return None;
+            }
+            let c = |v: f64| (v / CELL).floor() as i32;
+            Some((c(x0), c(z0), c(x1), c(z1)))
+        }
+        /// Boxes by the cells they cover, each visit paid from a budget.
+        #[derive(Default)]
+        struct Cells {
+            map: FxHashMap<(i32, i32), Vec<u32>>,
+        }
+        impl Cells {
+            /// How many cells `b` covers; None when that is no count.
+            fn count(b: Aabb) -> Option<usize> {
+                let (x0, z0, x1, z1) = cells(b)?;
+                let n = (i64::from(x1) - i64::from(x0) + 1)
+                    .checked_mul(i64::from(z1) - i64::from(z0) + 1)?;
+                usize::try_from(n).ok()
+            }
+            fn visit(b: Aabb, budget: &mut usize, mut f: impl FnMut((i32, i32))) -> Option<()> {
+                let (x0, z0, x1, z1) = cells(b)?;
+                *budget = budget.checked_sub(Self::count(b)?)?;
+                for x in x0..=x1 {
+                    for z in z0..=z1 {
+                        f((x, z));
+                    }
+                }
+                Some(())
+            }
+            fn insert(&mut self, i: u32, b: Aabb, budget: &mut usize) -> Option<()> {
+                Self::visit(b, budget, |cell| self.map.entry(cell).or_default().push(i))
+            }
+            fn query(&self, b: Aabb, budget: &mut usize, mut f: impl FnMut(u32)) -> Option<()> {
+                let mut found = 0usize;
+                Self::visit(b, budget, |cell| {
+                    if let Some(list) = self.map.get(&cell) {
+                        found += list.len();
+                        list.iter().copied().for_each(&mut f);
+                    }
+                })?;
+                *budget = budget.checked_sub(found)?;
+                Some(())
+            }
+        }
+        let ticking = reaches.iter().filter(|r| r.ticking).count();
+        census.ticking = ticking;
+        if lanes < 2 {
+            return Err(Verdict::OneLane);
+        }
+        if ticking < MIN_TICKING {
+            return Err(Verdict::FewTicking);
+        }
+        let n = reaches.len();
+        let mut budget = PLAN_BUDGET;
+        let mut sets = Sets {
+            parent: (0..n as u32).collect(),
+        };
+        // Joining two mobs that can't reach each other only costs parallelism, never the
+        // result, so the plan works in columns of CELL blocks: every mob of a column is one
+        // island, and a column joins every column its mobs' reaches meet. A column holds the box
+        // around its mobs' bodies, around their reads, around its villagers' points of interest
+        // and around the village reads of the mobs that make them.
+        #[derive(Clone, Copy)]
+        struct Column {
+            first: u32,
+            body: Aabb,
+            sense: Aabb,
+            claims: Option<Aabb>,
+            village_reads: Option<Aabb>,
+        }
+        let widen = |a: Option<Aabb>, b: Option<Aabb>| match (a, b) {
+            (Some(a), Some(b)) => Some(union_box(a, b)),
+            (a, b) => a.or(b),
+        };
+        let mut columns: Vec<Column> = Vec::new();
+        let mut column_of = FxHashMap::<(i32, i32), u32>::default();
+        let mut index = FxHashMap::<u32, u32>::default();
+        for (i, r) in reaches.iter().enumerate() {
+            index.entry(r.id).or_insert(i as u32);
+            // Where it stands, then where a teleport can take it, each in its own column.
+            let away = r
+                .away
+                .iter()
+                .map(|a| (a.at, a.body, a.sense, None, a.village_reads));
+            let parts = std::iter::once((r.at, r.body, r.sense, r.claims, r.village_reads));
+            for (at, body, sense, claims, village_reads) in parts.chain(away) {
+                let key = ((at.0 / CELL).floor() as i32, (at.1 / CELL).floor() as i32);
+                let next = columns.len() as u32;
+                let c = *column_of.entry(key).or_insert(next);
+                if c == next {
+                    columns.push(Column {
+                        first: i as u32,
+                        body,
+                        sense,
+                        claims,
+                        village_reads,
+                    });
+                    continue;
+                }
+                sets.join(columns[c as usize].first, i as u32);
+                let col = &mut columns[c as usize];
+                col.body = union_box(col.body, body);
+                col.sense = union_box(col.sense, sense);
+                col.claims = widen(col.claims, claims);
+                col.village_reads = widen(col.village_reads, village_reads);
+            }
+        }
+        // Columns by the cells their boxes cover, and the columns that claim.
+        let (mut bodies, mut claims) = (Cells::default(), Cells::default());
+        let mut claiming = Vec::new();
+        for (c, col) in columns.iter().enumerate() {
+            bodies
+                .insert(c as u32, col.body, &mut budget)
+                .ok_or(Verdict::OverBudget)?;
+            if let Some(b) = col.claims {
+                claims
+                    .insert(c as u32, b, &mut budget)
+                    .ok_or(Verdict::OverBudget)?;
+                claiming.push(c as u32);
+            }
+        }
+        for col in &columns {
+            bodies
+                .query(col.sense, &mut budget, |j| {
+                    let other = &columns[j as usize];
+                    if other.body.intersects(col.sense) {
+                        sets.join(col.first, other.first);
+                    }
+                })
+                .ok_or(Verdict::OverBudget)?;
+            if let Some(reads) = col.village_reads {
+                let mut meet = |j: u32| {
+                    let other = &columns[j as usize];
+                    if other.claims.is_some_and(|b| b.intersects(reads)) {
+                        sets.join(col.first, other.first);
+                    }
+                };
+                // A village read covers some four hundred cells, and a level has few claiming
+                // columns: testing each of them finds the same ones for less.
+                if claiming.len() < Cells::count(reads).ok_or(Verdict::OverBudget)? {
+                    budget = budget
+                        .checked_sub(claiming.len())
+                        .ok_or(Verdict::OverBudget)?;
+                    claiming.iter().copied().for_each(&mut meet);
+                } else {
+                    claims
+                        .query(reads, &mut budget, &mut meet)
+                        .ok_or(Verdict::OverBudget)?;
+                }
+            }
+        }
+        let mut raids = FxHashMap::<i32, u32>::default();
+        for (i, r) in reaches.iter().enumerate() {
+            for id in &r.links {
+                if let Some(&j) = index.get(id) {
+                    sets.join(i as u32, j);
+                }
+            }
+            if let Some(raid) = r.raid {
+                let first = *raids.entry(raid).or_insert(i as u32);
+                sets.join(first, i as u32);
+            }
+        }
+        // Islands, in the order of their first mob; their ticking mobs are their weight.
+        let mut islands: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut slot = FxHashMap::<u32, usize>::default();
+        for (i, r) in reaches.iter().enumerate() {
+            let root = sets.find(i as u32);
+            let k = *slot.entry(root).or_insert_with(|| {
+                islands.push((0, Vec::new()));
+                islands.len() - 1
+            });
+            islands[k].1.push(i);
+            islands[k].0 += usize::from(r.ticking);
+        }
+        let largest = islands.iter().map(|i| i.0).max().unwrap_or(0);
+        (census.islands, census.largest) = (islands.len(), largest);
+        if largest * 4 > ticking * 3 {
+            return Err(Verdict::OneIsland);
+        }
+        // Heaviest first (stable: ties keep the list's order), each to the lightest group.
+        islands.sort_by_key(|a| std::cmp::Reverse(a.0));
+        let mut groups: Vec<(usize, Vec<usize>)> = vec![(0, Vec::new()); lanes];
+        for (weight, members) in islands {
+            let g = groups
+                .iter_mut()
+                .min_by_key(|g| g.0)
+                .ok_or(Verdict::OneGroup)?;
+            g.0 += weight;
+            g.1.extend(members);
+        }
+        let mut groups: Vec<Vec<usize>> = groups
+            .into_iter()
+            .filter(|g| !g.1.is_empty())
+            .map(|g| g.1)
+            .collect();
+        for g in &mut groups {
+            g.sort_unstable();
+        }
+        if groups.len() > 1 {
+            Ok(Plan { groups })
+        } else {
+            Err(Verdict::OneGroup)
+        }
+    }
+
     /// The plan does not depend on the size of the cells it finds the boxes by: at the columns'
-    /// own size (`CELL`, which it used before `INDEX_CELL`) and at smaller and larger ones, every
-    /// random scene gives the same groups, or keeps the tick serial for the same reason, and its
-    /// census finds the same islands.
+    /// own size (`CELL`) and at smaller and larger ones, every random scene gives the groups the
+    /// plan gave before `INDEX_CELL` ([`plan_before_index_cells`]), or keeps the tick serial for
+    /// the same reason, and its census finds the same islands; so does `islands_why`, the tick's
+    /// own entry.
     #[test]
     fn the_plan_is_the_same_whatever_cells_find_the_boxes() {
         let (mut cases, mut grouped) = (0, 0);
         for seed in 0..48 {
             let list = random_scene(seed);
             for lanes in [2, 4, 7] {
+                let census_of = |census: Census| (census.ticking, census.islands, census.largest);
                 let plan = |cell: f64| {
                     let mut census = Census::default();
                     let plan = islands_in_cells(&list, lanes, &mut census, cell);
-                    let found = (census.ticking, census.islands, census.largest);
-                    (plan.map(|p| p.groups), found)
+                    (plan.map(|p| p.groups), census_of(census))
                 };
-                let expected = plan(CELL);
+                let expected = {
+                    let mut census = Census::default();
+                    let plan = plan_before_index_cells(&list, lanes, &mut census);
+                    (plan.map(|p| p.groups), census_of(census))
+                };
                 assert_ne!(expected.0, Err(Verdict::OverBudget), "seed {seed}: too big a scene");
                 cases += 1;
                 grouped += usize::from(expected.0.is_ok());
-                for cell in [24.0, INDEX_CELL, 64.0, 128.0] {
+                for cell in [CELL, 24.0, INDEX_CELL, 64.0, 128.0] {
                     let found = plan(cell);
                     assert_eq!(found, expected, "seed {seed}, {lanes} lanes, cells of {cell}");
                 }
+                let tick = {
+                    let mut census = Census::default();
+                    let plan = islands_why(&list, lanes, &mut census);
+                    (plan.map(|p| p.groups), census_of(census))
+                };
+                assert_eq!(tick, expected, "seed {seed}, {lanes} lanes: islands_why");
             }
         }
         assert!(grouped * 4 > cases, "too few scenes split ({grouped} of {cases})");
