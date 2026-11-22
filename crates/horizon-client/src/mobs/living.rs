@@ -1071,7 +1071,7 @@ impl Mob {
         let on = self.supported_on_pos(w, supporting, 1.0e-5);
         let state = w.world.block(on[0], on[1], on[2]);
         let climbable = w.facts.get(state).name.as_ref() == "minecraft:powder_snow"
-            || w.has_tag("minecraft:climbable", &w.facts.get(state).name);
+            || w.has_hot_tag(super::HotTag::Climbable, state);
         let steps = &mut self.ai.steps;
         steps.move_dist += if climbable { full } else { horizontal };
         steps.fly_dist += full;
@@ -1233,11 +1233,11 @@ impl Mob {
         if offset <= 1.0e-5 {
             return p;
         }
-        let name = &w.facts.get(w.world.block(p[0], p[1], p[2])).name;
+        let state = w.world.block(p[0], p[1], p[2]);
         // (!(offset <= 0.5) || !FENCES) && !WALLS && !(FenceGateBlock)
-        let below = !w.has_tag("minecraft:walls", name)
-            && !w.has_tag("minecraft:fence_gates", name)
-            && (offset > 0.5 || !w.has_tag("minecraft:fences", name));
+        let below = !w.has_hot_tag(super::HotTag::Walls, state)
+            && !w.has_hot_tag(super::HotTag::FenceGates, state)
+            && (offset > 0.5 || !w.has_hot_tag(super::HotTag::Fences, state));
         if below {
             [
                 p[0],

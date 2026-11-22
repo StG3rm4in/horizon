@@ -3241,17 +3241,61 @@ const HOT_TAGS: [&str; 5] = [
     "minecraft:climbable",
     "minecraft:fire",
 ];
+/// One of [`HOT_TAGS`], by its place there ([`MobWorld::has_hot_tag`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HotTag {
+    Walls,
+    FenceGates,
+    Fences,
+    Climbable,
+    Fire,
+}
+impl HotTag {
+    pub const ALL: [Self; HOT_TAGS.len()] = [
+        Self::Walls,
+        Self::FenceGates,
+        Self::Fences,
+        Self::Climbable,
+        Self::Fire,
+    ];
+    /// The tag's id.
+    pub fn id(self) -> &'static str {
+        HOT_TAGS[self as usize]
+    }
+}
 /// [`HOT_TAGS`] looked up once in a world view's `block_tags` ([`Self::of`]): their sets, and every
 /// block any of them holds. Asking one of them for a block in none ([`MobWorld::has_tag`]) costs one
 /// Fx hash where the map asks for two SipHashes. A view borrows the map, so it cannot change while
-/// these are kept.
+/// these are kept. Its copies (one per mob's view) share one `Arc`.
 #[derive(Clone, Default)]
 pub struct HotTags<'a> {
     /// The map they were looked up in, by address: a view whose `block_tags` was replaced since (a
     /// test's) is asked from the map.
     from: usize,
     sets: [Option<&'a std::collections::HashSet<String>>; HOT_TAGS.len()],
-    any: Arc<crate::fast_hash::FxHashSet<&'a str>>,
+    shared: Arc<SharedHotTags<'a>>,
+}
+/// What the copies of [`HotTags`] share: every block any of the tags holds, and the answers by
+/// state of the view of a tick ([`HotTags::with_states`]; none for tags made with
+/// [`HotTags::of`] alone).
+#[derive(Default)]
+struct SharedHotTags<'a> {
+    any: crate::fast_hash::FxHashSet<&'a str>,
+    states: Option<StateAnswers<'a>>,
+}
+/// [`HotTags`]' answers by state for the blocks `facts` names: a byte per state, 0 until the state
+/// is first asked about, then [`StateAnswers::KNOWN`] and a bit per hot tag that holds the state's
+/// name. The table is made once the view has asked [`StateAnswers::KEEP_AFTER`] times, so a view
+/// built for a few questions does not make it. Atomic, as the lanes of the parallel mob tick share
+/// a view's tags: every lane works out the same byte for a state.
+struct StateAnswers<'a> {
+    facts: &'a BlockFacts,
+    asked: std::sync::atomic::AtomicU32,
+    bytes: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU8]>>,
+}
+impl StateAnswers<'_> {
+    const KNOWN: u8 = 0x80;
+    const KEEP_AFTER: u32 = 64;
 }
 impl<'a> HotTags<'a> {
     pub fn of(tags: &'a HashMap<String, std::collections::HashSet<String>>) -> Self {
@@ -3262,8 +3306,78 @@ impl<'a> HotTags<'a> {
         Self {
             from: std::ptr::from_ref(tags).addr(),
             sets,
-            any: Arc::new(any),
+            shared: Arc::new(SharedHotTags { any, states: None }),
         }
+    }
+    /// These tags, answering by state for the blocks `facts` names ([`Self::has_state`]): the view
+    /// a tick of mobs shares keeps each state's answers once it has asked enough.
+    pub fn with_states(mut self, facts: &'a BlockFacts) -> Self {
+        let states = StateAnswers {
+            facts,
+            asked: Default::default(),
+            bytes: Default::default(),
+        };
+        match Arc::get_mut(&mut self.shared) {
+            Some(shared) => shared.states = Some(states),
+            None => {
+                let any = self.shared.any.clone();
+                self.shared = Arc::new(SharedHotTags {
+                    any,
+                    states: Some(states),
+                });
+            }
+        }
+        self
+    }
+    /// [`Self::has`] of `tag` for the block of `state`, whose name `facts` gives: the same answer,
+    /// from the byte kept for the state when these tags keep one, so the name is not hashed again.
+    pub fn has_state(
+        &self,
+        tags: &HashMap<String, std::collections::HashSet<String>>,
+        facts: &BlockFacts,
+        tag: HotTag,
+        state: horizon_world::registry::BlockStateId,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let kept = self.kept(tags, facts);
+        let Some(slot) = kept.and_then(|bytes| bytes.get(state.0 as usize)) else {
+            return self.has(tags, tag.id(), &facts.get(state).name);
+        };
+        let mut byte = slot.load(Relaxed);
+        if byte == 0 {
+            let name = &*facts.get(state).name;
+            byte = (HotTag::ALL.into_iter())
+                .filter(|hot| self.has(tags, hot.id(), name))
+                .fold(StateAnswers::KNOWN, |byte, hot| byte | (1 << hot as u8));
+            slot.store(byte, Relaxed);
+        }
+        byte & (1 << tag as u8) != 0
+    }
+    /// The bytes kept by state, when these tags keep them for `facts`, `tags` is the map they were
+    /// looked up in, and their view has asked often enough.
+    fn kept(
+        &self,
+        tags: &HashMap<String, std::collections::HashSet<String>>,
+        facts: &BlockFacts,
+    ) -> Option<&[std::sync::atomic::AtomicU8]> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let answers = self.shared.states.as_ref()?;
+        if self.from != std::ptr::from_ref(tags).addr() || !std::ptr::eq(answers.facts, facts) {
+            return None;
+        }
+        if let Some(bytes) = answers.bytes.get() {
+            return Some(&bytes[..]);
+        }
+        if answers.asked.fetch_add(1, Relaxed) < StateAnswers::KEEP_AFTER {
+            return None;
+        }
+        let states = facts.states.len();
+        let bytes = answers.bytes.get_or_init(|| {
+            (0..states)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect()
+        });
+        Some(&bytes[..])
     }
     /// Whether `tag` of `tags` holds `block`: from the sets kept here when `tags` is the map they
     /// were looked up in and `tag` one of [`HOT_TAGS`], else from `tags`.
@@ -3276,7 +3390,8 @@ impl<'a> HotTags<'a> {
         if self.from == std::ptr::from_ref(tags).addr()
             && let Some(i) = HOT_TAGS.iter().position(|&hot| hot == tag)
         {
-            return self.any.contains(block) && self.sets[i].is_some_and(|set| set.contains(block));
+            let any = &self.shared.any;
+            return any.contains(block) && self.sets[i].is_some_and(|set| set.contains(block));
         }
         tags.get(tag).is_some_and(|set| set.contains(block))
     }
@@ -3326,6 +3441,66 @@ mod hot_tags_tests {
         assert!(hot.has(&other, "minecraft:walls", "minecraft:dirt"));
         assert!(!hot.has(&tags, "minecraft:walls", "minecraft:dirt"));
         assert!(HotTags::default().has(&tags, "minecraft:fences", "minecraft:oak_fence"));
+    }
+
+    /// Tags that answer by state answer as the names do: every state (and two past the facts'
+    /// end) for every hot tag, in a shuffled order twice, before the view keeps its table and
+    /// from it. Facts copied to another address are answered from their names, and so is a view
+    /// whose tags keep no states.
+    #[test]
+    #[ignore = "daily"]
+    fn hot_tags_by_state_answer_as_the_names() {
+        let ran = crate::mobs::world::with_test_world(&[], |w, _| {
+            let mut v = w.clone();
+            v.hot_tags = HotTags::of(w.block_tags).with_states(w.facts);
+            let named = |facts: &BlockFacts, tag: HotTag, s: u32| {
+                let name = &*facts.get(horizon_world::registry::BlockStateId(s)).name;
+                (w.block_tags.get(tag.id())).is_some_and(|set| set.contains(name))
+            };
+            let states = w.facts.states.len() as u32 + 2;
+            let mut order: Vec<u32> = (0..states).collect();
+            let mut seed = 0x2545_f491_4f6c_dd1du64;
+            for round in 0..2 {
+                for i in (1..order.len()).rev() {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    order.swap(i, (seed >> 33) as usize % (i + 1));
+                }
+                for &s in &order {
+                    let state = horizon_world::registry::BlockStateId(s);
+                    for tag in HotTag::ALL {
+                        let expected = named(w.facts, tag, s);
+                        assert_eq!(v.has_hot_tag(tag, state), expected, "{round}: {s} {tag:?}");
+                        assert_eq!(
+                            w.has_hot_tag(tag, state),
+                            expected,
+                            "no states: {s} {tag:?}"
+                        );
+                    }
+                }
+            }
+            let kept = (v.hot_tags.shared.states.as_ref()).and_then(|a| a.bytes.get());
+            assert!(kept.is_some(), "the view keeps its answers by state");
+            for tag in HotTag::ALL {
+                assert!(
+                    (0..states).any(|s| named(w.facts, tag, s)),
+                    "{tag:?} holds a block"
+                );
+            }
+            let copy = BlockFacts {
+                states: w.facts.states.clone(),
+                air: w.facts.air,
+                woods: Default::default(),
+                sign_texts: Default::default(),
+            };
+            for s in 0..states {
+                let state = horizon_world::registry::BlockStateId(s);
+                for tag in HotTag::ALL {
+                    let by_state = v.hot_tags.has_state(v.block_tags, &copy, tag, state);
+                    assert_eq!(by_state, named(&copy, tag, s), "copied facts: {s} {tag:?}");
+                }
+            }
+        });
+        assert!(ran, "the vanilla test resources must be available");
     }
 }
 #[derive(Clone)]

@@ -281,6 +281,14 @@ impl RandomTickSections {
     /// which drawn blocks to read: the draws and the ticks are the same either way, and an edit
     /// before the loop reaches a section drops its mask as usual.
     ///
+    /// The helpers also build the WORLD_SURFACE heights (`Chunk::world_surface`, with the air of
+    /// `facts`) of each chunk read here for the first time: one that came, or was replaced, since
+    /// its last walk. The loop's precipitation draws read them (`motion_blocking_top`), and a new
+    /// chunk's first read built them whole there, on the tick thread. Heights are those of the
+    /// blocks, and the writes after are marked on heights built now as on heights built at their
+    /// first read (`Chunk::set` marks the columns it may move, `Chunk::replace_blocks` drops the
+    /// heights): every read answers the same.
+    ///
     /// `chunk_of` lends each chunk from the caller's map, which does not change while this runs.
     /// A clone of each one's `Arc` was a locked count up and down on the chunk's own cache line
     /// for every ticking chunk of every tick, most of them with every mask built already (their
@@ -293,39 +301,66 @@ impl RandomTickSections {
         candidate: &(impl Fn(u32) -> bool + Sync),
     ) {
         let random = |id| facts.get(BlockStateId(id)).random_ticks;
-        self.prepare_masks_with(keys, chunk_of, random, candidate);
+        // The air every server reader of the heights passes (`GameLevel::world_surface`).
+        let air = |id| facts.is_air(BlockStateId(id));
+        self.prepare_masks_priming(keys, chunk_of, random, candidate, Some(&air));
     }
-    /// [`Self::prepare_masks`], `random` telling the states that tick randomly.
+    /// [`Self::prepare_masks`], `random` telling the states that tick randomly, without the
+    /// surface heights (for the tests of the masks).
+    #[cfg(test)]
     fn prepare_masks_with<'c>(
+        &mut self,
+        keys: &[(i32, i32)],
+        chunk_of: impl Fn((i32, i32)) -> Option<&'c Arc<Chunk>>,
+        random: impl FnMut(u32) -> bool,
+        candidate: &(impl Fn(u32) -> bool + Sync),
+    ) {
+        let air = None::<&fn(u32) -> bool>;
+        self.prepare_masks_priming(keys, chunk_of, random, candidate, air);
+    }
+    /// [`Self::prepare_masks_with`], and with `air` the surface heights of the chunks read for
+    /// the first time, built with it.
+    fn prepare_masks_priming<'c, A: Fn(u32) -> bool + Sync>(
         &mut self,
         keys: &[(i32, i32)],
         chunk_of: impl Fn((i32, i32)) -> Option<&'c Arc<Chunk>>,
         mut random: impl FnMut(u32) -> bool,
         candidate: &(impl Fn(u32) -> bool + Sync),
+        air: Option<&A>,
     ) {
-        // The sections without a mask, each with its chunk as lent.
-        let mut todo: Vec<((i32, i32), usize, &'c Chunk)> = Vec::new();
+        // The sections without a mask, each with its chunk as lent, and before them (`None`)
+        // a chunk whose heights are to be built.
+        let mut todo: Vec<((i32, i32), Option<usize>, &'c Chunk)> = Vec::new();
         for &key in keys {
             let Some(chunk) = chunk_of(key) else {
                 continue;
             };
-            let cached = Self::refresh(&mut self.chunks, key, chunk, &mut random);
+            let (cached, read) = Self::refresh_reading(&mut self.chunks, key, chunk, &mut random);
+            if read && air.is_some() {
+                todo.push((key, None, &**chunk));
+            }
             for i in cached.sections.mask.iter() {
                 if !cached.masks.built.contains(i) {
-                    todo.push((key, i, &**chunk));
+                    todo.push((key, Some(i), &**chunk));
                 }
             }
         }
         // Made compact on the helpers too: what comes back is a few words a section, not 65.
+        // A chunk's heights come back as nothing: they are built in the chunk, which every
+        // reader shares (`Chunk::height`).
         let masks = crate::parallel::par_map(&todo, 128, |part, out| {
-            out.extend(
-                (part.iter())
-                    .map(|(_, i, chunk)| Self::compact_mask(&chunk.sections[*i], candidate)),
-            );
+            out.extend((part.iter()).map(|(_, i, chunk)| match (i, air) {
+                (Some(i), _) => Self::compact_mask(&chunk.sections[*i], candidate),
+                (None, Some(air)) => {
+                    chunk.world_surface(0, 0, air);
+                    Vec::new()
+                }
+                (None, None) => Vec::new(),
+            }));
         });
         // A chunk's sections are next to each other in `todo`: its table is laid out once.
-        let mut done = (todo.into_iter().map(|(key, i, _)| (key, i)))
-            .zip(masks)
+        let mut done = (todo.into_iter().zip(masks))
+            .filter_map(|((key, i, _), mask)| Some(((key, i?), mask)))
             .peekable();
         let mut new = Vec::new();
         while let Some(((key, i), mask)) = done.next() {
@@ -377,19 +412,31 @@ impl RandomTickSections {
             RandomTickMask::words_of(&states, candidate)
         }
     }
+    #[inline]
     fn refresh<'a>(
         chunks: &'a mut FxHashMap<(i32, i32), Cached>,
         key: (i32, i32),
         chunk: &Arc<Chunk>,
         random: &mut impl FnMut(u32) -> bool,
     ) -> &'a mut Cached {
+        Self::refresh_reading(chunks, key, chunk, random).0
+    }
+    /// [`Self::refresh`], and whether `chunk` was read: it is not the chunk the entry was read
+    /// from (a new entry, or a chunk replaced or edited since).
+    fn refresh_reading<'a>(
+        chunks: &'a mut FxHashMap<(i32, i32), Cached>,
+        key: (i32, i32),
+        chunk: &Arc<Chunk>,
+        random: &mut impl FnMut(u32) -> bool,
+    ) -> (&'a mut Cached, bool) {
         let cached = chunks.entry(key).or_insert_with(|| Cached {
             chunk: Weak::new(),
             read: Vec::new(),
             sections: Sections::default(),
             masks: ChunkMasks::default(),
         });
-        if cached.chunk.as_ptr() != Arc::as_ptr(chunk) {
+        let read = cached.chunk.as_ptr() != Arc::as_ptr(chunk);
+        if read {
             if cached.read.len() != chunk.sections.len() || cached.sections.base != chunk.min_y() {
                 cached.read = chunk.sections.iter().map(|_| Weak::new()).collect();
                 cached.masks = ChunkMasks::default();
@@ -417,7 +464,7 @@ impl RandomTickSections {
             cached.masks.retain(!read_again);
             cached.chunk = Arc::downgrade(chunk);
         }
-        cached
+        (cached, read)
     }
 }
 
@@ -922,6 +969,132 @@ mod tests {
             assert_eq!(prepared.table.as_deref(), built.table.as_deref(), "{key:?}");
             assert_eq!(Arc::strong_count(chunk), 1, "{key:?}");
         }
+    }
+
+    /// The surface heights built ahead (`prepare_masks`) are those of the chunks read for the
+    /// first time (a new chunk, one edited since its walk, one without a ticking section), not of
+    /// a chunk read before; and they answer as heights built at the first read do, at once and
+    /// after writes that raise, lower or leave a column and after a section replaced whole. The
+    /// masks prepared are the same with or without them.
+    #[test]
+    fn surface_heights_built_ahead_answer_as_heights_built_at_the_first_read() {
+        let ticks = |id: u32| id == 1;
+        let air = |id: u32| id == 0;
+        let mut seed = 0x5851_f42d_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        // Uneven ground: stone (2) up to each column's own height, 48 to 111 blocks above the
+        // bottom, topped by a ticking block (1) on some columns (none in the last chunk).
+        let mut ground = |cx: i32| {
+            let tops: [i32; 256] = std::array::from_fn(|_| 48 + (next() % 64) as i32);
+            let mut chunk = Chunk::empty(cx, 0);
+            for s in 3..7 {
+                let states: [u32; 4096] = std::array::from_fn(|i| {
+                    let (y, column) = (s as i32 * 16 + (i >> 8) as i32, i & 255);
+                    if y >= tops[column] {
+                        0
+                    } else if y == tops[column] - 1 && cx != 3 && column % 3 == 0 {
+                        1
+                    } else {
+                        2
+                    }
+                });
+                Arc::make_mut(&mut chunk.sections[s]).blocks = Section::from_blocks(&states);
+            }
+            chunk
+        };
+        let mut chunks: FxHashMap<(i32, i32), Arc<Chunk>> = FxHashMap::default();
+        for cx in 0..4 {
+            chunks.insert((cx, 0), Arc::new(ground(cx)));
+        }
+        let surface = |chunk: &Chunk| -> Vec<i32> {
+            (0..256)
+                .map(|i: i32| chunk.world_surface(i & 15, i >> 4, air))
+                .collect()
+        };
+        // One above each column's highest block that is not air, as a scan down finds it.
+        let scan = |chunk: &Chunk| -> Vec<i32> {
+            let top = MIN_Y + SECTIONS as i32 * 16;
+            (0..256)
+                .map(|i: i32| {
+                    let mut ys = (MIN_Y..top).rev();
+                    ys.find(|&y| !air(chunk.get(i & 15, y, i >> 4)))
+                        .map_or(MIN_Y, |y| y + 1)
+                })
+                .collect()
+        };
+        // Whether the heights are built: a read of a column not marked asks nothing then.
+        let built = |chunk: &Chunk| {
+            let asked = std::cell::Cell::new(false);
+            chunk.world_surface(0, 0, |id| {
+                asked.set(true);
+                air(id)
+            });
+            !asked.get()
+        };
+        let walk = |cache: &mut RandomTickSections, key: (i32, i32), chunk: &Arc<Chunk>| {
+            let mut from = MIN_Y;
+            while let Some((y, _)) = cache.next_masked_with(key, chunk, ticks, ticks, from) {
+                from = y + 16;
+            }
+        };
+        let mut ahead = RandomTickSections::default();
+        // Chunk 1 is walked and stays as it was; chunk 2 is walked, then edited.
+        walk(&mut ahead, (1, 0), &chunks[&(1, 0)]);
+        walk(&mut ahead, (2, 0), &chunks[&(2, 0)]);
+        let edited = chunks.get_mut(&(2, 0)).unwrap();
+        Arc::make_mut(edited).set(4, MIN_Y + 120, 4, 2);
+        // The same chunks, their heights built at their first read: the reference.
+        let mut lazy: FxHashMap<(i32, i32), Chunk> = (chunks.iter())
+            .map(|(&key, chunk)| (key, (**chunk).clone()))
+            .collect();
+        let mut plain = RandomTickSections::default();
+        walk(&mut plain, (1, 0), &chunks[&(1, 0)]);
+        walk(&mut plain, (2, 0), &chunks[&(2, 0)]);
+        let keys = [(0, 0), (1, 0), (2, 0), (3, 0), (7, 7)];
+        let chunk_of = |key: (i32, i32)| chunks.get(&key);
+        ahead.prepare_masks_priming(&keys, chunk_of, ticks, &ticks, Some(&air));
+        plain.prepare_masks_with(&keys, chunk_of, ticks, &ticks);
+        for key in [(0, 0), (2, 0), (3, 0)] {
+            assert!(built(&chunks[&key]), "{key:?} built ahead");
+        }
+        // Chunk 1 was read before: its heights wait for their first read (this one).
+        assert!(!built(&chunks[&(1, 0)]));
+        for (key, chunk) in &chunks {
+            let (prepared, without) = (&ahead.chunks[key].masks, &plain.chunks[key].masks);
+            assert_eq!(prepared.built, without.built, "{key:?}");
+            assert_eq!(
+                prepared.table.as_deref(),
+                without.table.as_deref(),
+                "{key:?}"
+            );
+            assert_eq!(surface(chunk), surface(&lazy[key]), "{key:?}");
+            assert_eq!(surface(chunk), scan(chunk), "{key:?}");
+        }
+        // Writes: a column raised, one lowered by its top block, one left as it was (a block
+        // far under its top), then section 4 of chunk 0 replaced whole.
+        for key in [(0, 0), (2, 0), (3, 0)] {
+            let writes = {
+                let c = &chunks[&key];
+                let (a, b) = (c.world_surface(1, 2, air), c.world_surface(7, 9, air));
+                [(1, a + 5, 2, 2), (7, b - 1, 9, 0), (12, MIN_Y + 1, 3, 2)]
+            };
+            for (x, y, z, state) in writes {
+                Arc::make_mut(chunks.get_mut(&key).unwrap()).set(x, y, z, state);
+                lazy.get_mut(&key).unwrap().set(x, y, z, state);
+            }
+            assert_eq!(surface(&chunks[&key]), surface(&lazy[&key]), "{key:?}");
+            assert_eq!(surface(&chunks[&key]), scan(&chunks[&key]), "{key:?}");
+        }
+        let flat: [u32; 4096] = std::array::from_fn(|i| u32::from(i >> 8 < 3) * 2);
+        Arc::make_mut(chunks.get_mut(&(0, 0)).unwrap()).replace_blocks(4, &flat);
+        lazy.get_mut(&(0, 0)).unwrap().replace_blocks(4, &flat);
+        assert_eq!(surface(&chunks[&(0, 0)]), surface(&lazy[&(0, 0)]));
+        assert_eq!(surface(&chunks[&(0, 0)]), scan(&chunks[&(0, 0)]));
     }
 }
 

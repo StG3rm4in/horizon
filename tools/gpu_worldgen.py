@@ -96,9 +96,10 @@ def resources(args):
 
 def build_probe():
     """The probe, built as tools/test_chunk_generation_parity.py builds it (so one build serves both)."""
-    print("== building the probe: cargo build --release -p horizon-world --example world_probe", flush=True)
-    code, outp = run_capture(["cargo", "build", "--release", "-q", "-p", "horizon-world", "--example",
-                              "world_probe"])
+    print("== building the probe: cargo build --release -p horizon-world --features cuda --example world_probe",
+          flush=True)
+    code, outp = run_capture(["cargo", "build", "--release", "-q", "-p", "horizon-world", "--features", "cuda",
+                              "--example", "world_probe"])
     if code != 0:
         sys.exit("the probe does not build:\n" + "\n".join(outp.splitlines()[-40:]))
     meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"],

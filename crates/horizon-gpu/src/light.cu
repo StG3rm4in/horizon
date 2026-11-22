@@ -89,7 +89,9 @@ extern "C" __global__ void klt_states(const unsigned long long *IN, const unsign
     int lx = i & 15, lz = (i >> 4) & 15, ly = i >> 8;
     unsigned p = (unsigned)((s * 16 + ly) * LT_WW + (cz * 16 + lz) * LT_W + cx * 16 + lx);
     S[p] = (unsigned short)(info & 0xFFFF);
-    unsigned char e = (unsigned char)(info >> 16);
+    // The emission's four bits: bit 20 is the table's DYNAMIC flag, whose regions the CPU lights
+    // (gpu_light_submit refuses them).
+    unsigned char e = (unsigned char)((info >> 16) & 15u);
     BLK[p] = e;
     if (info > 0xFFFF) {
       unsigned n = atomicAdd(NSEEDS, 1u);

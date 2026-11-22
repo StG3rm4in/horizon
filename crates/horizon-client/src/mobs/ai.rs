@@ -1353,6 +1353,8 @@ pub(crate) const CONTACT_INSIDE: u8 = 1;
 pub(crate) const CONTACT_FIRE: u8 = 2;
 /// `minecraft:powder_snow`, as `in_powder_snow` names it.
 pub(crate) const CONTACT_POWDER_SNOW: u8 = 4;
+/// `minecraft:wither_rose` or `minecraft:open_eyeblossom`, as `flower_contact_effects` names them.
+pub(crate) const CONTACT_FLOWER: u8 = 8;
 
 /// The contact bits of a block name.
 fn contact_bits_of(name: &str) -> u8 {
@@ -1365,14 +1367,15 @@ fn contact_bits_of(name: &str) -> u8 {
         | "minecraft:sweet_berry_bush"
         | "minecraft:honey_block" => CONTACT_INSIDE,
         "minecraft:fire" | "minecraft:soul_fire" => CONTACT_FIRE,
+        "minecraft:wither_rose" | "minecraft:open_eyeblossom" => CONTACT_FLOWER,
         _ => 0,
     }
 }
 
-/// `state`'s contact bits, each from the name its scan reads: the walk and the powder snow test
-/// read `MobWorld::facts`, `fire_contact` the registry.
+/// `state`'s contact bits, each from the name its scan reads: the walk, the powder snow test and
+/// the flowers' sweep read `MobWorld::facts`, `fire_contact` the registry.
 fn contact_bits_named(w: &MobWorld, state: horizon_world::registry::BlockStateId) -> u8 {
-    let walked = CONTACT_INSIDE | CONTACT_POWDER_SNOW;
+    let walked = CONTACT_INSIDE | CONTACT_POWDER_SNOW | CONTACT_FLOWER;
     let facts = contact_bits_of(&w.facts.get(state).name) & walked;
     let registry = w
         .registry
@@ -1905,6 +1908,8 @@ mod contact_bits_tests {
                 ),
                 ("minecraft:fire", CONTACT_FIRE),
                 ("minecraft:soul_fire", CONTACT_FIRE),
+                ("minecraft:wither_rose", CONTACT_FLOWER),
+                ("minecraft:open_eyeblossom", CONTACT_FLOWER),
                 ("minecraft:stone", 0),
                 ("minecraft:water", 0),
             ] {
@@ -3975,6 +3980,61 @@ fn flower_contact_effects(m: &mut Mob, w: &MobWorld) {
     let box_at_end = m
         .bounds_at(m.position)
         .deflate(Vec3::new(inset, inset, inset));
+    // Where no section holding a cell the sweep can visit may hold either flower, it would read
+    // every cell and act on none: it is skipped. (A move of more than a chunk or two sweeps as
+    // before rather than look at every section in between.)
+    if let Some((lo, hi)) = flower_sweep_cells(m.previous, m.position, box_at_end)
+        && (hi[0] >> 4) - (lo[0] >> 4) <= 2
+        && (hi[2] >> 4) - (lo[2] >> 4) <= 2
+        && !may_contact(w, lo, hi, CONTACT_FLOWER)
+    {
+        return;
+    }
+    sweep_flowers(m, w, box_at_end);
+}
+
+/// The cells `sweep_intersected_blocks(from, to, box_at_end, ..)` can visit, as the lowest and
+/// highest corner of a box of cells. A move too short to sweep (the sweep's own test) visits the
+/// cells of the box at its end. A longer one visits those of the boxes at both ends and of every
+/// box on the way, which lies between them, and the cells its corner's ray steps through, nudged
+/// by 1.0E-5 into each: one more cell on every side holds them all. `None` when a corner is not
+/// finite or is past any world border.
+fn flower_sweep_cells(
+    from: Vec3,
+    to: Vec3,
+    box_at_end: horizon_core::geometry::Aabb,
+) -> Option<([i32; 3], [i32; 3])> {
+    let movement = to.subtract(from);
+    let still = movement.length_squared() < (1.0e-5_f32 * 1.0e-5_f32) as f64;
+    let box_at_start = box_at_end.move_by(movement.scale(-1.0));
+    let corners = [
+        box_at_end.min_position(),
+        box_at_end.max_position(),
+        box_at_start.min_position(),
+        box_at_start.max_position(),
+    ];
+    let (corners, margin) = if still {
+        (&corners[..2], 0)
+    } else {
+        (&corners[..], 1)
+    };
+    let (mut lo, mut hi) = ([i32::MAX; 3], [i32::MIN; 3]);
+    for corner in corners {
+        for (k, v) in [corner.x, corner.y, corner.z].into_iter().enumerate() {
+            if !v.is_finite() || v.abs() >= 1.0e9 {
+                return None;
+            }
+            let cell = v.floor() as i32;
+            lo[k] = lo[k].min(cell - margin);
+            hi[k] = hi[k].max(cell + margin);
+        }
+    }
+    Some((lo, hi))
+}
+
+/// The sweep of [`flower_contact_effects`] over the blocks the box `box_at_end` passes through
+/// along the mob's move this tick.
+fn sweep_flowers(m: &mut Mob, w: &MobWorld, box_at_end: horizon_core::geometry::Aabb) {
     let _ = horizon_core::geometry::sweep_intersected_blocks(
         m.previous,
         m.position,
@@ -4020,7 +4080,11 @@ pub(crate) fn tick_effects(
     // a totem adds its effects to it). An effect a tick appends ticks from
     // the next tick on.
     let first = m.extra.effects.len();
-    let old_max_absorption = super::armor::max_absorption(m);
+    // Without an effect at the start the mob gains and loses none below (an effect a tick appends
+    // ticks from the next tick on, and no tick runs), so its maximum absorption is the same at the
+    // end and the clamp after it never applies: it is not read, as each read hashes the
+    // attribute's name.
+    let old_max_absorption = (first > 0).then(|| super::armor::max_absorption(m));
     let old_boost_amp = m
         .extra
         .effects
@@ -4165,9 +4229,11 @@ pub(crate) fn tick_effects(
         m.effects_dirty = false;
     }
 
-    let max_absorption = super::armor::max_absorption(m);
-    if max_absorption != old_max_absorption {
-        m.absorption = m.absorption.min(max_absorption);
+    if let Some(old_max_absorption) = old_max_absorption {
+        let max_absorption = super::armor::max_absorption(m);
+        if max_absorption != old_max_absorption {
+            m.absorption = m.absorption.min(max_absorption);
+        }
     }
 
     if old_boost_amp
@@ -6586,6 +6652,106 @@ mod burn_and_rose_tests {
         assert!(ran, "vanilla data is missing");
     }
 
+    /// The palettes' check before the flowers' sweep changes nothing: in 3x3 chunks with wither
+    /// roses in a few sections only, zombies standing, stepping, falling, moving across chunk and
+    /// section borders, and teleported far, get the same effects with the check as with the sweep
+    /// alone, and the check spares most of them the sweep.
+    #[test]
+    #[ignore = "daily"]
+    fn the_flower_check_skips_only_sweeps_that_meet_no_flower() {
+        let roses = [
+            (3, 64, 3),
+            (5, 64, 12),
+            (16, 64, 16),
+            (-1, 64, 30),
+            (2, 80, 2),
+        ];
+        let build = move |world: &mut crate::world::World, registry: &BlockRegistry| {
+            let stone = registry.default_state("minecraft:stone").unwrap();
+            let rose = registry.default_state("minecraft:wither_rose").unwrap();
+            for cx in -1..2 {
+                for cz in -1..2 {
+                    world
+                        .chunks
+                        .insert((cx, cz), Arc::new(crate::chunk::Chunk::empty(cx, cz)));
+                }
+            }
+            for x in -16..32 {
+                for z in -16..32 {
+                    world.set(x, 63, z, stone).unwrap();
+                }
+            }
+            for (x, y, z) in roses {
+                world.set(x, y, z, rose).unwrap();
+            }
+        };
+        let ran = crate::mobs::world::with_built_test_world(&[], build, |w, types| {
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = |range: f64| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                (seed >> 11) as f64 / (1u64 << 53) as f64 * range
+            };
+            let effects = |m: &Mob| -> Vec<(&'static str, i32, i32)> {
+                (m.extra.effects.iter())
+                    .map(|e| (e.id, e.duration, e.amplifier))
+                    .collect()
+            };
+            let (mut skipped, mut met) = (0, 0);
+            for round in 0..6000 {
+                let from = if round % 4 == 0 {
+                    // Beside a rose, often in its cell.
+                    let (x, y, z) = roses[round / 4 % roses.len()];
+                    Vec3::new(
+                        f64::from(x) + next(3.0) - 1.0,
+                        f64::from(y) + next(2.0) - 1.0,
+                        f64::from(z) + next(3.0) - 1.0,
+                    )
+                } else {
+                    let y = if round % 3 == 0 {
+                        60.0 + next(26.0)
+                    } else {
+                        64.0
+                    };
+                    Vec3::new(next(48.0) - 16.0, y, next(48.0) - 16.0)
+                };
+                let to = match round % 5 {
+                    0 => from,
+                    1 => from.add_vector(Vec3::new(next(0.6) - 0.3, 0.0, next(0.6) - 0.3)),
+                    2 => from.add_vector(Vec3::new(0.0, -next(3.0), 0.0)),
+                    3 => {
+                        let mut step = || next(6.0) - 3.0;
+                        from.add_vector(Vec3::new(step(), step(), step()))
+                    }
+                    _ => from.add_vector(Vec3::new(next(160.0) - 80.0, 0.0, next(160.0) - 80.0)),
+                };
+                let mut checked = zombie(types);
+                (checked.previous, checked.position) = (from, to);
+                let mut swept = checked.clone();
+                let inset = f64::from(1.0e-5_f32);
+                let box_at_end = swept.bounds_at(to).deflate(Vec3::new(inset, inset, inset));
+                flower_contact_effects(&mut checked, w);
+                sweep_flowers(&mut swept, w, box_at_end);
+                assert_eq!(
+                    effects(&checked),
+                    effects(&swept),
+                    "round {round}: {from:?} {to:?}"
+                );
+                assert_eq!(checked.outbox.len(), swept.outbox.len(), "round {round}");
+                met += usize::from(swept.has_effect("minecraft:wither"));
+                skipped += usize::from(flower_sweep_cells(from, to, box_at_end).is_some_and(
+                    |(lo, hi)| {
+                        (hi[0] >> 4) - (lo[0] >> 4) <= 2
+                            && (hi[2] >> 4) - (lo[2] >> 4) <= 2
+                            && !may_contact(w, lo, hi, CONTACT_FLOWER)
+                    },
+                ));
+            }
+            assert!(met > 50, "{met} zombies met a rose");
+            assert!(skipped > 1000, "{skipped} sweeps skipped");
+        });
+        assert!(ran, "vanilla data is missing");
+    }
+
     /// `applyEffectsFromBlocks` runs after `baseTick` counted the fire and
     /// the invulnerable time down: standing in lava a golem reads Fire 300
     /// (not 299) after its first tick, and the hit that tick starts has its
@@ -8058,6 +8224,43 @@ mod hidden_absorption_promotion_tests {
         assert_eq!(m.extra.effects[0].amplifier, 0, "Absorption I took over");
         assert_eq!(super::super::armor::max_absorption(&m), 4.0);
         assert_eq!(m.absorption, 4.0);
+    }
+
+    /// A mob without effects ends `tickEffects` with the absorption the skipped clamp would have
+    /// left it, bit for bit, whether the amount is below, at or above its maximum, with or
+    /// without a visibility refresh due: the maximum read before and after is the same.
+    #[test]
+    fn a_mob_without_effects_keeps_the_absorption_the_clamp_would_leave() {
+        let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
+        kind.id = "minecraft:pig".into();
+        kind.species = Species::Pig;
+        let kind = Arc::new(kind);
+        for (i, absorption) in [0.0, 2.5, 4.0, 40.0, -1.0, f32::NAN]
+            .into_iter()
+            .enumerate()
+        {
+            let mut m = Mob::new(204, Arc::clone(&kind), Vec3::ZERO, 0.0);
+            m.absorption = absorption;
+            m.effects_dirty = i % 2 == 0;
+            let before = super::super::armor::max_absorption(&m);
+            tick_effects(
+                &mut m,
+                crate::test_resources::server_loop_context(),
+                &mut crate::health::TestLevel::new(0).level(),
+                None,
+            );
+            let after = super::super::armor::max_absorption(&m);
+            let clamped = if after != before {
+                absorption.min(after)
+            } else {
+                absorption
+            };
+            assert_eq!(m.absorption.to_bits(), clamped.to_bits(), "{absorption}");
+            assert!(
+                m.extra.effects.is_empty() && !m.effects_dirty,
+                "{absorption}"
+            );
+        }
     }
 }
 

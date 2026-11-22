@@ -1,4 +1,6 @@
-# Horizon, génération du monde sur GPU et tick serveur accéléré
+# Horizon GPU
+
+La génération du monde sur le GPU et un tick serveur accéléré, pour Horizon.
 
 [English](README.md)
 
@@ -11,7 +13,7 @@ choses, avec la même règle que l'amont : **rien ne doit différer du vanilla**
    l'Overworld, le Nether et l'End. Chaque chunk sort identique, bloc par bloc, au chemin CPU, lui-même identique
    au vanilla.
 2. **Un tick du serveur dédié plus rapide à 100 joueurs.** Chaque optimisation garde le tick identique au bit
-   près au code d'avant, ce que vérifie un harnais tick par tick.
+   près au code d'avant, ce que vérifie un harnais tick par tick sur une scène fixe (voir plus bas).
 
 ## Résultats
 
@@ -47,11 +49,18 @@ que le fork intègre régulièrement.
 
 - **Génération du monde :** les chunks générés sont comparés à ceux du serveur vanilla à la graine 12345
   (785 chunks, 27 biomes, 74 sites de structures : 0 différence, sur le GPU comme sur le CPU), et une sonde compare
-  les chemins CPU et GPU dans les trois dimensions.
-- **Tick du serveur :** un harnais fait tourner 600 ticks avec 100 joueurs simulés et hache, à chaque tick, les
-  tirages aléatoires, les écritures de blocs, les ticks planifiés, les entités, les joueurs, les paquets envoyés à
-  chaque joueur et les chunks chargés (et tous les 50 ticks les blocs et la lumière de chaque section). Deux
-  builds doivent donner les mêmes lignes, en série et avec le tick parallèle (`HORIZON_PARALLEL_TICK=exact`).
+  les chemins CPU et GPU dans les trois dimensions. Une seule graine est comparée au vanilla ; les étapes GPU ont
+  aussi des modes de test qui comparent chaque résultat à celui du CPU.
+- **Tick du serveur :** un harnais fait tourner une scène fixe, 600 ticks avec 100 joueurs simulés, et hache, à
+  chaque tick, l'état de l'aléa du niveau, les écritures de blocs, les ticks planifiés, les entités (id, type,
+  position, vitesse, rotation), les joueurs (position), les paquets envoyés à chaque joueur et les chunks chargés
+  (et tous les 50 ticks les blocs et la lumière de chaque section). Deux builds doivent donner les mêmes lignes,
+  en série et avec le tick parallèle (`HORIZON_PARALLEL_TICK=exact`).
+
+  Cela montre qu'une optimisation ne change rien par rapport au build d'avant, sur cette scène ; ce n'est pas une
+  comparaison avec le vanilla. Les joueurs de la scène sont en créatif et volent dans l'Overworld, de jour ; la
+  santé, l'IA et l'inventaire des entités et les block entities ne sont pas hachés, et les paquets ne le sont
+  que depuis le 22/11/2026. L'élargissement du harnais est à l'étude.
 - **Îlots de mobs :** `HORIZON_PARALLEL_TICK=verify` fait tourner les mobs à la fois en groupes et en série, et
   compare les deux.
 

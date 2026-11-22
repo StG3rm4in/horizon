@@ -5,6 +5,13 @@ horizon-client game::api_values::loot_values::query_tests::queried_ability_parts
 horizon-client game::api_values::read_stack_tests::read_consumers_forward_nonresident_stacks_and_mutants lib daily slow
 horizon-client game::big_dripleaf_tests::a_leaf_stays_flat_under_an_entity_that_cannot_tilt_it lib daily resources
 horizon-client game::big_dripleaf_tests::a_leaf_tilts_under_a_mob_an_item_a_boat_a_minecart_and_a_trident lib daily resources
+horizon-client game::big_dripleaf_tests::the_sweep_passes_over_quiet_sections_with_the_same_effects lib daily resources
+horizon-client game::block_entity_ticks::quiet_tick_tests::a_creaking_heart_with_nothing_to_do_waits_as_its_whole_tick lib daily resources
+horizon-client game::block_entity_ticks::quiet_tick_tests::a_spawner_nobody_is_near_waits_as_its_whole_tick lib daily resources
+horizon-client game::block_entity_ticks::quiet_tick_tests::a_trial_spawner_nobody_is_near_waits_as_its_whole_tick lib daily resources
+horizon-client game::block_entity_ticks::quiet_tick_tests::a_vault_with_nothing_due_waits_as_its_whole_tick lib daily resources
+horizon-client game::block_entity_ticks::quiet_tick_tests::the_waiting_blocks_read_every_state_as_the_registry_does lib daily resources
+horizon-client game::block_ticks::sweep_sections_tests::sweep_sections_answer_as_world_may_hold lib daily resources
 horizon-client game::commands::modprofile::tests::modprofile_state_and_report_side_effects lib daily child-process
 horizon-client game::commands::selector_bounds_tests::actual_selector_uses_body_overlap_but_distance_stays_at_the_origin lib daily game-boot
 horizon-client game::commands::world_cmds::allay_owner_damage_tests::allay_owner_adapters_compare_the_actual_player_uuid lib daily game-boot
@@ -46,7 +53,9 @@ horizon-client game::fishing::impact::tests::removing_a_bobber_in_its_impact_cle
 horizon-client game::gui_clips::dispatch_tests::a_hook_call_clips_what_its_mod_draws_and_closes_what_it_leaves_open lib daily resources
 horizon-client game::gui_entity::tests::a_screen_draws_a_mob_by_type_once_and_refuses_what_it_cant_draw lib daily game-boot
 horizon-client game::item_entities::orb_pickup_tests::a_player_picks_a_random_orb_not_the_first lib daily resources
+horizon-client game::lan::mob_swing_sync_tests::a_mobs_hurt_and_swing_go_out_once_for_each_change lib daily resources
 horizon-client game::lan_actions::pickup_xp_tests::a_guest_picks_an_orb_with_their_own_random lib daily resources
+horizon-client game::lan_actions::tick::building_cache_tests::the_mobs_views_of_the_guests_share_the_bodies_for_their_turns_only lib daily resources
 horizon-client game::lan_entities::tests::glowing_display_metadata_reaches_the_model_silhouettes lib daily resources
 horizon-client game::launch_api::tests::developer_offline_never_consumes_inherited_sessions lib daily child-process
 horizon-client game::levels::tests::a_level_keeps_its_portal_palettes_while_another_ticks lib daily resources
@@ -139,9 +148,9 @@ horizon-client game::native_passages::tests::a_destination_level_must_be_open_an
 horizon-client game::native_passages::tests::a_passage_into_another_level_is_not_sent_to_the_clients lib daily resources
 horizon-client game::native_player_ender_chest_tests::a_write_while_the_local_ender_chest_is_open_survives_closing_it lib daily resources
 horizon-client game::native_player_ender_chest_tests::a_written_slot_is_what_the_open_ender_chest_menu_shows_and_clicks lib daily resources
+horizon-client game::native_player_ender_chest_tests::an_ender_chest_open_is_heard_and_a_chest_open_is_not lib daily resources
 horizon-client game::native_player_ender_chest_tests::each_ender_chest_refusal_has_its_own_name_and_writes_nothing lib daily resources
 horizon-client game::native_player_ender_chest_tests::ender_chest_slots_are_read_and_written lib daily resources
-horizon-client game::native_player_ender_chest_tests::an_ender_chest_open_is_heard_and_a_chest_open_is_not lib daily resources
 horizon-client game::native_player_inventory_tests::a_written_slot_is_what_the_open_inventory_menu_shows_and_clicks lib daily resources
 horizon-client game::native_player_inventory_tests::data_write_aborts lib daily resources
 horizon-client game::native_player_inventory_tests::each_inventory_refusal_has_its_own_name_and_writes_nothing lib daily resources
@@ -160,6 +169,9 @@ horizon-client game::native_recipes::tests::a_synced_vanilla_recipe_has_one_book
 horizon-client game::native_recipes::tests::synced_vanilla_recipes_keep_their_book_ids lib daily resources
 horizon-client game::native_server::network_settings_tests::server_settings_follow_the_network_config lib daily slow
 horizon-client game::native_world_columns::tests::terrain_columns_are_the_generators_own_surface_and_load_no_chunk lib daily resources
+horizon-client game::natural_spawning::tests::a_grid_built_first_answers_as_the_first_scans lib daily resources
+horizon-client game::natural_spawning::tests::biome_lists_and_tags_read_the_zoomed_biome lib daily resources
+horizon-client game::natural_spawning::tests::reads_from_the_kept_chunk_answer_as_the_world lib daily resources
 horizon-client game::natural_spawning::tests::spawn_candidates_match_the_uncached_union_while_players_move lib daily slow
 horizon-client game::persist::completion_tests::admitted_families_load_merge_save_and_reload lib daily resources
 horizon-client game::persist::completion_tests::cold_registry_nonmob_uuid_collision_refuses_the_entire_tree lib daily resources
