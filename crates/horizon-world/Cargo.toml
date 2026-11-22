@@ -48,9 +48,10 @@ name = "world_probe"
 path = "examples/probe/main.rs"
 
 [features]
-# CUDA for the GPU stages (horizon-gpu); on by default, so that the probe and the parity tool, which
-# build this crate alone, run them. The game forwards it as its own `cuda` feature.
-default = ["cuda"]
+# CUDA for the GPU stages (horizon-gpu). Off by default, so that this portable crate and the server
+# build without CUDA build without it; the game forwards it as its own `cuda` feature, and the probe and
+# the parity tool, which build this crate alone, ask for it (`--features cuda`).
+default = []
 cuda = ["horizon-gpu/cuda"]
 
 [lints]

@@ -48,3 +48,9 @@ jobs:
         run: cargo clippy -p horizon-gpu --all-targets --locked -- -D warnings
       - name: unit tests (no GPU, no game files)
         run: cargo test --locked -p horizon-gpu -p horizon-core --lib
+      - name: horizon-world's tests (those that need the game's files skip without them)
+        run: cargo test --locked -p horizon-world
+      - name: the layer check (docs/layers.md)
+        run: python3 tools/check_layers.py
+      - name: every daily test has its row (tools/ci/ignored-tests)
+        run: python3 tools/ci/check_ignored_test_rows.py

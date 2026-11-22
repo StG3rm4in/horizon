@@ -75,7 +75,8 @@ class Oracle:
 
 
 def rust_binary():
-    subprocess.run(['cargo', 'build', '--profile', 'fast', '-q', '-p', 'horizon-world', '--example', 'world_probe'], check=True, cwd=lab.ROOT)
+    # `cuda`: the GPU stages (HORIZON_GPU_*) are compiled in; they run only when asked for.
+    subprocess.run(['cargo', 'build', '--profile', 'fast', '-q', '-p', 'horizon-world', '--features', 'cuda', '--example', 'world_probe'], check=True, cwd=lab.ROOT)
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--format-version', '1'], cwd=lab.ROOT, text=True))
     return Path(metadata['target_directory']) / 'fast/examples/world_probe'
 
