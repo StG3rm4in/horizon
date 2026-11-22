@@ -1568,7 +1568,7 @@ impl Game<'_> {
             if let Some(digest) = digest.as_mut()
                 && !digest.started
             {
-                self.write_tick_digest(digest, true)?;
+                self.write_tick_digest(digest, true, fixture.as_mut())?;
             }
             let players = self.lan.as_ref().map_or(0, |h| h.hub.online_count());
             // Vanilla reads pauseWhenEmptySeconds on every tick, so management changes take effect
@@ -1638,7 +1638,7 @@ impl Game<'_> {
                 }
             }
             if let Some(digest) = digest.as_mut() {
-                self.write_tick_digest(digest, false)?;
+                self.write_tick_digest(digest, false, fixture.as_mut())?;
             }
             if let Some(fixture) = fixture.as_mut() {
                 fixture.ran += 1;

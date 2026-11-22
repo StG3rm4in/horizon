@@ -23,6 +23,55 @@ use std::{
     io::{BufWriter, Write},
 };
 
+/// The VarInt at `at` in a packet body, and where the next field starts.
+fn varint(body: &[u8], at: usize) -> (u32, usize) {
+    let mut value = 0u32;
+    for (i, byte) in body.iter().skip(at).take(5).enumerate() {
+        value |= u32::from(byte & 0x7F) << (7 * i);
+        if byte & 0x80 == 0 {
+            return (value, at + i + 1);
+        }
+    }
+    (value, body.len())
+}
+
+/// The VarInt id at the start of a packet body (`Out::Packet`: VarInt id and payload).
+fn packet_id(body: &[u8]) -> u32 {
+    varint(body, 0).0
+}
+
+/// What the `packets` part hashes of a body. `None` for the packets whose body holds the clock rather
+/// than the game: `UPDATE_ADVANCEMENTS`, whose criteria carry the date they were met. An `ADD_ENTITY`
+/// with its UUID zeroed: entity UUIDs are random (`save::random_uuid`, seeded from the clock, one
+/// counter for every thread), and the `entities` part leaves them out too. Two runs of one build give
+/// the same `packets` once these two are set aside (checked over 600 ticks with 100 players).
+fn canonical(body: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    use horizon_protocol::ids::play::clientbound as ids;
+    let (id, after_id) = varint(body, 0);
+    if id == ids::UPDATE_ADVANCEMENTS as u32 {
+        return None;
+    }
+    if id == ids::ADD_ENTITY as u32 {
+        let (_, uuid) = varint(body, after_id);
+        if body.len() >= uuid + 16 {
+            let mut masked = body.to_vec();
+            masked[uuid..uuid + 16].fill(0);
+            return Some(std::borrow::Cow::Owned(masked));
+        }
+    }
+    Some(std::borrow::Cow::Borrowed(body))
+}
+
+/// `HORIZON_TICK_DIGEST_SKIP_PACKETS`: more packet ids (hex, comma-separated) for the `packets` part to
+/// leave out, to find which packet differs between two runs (the detail rows name it).
+fn skipped_packets() -> Vec<u32> {
+    std::env::var("HORIZON_TICK_DIGEST_SKIP_PACKETS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|id| u32::from_str_radix(id.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
 /// A count and a hash of what was added: `DefaultHasher::new` is SipHash with fixed keys, the same in
 /// every run of one toolchain.
 struct Part {
@@ -377,6 +426,7 @@ impl Game<'_> {
         &mut self,
         digest: &mut TickDigest,
         start: bool,
+        fixture: Option<&mut Fixture>,
     ) -> horizon_client::Result<()> {
         if start {
             digest.started = true;
@@ -463,6 +513,48 @@ impl Game<'_> {
             }
         }
         line += &format!(" players={}", part.show());
+
+        // What the fixture's players were sent during the tick, as `PlayerSender` queued it: each
+        // player's bodies in its order of sending, the players in the order they joined. The other
+        // parts see no packet, neither its body nor its order. Drained here, so that the next tick's
+        // `fixture_players` only finds what came after this line.
+        if let Some(fixture) = fixture {
+            let skip = skipped_packets();
+            let mut part = Part::new();
+            for phantom in &mut fixture.players {
+                while let Ok(out) = phantom.rx.try_recv() {
+                    let bodies = match out {
+                        horizon_client::lan::Out::Packet(body) => vec![body],
+                        horizon_client::lan::Out::Packets(bodies) => bodies,
+                        horizon_client::lan::Out::Disconnect(_) => {
+                            part.add((phantom.conn, "disconnect"));
+                            continue;
+                        }
+                    };
+                    for body in &bodies {
+                        let Some(body) = canonical(body) else {
+                            continue;
+                        };
+                        let id = packet_id(&body);
+                        if skip.contains(&id) {
+                            continue;
+                        }
+                        part.add((phantom.conn, &*body));
+                        if detailed {
+                            let mut h = DefaultHasher::new();
+                            body.hash(&mut h);
+                            rows.push(format!(
+                                "k {} {id:#04x} {} {:016x}",
+                                phantom.conn,
+                                body.len(),
+                                h.finish()
+                            ));
+                        }
+                    }
+                }
+            }
+            line += &format!(" packets={}", part.show());
+        }
 
         // The chunks that random tick (their count is the random tick draws of a tick) and the ones
         // whose entities are not loaded yet (they don't block tick).
