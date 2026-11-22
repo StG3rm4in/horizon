@@ -4080,7 +4080,11 @@ pub(crate) fn tick_effects(
     // a totem adds its effects to it). An effect a tick appends ticks from
     // the next tick on.
     let first = m.extra.effects.len();
-    let old_max_absorption = super::armor::max_absorption(m);
+    // Without an effect at the start the mob gains and loses none below (an effect a tick appends
+    // ticks from the next tick on, and no tick runs), so its maximum absorption is the same at the
+    // end and the clamp after it never applies: it is not read, as each read hashes the
+    // attribute's name.
+    let old_max_absorption = (first > 0).then(|| super::armor::max_absorption(m));
     let old_boost_amp = m
         .extra
         .effects
@@ -4225,9 +4229,11 @@ pub(crate) fn tick_effects(
         m.effects_dirty = false;
     }
 
-    let max_absorption = super::armor::max_absorption(m);
-    if max_absorption != old_max_absorption {
-        m.absorption = m.absorption.min(max_absorption);
+    if let Some(old_max_absorption) = old_max_absorption {
+        let max_absorption = super::armor::max_absorption(m);
+        if max_absorption != old_max_absorption {
+            m.absorption = m.absorption.min(max_absorption);
+        }
     }
 
     if old_boost_amp
@@ -8218,6 +8224,43 @@ mod hidden_absorption_promotion_tests {
         assert_eq!(m.extra.effects[0].amplifier, 0, "Absorption I took over");
         assert_eq!(super::super::armor::max_absorption(&m), 4.0);
         assert_eq!(m.absorption, 4.0);
+    }
+
+    /// A mob without effects ends `tickEffects` with the absorption the skipped clamp would have
+    /// left it, bit for bit, whether the amount is below, at or above its maximum, with or
+    /// without a visibility refresh due: the maximum read before and after is the same.
+    #[test]
+    fn a_mob_without_effects_keeps_the_absorption_the_clamp_would_leave() {
+        let mut kind = (*crate::mobs::sensor_scan_tests::kind()).clone();
+        kind.id = "minecraft:pig".into();
+        kind.species = Species::Pig;
+        let kind = Arc::new(kind);
+        for (i, absorption) in [0.0, 2.5, 4.0, 40.0, -1.0, f32::NAN]
+            .into_iter()
+            .enumerate()
+        {
+            let mut m = Mob::new(204, Arc::clone(&kind), Vec3::ZERO, 0.0);
+            m.absorption = absorption;
+            m.effects_dirty = i % 2 == 0;
+            let before = super::super::armor::max_absorption(&m);
+            tick_effects(
+                &mut m,
+                crate::test_resources::server_loop_context(),
+                &mut crate::health::TestLevel::new(0).level(),
+                None,
+            );
+            let after = super::super::armor::max_absorption(&m);
+            let clamped = if after != before {
+                absorption.min(after)
+            } else {
+                absorption
+            };
+            assert_eq!(m.absorption.to_bits(), clamped.to_bits(), "{absorption}");
+            assert!(
+                m.extra.effects.is_empty() && !m.effects_dirty,
+                "{absorption}"
+            );
+        }
     }
 }
 
