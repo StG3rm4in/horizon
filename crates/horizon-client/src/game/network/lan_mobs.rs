@@ -196,6 +196,10 @@ impl Game<'_> {
                 (g.conn, g.uuid, moved)
             })
             .collect();
+        // No guest in play: no turn to take a view through, so no bodies to build for the turns.
+        if conns.is_empty() {
+            return Vec::new();
+        }
         // Each guest's turn starts from the other players' bodies (`enter_guest_at`): built once
         // for these turns and refreshed as each ends, as `tick_guests` keeps them for its own,
         // rather than built afresh from every guest for each turn.
