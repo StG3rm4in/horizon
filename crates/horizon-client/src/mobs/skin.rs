@@ -927,7 +927,17 @@ mod tests {
                         m.extra.variant2 = 2;
                     }
                     let mut cpu = Vec::new();
-                    render::render_with(&m, 0.4, camera, &atlas, 0x50a0, &data, &[], &mut cpu);
+                    render::render_with(
+                        &m,
+                        0.4,
+                        camera,
+                        &atlas,
+                        0x50a0,
+                        &data,
+                        &Default::default(),
+                        &[],
+                        &mut cpu,
+                    );
                     models.begin(&mut frame, store.len() as u32);
                     models.tagged = eyes;
                     let mut gpu = Vec::new();
@@ -939,6 +949,7 @@ mod tests {
                         &atlas,
                         0x50a0,
                         &data,
+                        &Default::default(),
                         Default::default(),
                         None,
                         &mut gpu,

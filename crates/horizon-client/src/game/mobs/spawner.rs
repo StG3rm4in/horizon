@@ -701,6 +701,7 @@ impl Game<'_> {
                 &lookup,
                 packed,
                 self.res.mob_data(),
+                &self.mob_armor_layers(mob),
                 out,
             );
             self.lit_entity(start..out.len());

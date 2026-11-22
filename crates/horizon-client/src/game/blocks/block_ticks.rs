@@ -29,8 +29,6 @@ impl Game<'_> {
         self.sync_tick_chunks();
         self.start_ticking_chunks();
         laps.lap("tb_tickets");
-        self.random_tick_chunks(&mut scratch.ticking);
-        laps.lap("tb_chunks");
         // Entity.checkInsideBlocks for the plates, tripwires, detector rails and
         // buttons under the players (the host and the LAN guests), the minecarts
         // and the arrows (the mobs and other entities are added in `with_level`
@@ -335,67 +333,91 @@ impl Game<'_> {
             }
         }
         horizon_threads::work::clear_work();
-        self.with_level(|b, level, ticks| {
-            // The masks the random ticks will read, built on helper threads first while the
-            // parallel tick is on (`HORIZON_PARALLEL_TICK`): the draws and ticks don't depend on them.
-            if !debug && horizon_client::parallel::lanes() > 1 {
-                horizon_client::spans::time("random_tick_masks", || {
-                    let chunks = &level.world.chunks;
-                    level.random_tick_sections.prepare_masks(
-                        &scratch.ticking,
-                        |key| chunks.get(&key),
-                        level.facts,
-                        &|id| b.random_tick_candidate(BlockStateId(id)),
-                    );
-                });
-            }
-            horizon_client::spans::time("random_ticks", || {
-                // Each chunk's ticking sections, read once and answered from while no block
-                // changes and no chunk comes or goes; the mask itself is retained by
-                // tick_chunk_random_masked between callback asks.
-                let mut sections = horizon_client::random_tick_sections::ChunkTicking::default();
-                for (n, &(x, z)) in scratch.ticking.iter().enumerate().filter(|_| !debug) {
-                    // The next chunks' first reads, read together (`RandomTickSections::read_ahead`):
-                    // their entries here and in the chunk map.
-                    if n % READ_AHEAD == 0 {
-                        let ahead = &scratch.ticking[n..(n + READ_AHEAD).min(scratch.ticking.len())];
+        // Read `RANDOM_TICK_SPEED` after scheduled ticks so any callback fired during
+        // `tick_scheduled()` (e.g. a sniffer egg hatch listener) that raises it from 0
+        // still takes effect on this tick.
+        let random_ticks_on = !debug
+            && self
+                .ui
+                .rules
+                .int_at(horizon_client::gamerules::vanilla::RANDOM_TICK_SPEED)
+                > 0;
+        if random_ticks_on {
+            self.random_tick_chunks(&mut scratch.ticking);
+        } else {
+            scratch.ticking.clear();
+        }
+        laps.lap("tb_chunks");
+        if random_ticks_on && !scratch.ticking.is_empty() {
+            self.with_level(|b, level, ticks| {
+                // The masks the random ticks will read, built on helper threads first while the
+                // parallel tick is on (`HORIZON_PARALLEL_TICK`): the draws and ticks don't depend on them.
+                if horizon_client::parallel::lanes() > 1 {
+                    horizon_client::spans::time("random_tick_masks", || {
                         let chunks = &level.world.chunks;
-                        let read = level.random_tick_sections.read_ahead(ahead);
-                        let found = ahead
-                            .iter()
-                            .filter_map(|key| chunks.get(key))
-                            .fold(0usize, |sum, chunk| sum ^ std::sync::Arc::as_ptr(chunk) as usize);
-                        std::hint::black_box(read ^ found);
-                    }
-                    let pos = horizon_core::position::ChunkPos::new(x, z);
-                    sections.start((x, z));
-                    b.tick_chunk_random_masked(level, ticks, pos, |level, from| {
-                        let stamp = (
-                            level.world.revision,
-                            level.world.chunks.membership_revision(),
-                        );
-                        let chunks = &level.world.chunks;
-                        sections.next(
-                            level.random_tick_sections,
-                            || chunks.get(&(x, z)),
+                        level.random_tick_sections.prepare_masks(
+                            &scratch.ticking,
+                            |key| chunks.get(&key),
                             level.facts,
-                            |id| b.random_tick_candidate(BlockStateId(id)),
-                            from,
-                            stamp,
-                        )
+                            &|id| b.random_tick_candidate(BlockStateId(id)),
+                        );
                     });
                 }
-                scratch.ticking.clear();
+                horizon_client::spans::time("random_ticks", || {
+                    // Each chunk's ticking sections, read once and answered from while no block
+                    // changes and no chunk comes or goes; the mask itself is retained by
+                    // tick_chunk_random_masked between callback asks.
+                    let mut sections =
+                        horizon_client::random_tick_sections::ChunkTicking::default();
+                    for (n, &(x, z)) in scratch.ticking.iter().enumerate() {
+                        // The next chunks' first reads, read together
+                        // (`RandomTickSections::read_ahead`): their entries here and in the
+                        // chunk map.
+                        if n % READ_AHEAD == 0 {
+                            let ahead =
+                                &scratch.ticking[n..(n + READ_AHEAD).min(scratch.ticking.len())];
+                            let chunks = &level.world.chunks;
+                            let read = level.random_tick_sections.read_ahead(ahead);
+                            let found = ahead
+                                .iter()
+                                .filter_map(|key| chunks.get(key))
+                                .fold(0usize, |sum, chunk| {
+                                    sum ^ std::sync::Arc::as_ptr(chunk) as usize
+                                });
+                            std::hint::black_box(read ^ found);
+                        }
+                        let pos = horizon_core::position::ChunkPos::new(x, z);
+                        sections.start((x, z));
+                        b.tick_chunk_random_masked(level, ticks, pos, |level, from| {
+                            let stamp = (
+                                level.world.revision,
+                                level.world.chunks.membership_revision(),
+                            );
+                            let chunks = &level.world.chunks;
+                            sections.next(
+                                level.random_tick_sections,
+                                || chunks.get(&(x, z)),
+                                level.facts,
+                                |id| b.random_tick_candidate(BlockStateId(id)),
+                                from,
+                                stamp,
+                            )
+                        });
+                    }
+                    scratch.ticking.clear();
+                });
             });
-        });
+        }
         horizon_threads::work::clear_work();
         laps = horizon_client::spans::laps();
         let sent = self.lan_broadcast_changes();
         laps.lap("tb_broadcast");
         self.save_chunks_eagerly();
-        self.with_level(|b, level, ticks| {
-            b.run_block_events(level, ticks);
-        });
+        if !self.block_ticks.block_events.is_empty() {
+            self.with_level(|b, level, ticks| {
+                b.run_block_events(level, ticks);
+            });
+        }
         laps.lap("tb_block_events");
         // `ServerLevel`: `handlingTick = false` right after `runBlockEvents`
         // (:412), before the entities and the block entities.
@@ -733,5 +755,75 @@ mod sweep_sections_tests {
         assert!(!sweep.may_hold(&game.world, b, high, SENSING));
         game.world.set(4, 100, 4, plate).unwrap();
         assert!(sweep.may_hold(&game.world, b, high, SENSING));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore = "daily"]
+    fn random_tick_speed_zero_and_empty_block_events_skip_without_breaking_active_ticks() {
+        use horizon_client::{chunk::Chunk, motion::PlayerMotion};
+        use horizon_core::{geometry::Vec3, position::ChunkPos};
+        use std::sync::Arc;
+
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            game.options.dedicated = Some(Vec::new());
+            game.build_registries();
+            game.set_allow_commands(true);
+            for cx in -1..=1 {
+                for cz in -1..=1 {
+                    let mut chunk = Chunk::empty(cx, cz);
+                    chunk.lit = true;
+                    game.world.chunks.insert((cx, cz), Arc::new(chunk));
+                    let _ = game.block_ticks.add_empty_chunk(ChunkPos::new(cx, cz));
+                }
+            }
+            game.player =
+                Some(PlayerMotion::new(game.motion, Vec3::new(8.5, 65.0, 8.5)).unwrap());
+            game.update_chunk_tickets();
+            game.world.random = horizon_core::random::LevelRandom::for_level(
+                horizon_core::random::LegacyRandom::new(12345),
+            );
+
+            assert!(game.run_command("gamerule random_tick_speed 0"));
+            assert!(game.run_command("setblock 5 64 5 minecraft:farmland[moisture=7]"));
+            let before = game.world.block(5, 64, 5);
+
+            // Sentinel proves the fast path clears `tick_scratch.ticking` and skips random ticks.
+            game.tick_scratch.ticking.push((99, 99));
+            assert!(game.block_ticks.block_events.is_empty());
+            game.tick_blocks().unwrap();
+            assert!(game.tick_scratch.ticking.is_empty());
+            for _ in 0..9 {
+                game.tick_blocks().unwrap();
+            }
+            assert_eq!(game.world.block(5, 64, 5), before);
+
+            // Re-enabling random_tick_speed still random-ticks farmland moisture.
+            assert!(game.run_command("gamerule random_tick_speed 4096"));
+            for _ in 0..8 {
+                game.tick_blocks().unwrap();
+                if game.world.block(5, 64, 5) != before {
+                    break;
+                }
+            }
+            assert_ne!(
+                game.world.block(5, 64, 5),
+                before,
+                "active random_tick_speed must still tick blocks"
+            );
+
+            // Non-empty block_events still run cleanly (piston extension triggers moving_pistons).
+            assert!(game.run_command("setblock 2 65 4 minecraft:piston[facing=east]"));
+            assert!(game.run_command("setblock 1 65 4 minecraft:redstone_block"));
+            assert!(!game.block_ticks.block_events.is_empty());
+            game.tick_blocks().unwrap();
+            assert!(game.block_ticks.block_events.is_empty());
+            assert!(
+                !game.block_ticks.moving_pistons.is_empty(),
+                "queued piston block event must still execute"
+            );
+        });
     }
 }
