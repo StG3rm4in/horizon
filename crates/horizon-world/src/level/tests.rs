@@ -1624,30 +1624,118 @@ fn lava_meets_water() {
 }
 
 /// `Fluid.getTickDelay` of every fluid at a few positions is the delay worked out with the
-/// dimension's fast lava read first, as it was before only lava asked for it.
+/// dimension's fast lava read first, as it was before only lava asked for it: in the test level's
+/// own type, whose lava is slow, in a type whose lava flows fast (vanilla's `ultrawarm`, now the
+/// `fast_lava` attribute), and for a mod's fluid, whose delay is the level's `mod_fluid_rules`
+/// answer at the position.
 #[test]
 fn fluid_tick_delays_read_the_dimension_for_lava_alone() {
-    use crate::fluid::FluidKind;
+    use crate::fluid::{FluidKind, ModFluid, ModFluidRules, ModFluidType, register_mod_fluid};
+    /// The test level under another dimension type, where a mod fluid's parts slow it at x < 0.
+    struct Typed<'a> {
+        inner: &'a mut TestLevel,
+        facts: &'a DimensionFacts,
+    }
+    impl crate::level::BlockEntityNeighbors for Typed<'_> {}
+    impl LevelAccess for Typed<'_> {
+        fn dimension_type(&self) -> &DimensionFacts {
+            self.facts
+        }
+        fn mod_fluid_rules(
+            &self,
+            pos: BlockPos,
+            _fluid: ModFluid,
+            registered: ModFluidRules,
+        ) -> ModFluidRules {
+            let slower = ModFluidRules {
+                tick_delay: 45,
+                ..registered
+            };
+            if pos.x < 0 { slower } else { registered }
+        }
+        fn block_state(&self, pos: BlockPos) -> BlockStateId {
+            self.inner.block_state(pos)
+        }
+        fn set_raw(&mut self, pos: BlockPos, state: BlockStateId) -> Option<BlockStateId> {
+            self.inner.set_raw(pos, state)
+        }
+        fn is_loaded(&self, pos: BlockPos) -> bool {
+            self.inner.is_loaded(pos)
+        }
+        fn random(&mut self) -> &mut LegacyRandom {
+            self.inner.random()
+        }
+        fn game_time(&self) -> i64 {
+            self.inner.game_time()
+        }
+    }
+    /// The delay as it was worked out before: the dimension's fast lava read for every fluid,
+    /// then a mod fluid's rules as the level answers them at the position.
+    fn before(level: &impl LevelAccess, kind: FluidKind, pos: BlockPos) -> i32 {
+        let fast = level.dimension_type().fast_lava;
+        let rules = |fluid: ModFluid| level.mod_fluid_rules(pos, fluid, fluid.get().rules);
+        fluid_tick_delay(kind, fast, || kind.mod_fluid().map(rules))
+    }
+    /// `Sim::fluid_tick_delay` on `level` of each kind at each position, in that order, checked
+    /// against [`before`] on the same level.
+    fn delays(
+        b: &Behaviours,
+        level: &mut impl LevelAccess,
+        ticks: &mut Ticks,
+        kinds: &[FluidKind],
+    ) -> Vec<i32> {
+        let positions = [BlockPos::new(0, 64, 0), BlockPos::new(-17, -3, 40)];
+        let mut expected = Vec::new();
+        for &kind in kinds {
+            for pos in positions {
+                expected.push(before(&*level, kind, pos));
+            }
+        }
+        let sim = b.sim(level, ticks);
+        let mut found = Vec::new();
+        for &kind in kinds {
+            for pos in positions {
+                found.push(sim.fluid_tick_delay(kind, pos));
+            }
+        }
+        assert_eq!(found, expected, "{kinds:?} at {positions:?}");
+        found
+    }
     let mut w = world!();
-    let fast = w.level.dimension_type().fast_lava;
-    let sim = w.f.behaviours.sim(&mut w.level, &mut w.ticks);
+    let oil = register_mod_fluid(ModFluidType {
+        id: "tick_delay_reads:oil".into(),
+        flowing_id: "tick_delay_reads:flowing_oil".into(),
+        bucket: None,
+        rules: ModFluidRules {
+            tick_delay: 20,
+            drop_off: 1,
+            slope_find_distance: 4,
+            converts_to_source: false,
+        },
+    })
+    .unwrap();
     let kinds = [
         FluidKind::Empty,
         FluidKind::Water,
         FluidKind::FlowingWater,
         FluidKind::Lava,
         FluidKind::FlowingLava,
+        FluidKind::Mod(oil),
+        FluidKind::ModFlowing(oil),
     ];
-    for kind in kinds {
-        for pos in [BlockPos::new(0, 64, 0), BlockPos::new(-17, -3, 40)] {
-            let before = fluid_tick_delay(kind, fast, || None);
-            assert_eq!(
-                sim.fluid_tick_delay(kind, pos),
-                before,
-                "{kind:?} at {pos:?}"
-            );
-        }
-    }
+    // The test level's own type, the Overworld's: slow lava, the mod fluid as registered.
+    let slow = delays(&w.f.behaviours, &mut w.level, &mut w.ticks, &kinds);
+    assert_eq!(slow, [0, 0, 5, 5, 5, 5, 30, 30, 30, 30, 20, 20, 20, 20]);
+    // The Overworld's type with fast lava, as a data pack's type may have it.
+    let mut ultrawarm = DimensionFacts::overworld().clone();
+    ultrawarm.id = "test:ultrawarm".into();
+    ultrawarm.fast_lava = true;
+    let mut typed = Typed {
+        inner: &mut w.level,
+        facts: &ultrawarm,
+    };
+    let fast = delays(&w.f.behaviours, &mut typed, &mut w.ticks, &kinds);
+    assert_eq!(fast, [0, 0, 5, 5, 5, 5, 10, 10, 10, 10, 20, 45, 20, 45]);
 }
 
 #[test]

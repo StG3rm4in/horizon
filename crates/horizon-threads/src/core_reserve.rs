@@ -73,6 +73,16 @@ pub fn leave_server_core() {
     imp::leave();
 }
 
+/// While a CPU is kept, what [`crate::available_parallelism`] answers: [`crate::machine_threads`],
+/// fixed before the pin (the calling thread's own mask is that one CPU, the others' the rest).
+pub(crate) fn whole_set() -> Option<std::num::NonZeroUsize> {
+    if imp::kept() {
+        std::num::NonZeroUsize::new(crate::machine_threads())
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use super::{Reserved, others_of, parse_cpu_list};
@@ -197,6 +207,10 @@ mod imp {
             set_affinity(0, others);
         }
     }
+
+    pub(super) fn kept() -> bool {
+        RESERVED.get().is_some()
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -208,6 +222,10 @@ mod imp {
     }
 
     pub(super) fn leave() {}
+
+    pub(super) fn kept() -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

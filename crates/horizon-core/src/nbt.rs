@@ -1152,8 +1152,8 @@ impl RootWriter {
         self.writer.count(values.len())?;
         self.writer.put(values)
     }
-    /// A `LongArray` payload of `words` (as i64).
-    pub fn long_array(&mut self, words: &[u64]) -> Result<(), Error> {
+    /// A `LongArray` payload of `words`, as a `Tag::LongArray` holds them.
+    pub fn long_array(&mut self, words: &[i64]) -> Result<(), Error> {
         self.writer.count(words.len())?;
         if words.len().saturating_mul(8)
             <= self
@@ -1164,14 +1164,12 @@ impl RootWriter {
         {
             self.writer.bytes.reserve(words.len() * 8);
             for &word in words {
-                self.writer
-                    .bytes
-                    .extend_from_slice(&(word as i64).to_be_bytes());
+                self.writer.bytes.extend_from_slice(&word.to_be_bytes());
             }
             return Ok(());
         }
         for &word in words {
-            self.writer.put(&(word as i64).to_be_bytes())?;
+            self.writer.put(&word.to_be_bytes())?;
         }
         Ok(())
     }

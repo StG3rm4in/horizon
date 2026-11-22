@@ -993,6 +993,10 @@ pub struct Extra {
     pub immovable: bool,
     /// `Mannequin.DATA_DESCRIPTION`: the text under its name.
     pub description: MannequinDescription,
+    /// Runtime-only: `(world.revision, [x.to_bits(), y.to_bits(), z.to_bits()])` at which an
+    /// immovable, invulnerable mannequin was last verified stationary in an inert environment
+    /// (dry, unlit, not in powder snow).
+    pub static_env_stamp: Option<(u64, [u64; 3], [u32; 2])>,
     /// `LivingEntity`'s `minecraft:scale` (`getScale`), which scales its box
     /// (`getDimensions`), eye height and model (`LivingEntityRenderState.scale`):
     /// the local player's own, and on a server every living entity's from its
@@ -1641,13 +1645,21 @@ pub enum MannequinDescription {
     Custom(horizon_core::nbt::Tag),
 }
 impl MannequinDescription {
+    /// Cached default component (`entity.minecraft.mannequin.label`) to avoid per-tick allocations.
+    pub fn default_component() -> &'static horizon_core::nbt::Tag {
+        static DEFAULT: std::sync::OnceLock<horizon_core::nbt::Tag> = std::sync::OnceLock::new();
+        DEFAULT.get_or_init(|| {
+            horizon_core::nbt::Tag::compound([(
+                "translate",
+                horizon_core::nbt::Tag::String("entity.minecraft.mannequin.label".into()),
+            )])
+        })
+    }
+
     /// `Mannequin.getDescription`: the component `DATA_DESCRIPTION` holds, none when hidden.
     pub fn component(&self) -> Option<horizon_core::nbt::Tag> {
         match self {
-            Self::Default => Some(horizon_core::nbt::Tag::compound([(
-                "translate",
-                horizon_core::nbt::Tag::String("entity.minecraft.mannequin.label".into()),
-            )])),
+            Self::Default => Some(Self::default_component().clone()),
             Self::Hidden => None,
             Self::Custom(tag) => Some(tag.clone()),
         }
@@ -1656,7 +1668,7 @@ impl MannequinDescription {
     pub fn from_component(tag: Option<&horizon_core::nbt::Tag>) -> Self {
         match tag {
             None => Self::Hidden,
-            Some(tag) if Some(tag) == Self::Default.component().as_ref() => Self::Default,
+            Some(tag) if tag == Self::default_component() => Self::Default,
             Some(tag) => Self::Custom(tag.clone()),
         }
     }
@@ -2907,6 +2919,10 @@ impl PendingPushes {
     /// Whether every queued push has been consumed or retired with its target.
     pub fn is_empty(&self) -> bool {
         self.list.is_empty() && self.by_mob.is_empty()
+    }
+    /// Whether any queued push targets mob `id`.
+    pub fn has_for(&self, id: u32) -> bool {
+        self.list.iter().any(|(target, _)| *target == id) || self.by_mob.contains_key(&id)
     }
     pub fn push(&mut self, id: u32, v: Vec3) {
         if self.by_mob.is_empty() && self.list.len() < Self::LIST_MAX {
@@ -4480,12 +4496,61 @@ impl Mob {
         self.prepare_tick();
         neutral_anger::tick_until_consumption(self, w, level, events)
     }
-    fn prepare_tick(&mut self) {
+    pub(crate) fn prepare_tick(&mut self) {
         self.track_section();
         // LivingEntity.tick: CombatTracker.recheckStatus.
         let alive = self.alive();
         self.combat.recheck(alive, self.age);
         self.extra.stuck.tick();
+    }
+
+    /// Whether this mob is a stationary, immovable, invulnerable mannequin whose tick has no
+    /// block-contact, damage, or finite-effect countdown side effects once verified for the
+    /// current `(world.revision, position)` stamp.
+    pub fn is_static_mannequin(&self) -> bool {
+        self.species() == Species::Mannequin
+            && self.extra.immovable
+            && self.invulnerable_flag
+            && !self.removed
+            && self.alive()
+            && !self.first_tick
+            && !self.effects_dirty
+            && self.mount.is_none()
+            && self.rider.is_none()
+            && self.extra.rider.is_none()
+            && self.extra.leash.is_none()
+            && self.extra.leash_pending.is_none()
+            && self.fire_ticks == 0
+            && self.ticks_frozen == 0
+            && self.hurt_time == 0
+            && self.invulnerable == 0
+            && self.invulnerable_time == 0
+            && self.ai.last_hurt_by_player == 0
+            && self.impulse_grace_time == 0
+            && !self.ai.swinging
+            && self.velocity == Vec3::ZERO
+            && self.position == self.previous
+            && !self.fluids.in_water
+            && !self.fluids.in_lava
+            && !self.in_powder_snow
+            && self.air >= self.max_air_supply()
+            && self.outbox.is_empty()
+            && self.extra.effect_chains.is_empty()
+            && self.extra.effects.iter().all(|e| {
+                e.duration == -1
+                    && matches!(
+                        e.id,
+                        "minecraft:resistance"
+                            | "minecraft:fire_resistance"
+                            | "minecraft:water_breathing"
+                            | "minecraft:invisibility"
+                            | "minecraft:night_vision"
+                            | "minecraft:slow_falling"
+                            | "minecraft:glowing"
+                            | "minecraft:speed"
+                            | "minecraft:slowness"
+                    )
+            })
     }
     /// The section the mob is in, noted when it changes (`EntitySection` lists).
     fn track_section(&mut self) {
@@ -6469,17 +6534,58 @@ mod totem_tests {
 mod seen_box_tests {
     use super::*;
 
-    /// The snapshot's box, hitbox and eyes, from one `dims()`, are the mob's own `bounds()`,
-    /// `hitbox()` and `eye_y()`, to the bit: for species whose boxes follow their state, at
-    /// several sizes, scales and poses, seated on a vehicle, then no longer on it.
-    #[test]
-    fn a_snapshot_has_the_mobs_own_box_hitbox_and_eyes() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client")
-            .join(horizon_core::VANILLA_VERSION);
-        if !root.join("entity-types.json").exists() {
-            return;
+    /// `Mob::bounds_at` as it was before its arithmetic moved into `box_of`, which `bounds()` and
+    /// the snapshot now share: the reference for the snapshot's box, as a check against
+    /// `bounds()` alone would compare `box_of` with itself.
+    fn bounds_before_box_of(m: &Mob, position: Vec3) -> Aabb {
+        // Shulker.makeBoundingBox: the lid's lift, not the dimensions.
+        if m.kind.species == Species::Shulker {
+            return shulker::bounds_at(m, position);
         }
+        let (width, height, _) = m.dims();
+        let w = f64::from(width as f32) / 2.0;
+        Aabb::new(
+            Vec3::new(position.x - w, position.y, position.z - w),
+            Vec3::new(
+                position.x + w,
+                position.y + f64::from(height as f32),
+                position.z + w,
+            ),
+        )
+    }
+    /// `Mob::hitbox` as it was before `hitbox_of`, on the box of [`bounds_before_box_of`].
+    fn hitbox_before_box_of(m: &Mob) -> Aabb {
+        let b = bounds_before_box_of(m, m.position);
+        match m.extra.seat.filter(|s| m.mount == Some(s.0)) {
+            Some((_, offset, _)) => {
+                let (lo, hi) = (b.min_position(), b.max_position());
+                let y = (m.position.y + offset).max(lo.y);
+                Aabb::new(Vec3::new(lo.x, y, lo.z), hi)
+            }
+            None => b,
+        }
+    }
+
+    /// The snapshot's box, hitbox and eyes, from one `dims()`, are the mob's own `bounds()`,
+    /// `hitbox()` and `eye_y()`, and the box and hitbox of the arithmetic before `box_of`, to the
+    /// bit: for species whose boxes follow their state, at several sizes, scales and poses,
+    /// seated on a vehicle, then no longer on it. It needs the prepared entity types, so it is a
+    /// daily test, and it fails without them rather than pass having checked nothing.
+    #[test]
+    #[ignore = "daily"]
+    fn a_snapshot_has_the_mobs_own_box_hitbox_and_eyes() {
+        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client")
+                    .join(horizon_core::VANILLA_VERSION)
+            });
+        assert!(
+            root.join("entity-types.json").exists(),
+            "no entity-types.json in {}: set HORIZON_TEST_RESOURCES to prepared resources",
+            root.display()
+        );
         let types =
             MobTypes::load_for_server(&root, &MobTypes::root_catalog(&root).unwrap()).unwrap();
         let bits = |b: Aabb| {
@@ -6524,11 +6630,21 @@ mod seen_box_tests {
                     m.seated(9, offset, vehicle);
                 }
                 let seen = m.seen(None, &items);
-                assert_eq!(bits(seen.bounds), bits(m.bounds()), "{id}");
-                assert_eq!(bits(seen.hitbox), bits(m.hitbox()), "{id}");
+                let old = bits(bounds_before_box_of(&m, m.position));
+                assert_eq!(bits(seen.bounds), old, "{id}");
+                assert_eq!(bits(m.bounds()), old, "{id}");
+                let old_hitbox = bits(hitbox_before_box_of(&m));
+                assert_eq!(bits(seen.hitbox), old_hitbox, "{id}");
+                assert_eq!(bits(m.hitbox()), old_hitbox, "{id}");
                 assert_eq!(seen.eye_y.to_bits(), m.eye_y().to_bits(), "{id}");
+                // `bounds_at` elsewhere than the mob's feet, as collisions and pushes ask it.
+                let far = Vec3::new(-29_999_983.7, -63.9, 1.0e-3);
+                let far_box = bits(bounds_before_box_of(&m, far));
+                assert_eq!(bits(m.bounds_at(far)), far_box, "{id}");
                 m.mount = None;
-                assert_eq!(bits(m.seen(None, &items).hitbox), bits(m.hitbox()), "{id}");
+                let unseated = bits(m.seen(None, &items).hitbox);
+                assert_eq!(unseated, bits(hitbox_before_box_of(&m)), "{id}");
+                assert_eq!(unseated, bits(m.hitbox()), "{id}");
                 checked += 1;
             }
         }
