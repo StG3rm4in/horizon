@@ -70,7 +70,7 @@ impl MobWorld<'_> {
                     } else if data::vanilla_burning_block(
                         &facts.name,
                         facts.emission > 0,
-                        self.has_tag("minecraft:fire", &facts.name),
+                        self.has_hot_tag(super::HotTag::Fire, state),
                     ) {
                         Some(PathType::FireInNeighbor)
                     } else {

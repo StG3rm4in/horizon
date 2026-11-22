@@ -42,7 +42,7 @@ impl Mob {
             return false;
         }
         // `IBlockExtension.isLadder`: the block's parts answer after the tag.
-        let mut ladder = w.has_tag("minecraft:climbable", &facts.name);
+        let mut ladder = w.has_hot_tag(crate::mobs::HotTag::Climbable, state);
         crate::motion::native_is_ladder(
             w.loop_context,
             self.id,

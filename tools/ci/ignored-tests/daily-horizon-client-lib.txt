@@ -268,6 +268,7 @@ horizon-client-lib mobs::hidden_speed_mob_tick_tests::ai_full_mob_tick_promotes_
 horizon-client-lib mobs::hidden_speed_mob_tick_tests::noai_full_mob_tick_promotes_speed lib daily resources
 horizon-client-lib mobs::hostile::monster_no_action_tests::a_blaze_and_a_vex_keep_their_extra_no_action_time_in_the_dark lib daily resources
 horizon-client-lib mobs::hostile::spider_vehicle_tests::a_spider_carrying_a_player_does_not_start_its_attack lib daily resources
+horizon-client-lib mobs::hot_tags_tests::hot_tags_by_state_answer_as_the_names lib daily resources
 horizon-client-lib mobs::illager::tests::a_fang_stands_on_a_soul_sand_floor lib daily resources
 horizon-client-lib mobs::illager::tests::a_flagged_invisible_blue_sheep_is_not_wololoed_from_fourteen_blocks lib daily resources
 horizon-client-lib mobs::illager::tests::an_invisible_blue_sheep_is_not_wololoed_from_five_blocks lib daily resources

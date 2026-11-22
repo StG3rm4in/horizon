@@ -313,6 +313,12 @@ impl MobWorld<'_> {
     pub fn has_tag(&self, tag: &str, block: &str) -> bool {
         self.hot_tags.has(self.block_tags, tag, block)
     }
+    /// [`Self::has_tag`] of a hot tag for the block of `state` (its name in `facts`): the same
+    /// answer, read from the byte the view's tags keep for the state when they keep one.
+    pub fn has_hot_tag(&self, tag: super::HotTag, state: BlockStateId) -> bool {
+        self.hot_tags
+            .has_state(self.block_tags, self.facts, tag, state)
+    }
     /// `findBlocksInBoxByManhattanDistance(at, range_xz, range_y).filterState(..).findFirst()`:
     /// the first block `matches` accepts (given its position and name), going
     /// out from `at` by Manhattan distance as `BlockPos.withinBoxByManhattanDistance` does.
