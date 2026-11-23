@@ -970,8 +970,12 @@ impl GenerationScan {
                     x1 = x1.max(next_x1);
                 }
                 for x in x0..=x1 {
-                    if !input.ranges.requested(x, z, input.decorates)
-                        || input.world.chunks.contains_key(&(x, z))
+                    // Resident first: most columns of the areas are, and the chunk map's grid
+                    // slot of the next column of a row is next to the last one, where
+                    // `requested` asks the areas again. The tests only read, so their order
+                    // changes no answer.
+                    if input.world.chunks.contains_key(&(x, z))
+                        || !input.ranges.requested(x, z, input.decorates)
                         || input.generating.contains(&(x, z))
                         || input.protos.contains_key(&(x, z))
                         || input.finishing.contains(&(x, z))
@@ -2400,10 +2404,13 @@ impl Streaming {
             {
                 let ranges = self.ranges();
                 for (&(x, z), proto) in &self.protos {
+                    // The range first: most proto chunks lie in the rings past the columns that
+                    // finish, and it reads the areas' grid where the other two are look-ups.
+                    // The tests only read, so their order changes no answer.
                     if proto.is_none()
+                        || !ranges.in_range(x, z, 1)
                         || world.chunks.contains_key(&(x, z))
                         || self.finishing.contains(&(x, z))
-                        || !ranges.in_range(x, z, 1)
                     {
                         continue;
                     }
@@ -2488,10 +2495,12 @@ impl Streaming {
                     self.protos
                         .iter()
                         .filter(|&(&(x, z), proto)| {
+                            // The range first, as for the chunks that finish above: the outer
+                            // ring fails it without a look-up.
                             proto.is_some()
+                                && (ranges.in_range(x, z, 2) || ranges.near_finished(x, z, 1))
                                 && !self.decorated.contains(&(x, z))
                                 && !world.chunks.contains_key(&(x, z))
-                                && (ranges.in_range(x, z, 2) || ranges.near_finished(x, z, 1))
                         })
                         .map(|(&k, _)| k),
                     |x, z| ranges.priority(x, z),
