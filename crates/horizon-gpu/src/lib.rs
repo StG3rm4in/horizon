@@ -18,11 +18,12 @@
 //! `HORIZON_GPU_PRIORITY=0` (no priority for the critical path streams), `HORIZON_GPU_REGION` (side
 //! of a region in chunks, 8), `HORIZON_GPU_REGIONS_MAX` (regions kept in GPU memory, 128),
 //! `HORIZON_GPU_CACHE` (directory of the compiled PTX), `HORIZON_GPU_DEVICE` (the CUDA device, 0),
-//! `HORIZON_GPU_MEMORY_MB` (GPU memory of final_density's region cache; half of the memory free at
-//! startup by default, a region of the overworld takes about 33 MB). The surface
+//! `HORIZON_GPU_MEMORY_MB` (GPU memory of final_density's region cache; by default half of the
+//! memory free at its start that no other dimension's cache was promised, a region of the overworld
+//! takes about 33 MB). The surface
 //! (`HORIZON_GPU_SURFACE_REGIONS`, 48 regions) and the light (`HORIZON_GPU_LIGHT_CACHE`, slots of
 //! sections) have caches of their own. Out of GPU memory, the region cache halves (down to 8
-//! regions) and the chunk goes to the CPU; any other CUDA error, or no memory even for 8 regions,
+//! regions, once for the workers that run out together) and the chunk goes to the CPU; any other CUDA error, or no memory even for 8 regions,
 //! turns the stage off for the session.
 //!
 //! Build: the `cuda` feature (on by default in horizon-client-render and the game, which turn it on
@@ -69,7 +70,7 @@ use horizon_core::density::{Beardifier, DensitySampler, SamplerContext, TerrainA
 use horizon_core::noise::DensityVolume;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -481,7 +482,14 @@ struct Cache {
     lookup: HashMap<(i32, i32), (Arc<Region>, u64)>,
     clock: u64,
     capacity: usize,
+    /// When the cache last halved for lack of GPU memory.
+    last_shrink: Option<Instant>,
 }
+
+/// GPU memory promised to the region caches started so far (one per dimension), which the next one
+/// leaves aside: a cache fills its budget only as it computes regions, so the memory free at a start
+/// does not show yet what the caches started before it will take.
+static PROMISED: AtomicUsize = AtomicUsize::new(0);
 
 /// Stream and buffers of a worker for copying a chunk, returned to the pool after use.
 struct Resources {
@@ -675,7 +683,8 @@ impl Engine {
     ) -> Result<Self, String> {
         let ctx = context()?;
         // The region cache within a budget: HORIZON_GPU_MEMORY_MB, else half of the GPU memory free
-        // now (the other stages and dimensions take theirs from what is left). A region holds its
+        // now that no cache started before was promised (`PROMISED`; the other stages take theirs from
+        // what is left). A region holds its
         // densities and its block codes: about 33 MB for 8 x 8 chunks of the overworld.
         let region_bytes = prog.size * 4 + (r * r) as usize * 256 * height as usize;
         let budget = match std::env::var("HORIZON_GPU_MEMORY_MB")
@@ -683,9 +692,12 @@ impl Engine {
             .and_then(|v| v.trim().parse::<usize>().ok())
         {
             Some(mb) => mb << 20,
-            None => ctx.mem_get_info().map_or(usize::MAX, |(free, _)| free / 2),
+            None => ctx.mem_get_info().map_or(usize::MAX, |(free, _)| {
+                free.saturating_sub(PROMISED.load(Relaxed)) / 2
+            }),
         };
         let capacity = capacity.min((budget / region_bytes.max(1)).max(1));
+        PROMISED.fetch_add(capacity.saturating_mul(region_bytes), Relaxed);
         log::info!(
             "GPU final_density: up to {capacity} regions of {:.0} MB in GPU memory (budget {} MB)",
             region_bytes as f64 / 1e6,
@@ -751,6 +763,7 @@ impl Engine {
                 lookup: HashMap::new(),
                 clock: 0,
                 capacity,
+                last_shrink: None,
             }),
             pool: Mutex::new(Vec::new()),
             stats: Stats::default(),
@@ -834,14 +847,20 @@ impl Engine {
 
     /// A chunk's GPU work failed. Out of GPU memory, the region cache halves (down to
     /// `MIN_REGIONS`) and drops the region, whose next chunks compute it again with more room; only
-    /// this chunk goes to the CPU. Any other error, or a cache already at its floor, turns
-    /// final_density off for the session: with fewer regions the workers would compute the same
-    /// regions over and over, slower than the CPU.
+    /// this chunk goes to the CPU. The workers that ran out with it fail within `SETTLE` of the
+    /// halving: one halving answers them all, their chunks go to the CPU (eight of them used to take
+    /// the cache from 128 regions to 8, then turn the stage off). Any other error, or a cache
+    /// already at its floor, turns final_density off for the session: with fewer regions the
+    /// workers would compute the same regions over and over, slower than the CPU.
     fn failed(&self, e: &str, key: (i32, i32)) {
         const MIN_REGIONS: usize = 8;
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
         if e.contains("OUT_OF_MEMORY") {
             let mut c = self.cache.lock().unwrap();
             c.lookup.remove(&key);
+            if c.last_shrink.is_some_and(|t| t.elapsed() < SETTLE) {
+                return;
+            }
             if c.capacity > MIN_REGIONS {
                 let old = c.capacity;
                 c.capacity = (old / 2).max(MIN_REGIONS);
@@ -859,6 +878,7 @@ impl Engine {
                     self.stats.evictions.fetch_add(1, Relaxed);
                 }
                 let new = c.capacity;
+                c.last_shrink = Some(Instant::now());
                 drop(c);
                 self.stats.shrinks.fetch_add(1, Relaxed);
                 log::warn!(
