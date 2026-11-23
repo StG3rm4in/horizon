@@ -527,6 +527,11 @@ impl MobWorld<'_> {
         state: horizon_world::registry::BlockStateId,
         p: [i32; 3],
     ) -> Option<horizon_core::geometry::Aabb> {
+        // A cached shape is the one `collision_shape` clones: its bounds are read in place
+        // (`collision_changes` asks twice for every block written since the last tick).
+        if let Ok(Some(shape)) = self.collision.cached_shapes().cached_shape(state) {
+            return shape.bounds();
+        }
         let mut scene = SceneCollisions {
             world: self.world,
             binding: self.collision,
@@ -1217,6 +1222,82 @@ mod scaffolding_sight_tests {
                 let above = Vec3::new(0.5, 66.0 + 1.62, 0.5);
                 assert!(w.line_of_sight_for(Some(64.0), below, above));
                 assert!(!w.line_of_sight_for(Some(66.0), above, below));
+            },
+        );
+        assert!(ran, "vanilla data is missing");
+    }
+}
+
+#[cfg(test)]
+mod collision_bounds_tests {
+    use super::*;
+
+    /// Every state's collision bounds at three spots (one in a missing chunk), read in place where
+    /// the shape is cached, are the bounds of the shape `collision_shape` clones; and of writes
+    /// between random states, `collision_changes` keeps the ones comparing cloned shapes keeps,
+    /// in order.
+    #[test]
+    #[ignore = "daily"]
+    fn bounds_read_in_place_are_the_cloned_shapes_bounds() {
+        let ran = super::with_built_test_world(
+            &[],
+            |world, _| {
+                world.chunks.insert(
+                    (0, 0),
+                    std::sync::Arc::new(crate::chunk::Chunk::empty(0, 0)),
+                );
+            },
+            |w, _| {
+                let cloned = |state: BlockStateId, p: [i32; 3]| {
+                    let mut scene = SceneCollisions {
+                        world: w.world,
+                        binding: w.collision,
+                        subject: None,
+                    };
+                    w.collision
+                        .collision_shape(&mut scene, state, p)
+                        .ok()?
+                        .bounds()
+                };
+                let states = w.registry.len() as u32;
+                for i in 0..states {
+                    let state = BlockStateId(i);
+                    for p in [[0, 64, 0], [5, 70, 11], [-30, 64, 20]] {
+                        assert_eq!(
+                            w.collision_bounds_of(state, p),
+                            cloned(state, p),
+                            "state {i} at {p:?}"
+                        );
+                    }
+                }
+                let mut seed = 0x1319_8A2E_0370_7344u64;
+                let mut next = move |n: u64| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed % n
+                };
+                let writes: Vec<((i32, i32, i32), u32, u32)> = (0..20_000)
+                    .map(|_| {
+                        let (x, y) = (next(48) as i32 - 16, 60 + next(10) as i32);
+                        let at = (x, y, next(48) as i32 - 16);
+                        (
+                            at,
+                            next(u64::from(states)) as u32,
+                            next(u64::from(states)) as u32,
+                        )
+                    })
+                    .collect();
+                let changed: Vec<[i32; 3]> = writes
+                    .iter()
+                    .filter(|&&((x, y, z), old, new)| {
+                        let p = [x, y, z];
+                        cloned(BlockStateId(old), p) != cloned(BlockStateId(new), p)
+                    })
+                    .map(|&((x, y, z), _, _)| [x, y, z])
+                    .collect();
+                assert_eq!(crate::mobs::collision_changes(w, &writes), changed);
+                assert!(changed.len() > 1_000, "{} changed", changed.len());
             },
         );
         assert!(ran, "vanilla data is missing");
