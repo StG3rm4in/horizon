@@ -51,6 +51,7 @@ pub(super) struct Group {
     /// The first slot of each id, as a scan would find it.
     index: FxHashMap<u32, u32>,
     villager_slots: Vec<u32>,
+    village: horizon_client::mobs::village_index::VillageIndex,
     species_slots: horizon_client::mobs::species_slots::SpeciesSlots,
     solid_slots: Vec<u32>,
     pub pushes: PendingPushes,
@@ -140,6 +141,7 @@ impl Group {
             grid: SeenGrid::default(),
             index: FxHashMap::default(),
             villager_slots: Vec::new(),
+            village: Default::default(),
             species_slots: Default::default(),
             solid_slots: Vec::new(),
             pushes: PendingPushes::default(),
@@ -180,6 +182,8 @@ impl Group {
         }
         self.species_slots = horizon_client::mobs::species_slots::SpeciesSlots::new(&snapshot);
         (self.index, self.villager_slots, self.solid_slots) = (index, villager_slots, solid_slots);
+        // The villagers' sections are read from these entries at the first question.
+        self.village = Default::default();
         self.snapshot = snapshot;
     }
 
@@ -218,6 +222,7 @@ impl Group {
         self.grid = SeenGrid::default();
         self.index = FxHashMap::default();
         self.villager_slots = Vec::new();
+        self.village = Default::default();
         self.species_slots = Default::default();
         self.solid_slots = Vec::new();
     }
@@ -281,6 +286,8 @@ impl Group {
     fn turn(&mut self, i: usize, turns: &mut Turns, shared: &Shared) {
         if self.mobs[i].removed {
             self.keep.push(false);
+            // A villager's entry the village index may hold, as the borrowed loop marks it.
+            self.village.mark(i, &self.snapshot[i], &self.snapshot[i]);
             self.snapshot[i].alive = false;
             // `removed` is the view's authoritative gone (arismoko/horizon#795).
             self.snapshot[i].removed = true;
@@ -416,6 +423,7 @@ impl Group {
             others_grid: Some(&self.grid),
             others_index: Some(&self.index),
             others_villagers: Some(&self.villager_slots),
+            village: Some(&self.village),
             species_slots: Some(&self.species_slots),
             others_solid: Some(&self.solid_slots),
             difficulty,
@@ -536,6 +544,7 @@ impl Group {
         // ServerLevel ticks entities one after another: the ones
         // after this mob see it as it is now.
         let fresh = seen(m, shared.uuid, shared.items);
+        self.village.mark(i, &self.snapshot[i], &fresh);
         let reclassified = self.snapshot[i].species != fresh.species;
         self.snapshot[i] = fresh;
         if reclassified {
@@ -577,7 +586,9 @@ mod tests {
     #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn a_group_prepared_on_its_lane_is_the_group_made_whole() {
         let mut game = super::super::super::native_machines::tests::server_game();
-        let kinds = ["cow", "villager", "pig", "villager", "sheep", "cow", "chicken"];
+        let kinds = [
+            "cow", "villager", "pig", "villager", "sheep", "cow", "chicken",
+        ];
         for (k, kind) in kinds.iter().enumerate() {
             let at = [0.5 + 2.0 * k as f64, 65.0, 0.5 + 6.0 * (k % 3) as f64];
             game.spawn_mob(&format!("minecraft:{kind}"), at, true, SpawnSite::Plain)
@@ -607,7 +618,11 @@ mod tests {
                 .iter()
                 .filter_map(|m| bindings.get(&m.id).map(|&conn| (m.id, conn)))
                 .collect();
-            let d = own.iter().filter(|m| died.contains(&m.id)).map(|m| m.id).collect();
+            let d = own
+                .iter()
+                .filter(|m| died.contains(&m.id))
+                .map(|m| m.id)
+                .collect();
             let seen = members.iter().map(|&k| frozen[k].clone()).collect();
             Group::new(own.clone(), seen, start(b, d)).answering_as(whole)
         };
@@ -615,11 +630,20 @@ mod tests {
         let mut prepared = Group::of_list(own.into_iter().collect(), Vec::new(), blank);
         prepared.global = members;
         prepared.prepare(&frozen, whole, &bindings, &died);
-        let entries = |g: &Group| g.snapshot.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>();
+        let entries = |g: &Group| {
+            g.snapshot
+                .iter()
+                .map(|s| format!("{s:?}"))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(entries(&prepared), entries(&made_whole));
         assert_eq!(prepared.index, made_whole.index);
         assert_eq!(prepared.villager_slots, made_whole.villager_slots);
-        assert_eq!(prepared.villager_slots.len(), 2, "both villagers are members");
+        assert_eq!(
+            prepared.villager_slots.len(),
+            2,
+            "both villagers are members"
+        );
         assert_eq!(prepared.solid_slots, made_whole.solid_slots);
         assert_eq!(prepared.bindings, made_whole.bindings);
         assert_eq!(prepared.died, made_whole.died);
@@ -636,10 +660,17 @@ mod tests {
         }
         for s in &frozen {
             let species = s.species;
-            assert_eq!(prepared.species_slots.of(species), made_whole.species_slots.of(species));
+            assert_eq!(
+                prepared.species_slots.of(species),
+                made_whole.species_slots.of(species)
+            );
         }
         prepared.release();
         assert!(prepared.index.is_empty() && prepared.villager_slots.is_empty());
-        assert_eq!(entries(&prepared), entries(&made_whole), "the merge reads the entries");
+        assert_eq!(
+            entries(&prepared),
+            entries(&made_whole),
+            "the merge reads the entries"
+        );
     }
 }

@@ -48,6 +48,14 @@ jobs:
         run: cargo clippy -p horizon-gpu --all-targets --locked -- -D warnings
       - name: unit tests (no GPU, no game files)
         run: cargo test --locked -p horizon-gpu -p horizon-core --lib
+      - name: NVRTC, for the kernels' compilation (a compiler library, no GPU needed)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/nvrtc"
+          "$RUNNER_TEMP/nvrtc/bin/pip" install --quiet nvidia-cuda-nvrtc-cu12
+          lib=$("$RUNNER_TEMP/nvrtc/bin/python" -c 'import nvidia.cuda_nvrtc, os; print(os.path.join(list(nvidia.cuda_nvrtc.__path__)[0], "lib"))')
+          echo "LD_LIBRARY_PATH=$lib" >> "$GITHUB_ENV"
+      - name: the GPU kernels compile with NVRTC
+        run: HORIZON_REQUIRE_NVRTC=1 cargo test --locked -p horizon-gpu --features cuda --lib nvrtc
       - name: horizon-world's tests (those that need the game's files skip without them)
         run: cargo test --locked -p horizon-world
       - name: the layer check (docs/layers.md)

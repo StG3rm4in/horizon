@@ -2675,6 +2675,7 @@ mod tests {
                 others_index: None,
                 passenger_objects: &[],
                 others_villagers: None,
+                village: None,
                 species_slots: None,
                 others_solid: None,
                 daylight: true,
@@ -2809,6 +2810,7 @@ mod tests {
                 others_index: None,
                 passenger_objects: &[],
                 others_villagers: None,
+                village: None,
                 species_slots: None,
                 others_solid: None,
                 daylight: true,
@@ -2944,6 +2946,7 @@ mod tests {
             others_index: None,
             passenger_objects: &[],
             others_villagers: None,
+            village: None,
             species_slots: None,
             others_solid: None,
             daylight: true,
@@ -3088,6 +3091,7 @@ mod tests {
                 others_index: None,
                 passenger_objects: &[],
                 others_villagers: None,
+                village: None,
                 species_slots: None,
                 others_solid: None,
                 daylight: true,
@@ -3863,6 +3867,9 @@ pub mod teleports;
 #[cfg(test)]
 mod farmland_event_tests;
 
+#[cfg(test)]
+#[path = "climbable_player_push_tests.rs"]
+mod climbable_player_push_tests;
 #[cfg(test)]
 #[path = "living_climbable_tests.rs"]
 mod climbable_tests;

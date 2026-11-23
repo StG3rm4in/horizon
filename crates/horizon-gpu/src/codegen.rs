@@ -2,7 +2,6 @@
 //! variable per node, in topological order, for each grid (2D pass of the Y-free values, corner
 //! grids of the interpolations, block grid). Every float operation goes through `_rn` intrinsics
 //! (no fused multiply-add) to reproduce the CPU bit for bit.
-#![allow(dead_code, clippy::all)]
 use horizon_core::density::graph::{
     DensityCompiler, FunctionId, GraphBinary, GraphNode, GraphUnary,
 };
@@ -143,7 +142,6 @@ struct Gen<'a> {
     external: Vec<(FunctionId, usize)>,
     nv: usize,
     count: BTreeMap<&'static str, usize>,
-    seed: i64,
     /// Noises kept alive for the whole generation: the tables are identified by their address,
     /// which a freed object could let another noise reuse.
     kept: Vec<Box<dyn std::any::Any>>,
@@ -168,12 +166,12 @@ fn layer_step(t: [i32; 3]) -> usize {
 }
 
 impl<'a> Gen<'a> {
-    fn new(c: &'a DensityCompiler, main_grid: Grid, root: Option<FunctionId>, seed: i64) -> Self {
+    /// `_seed`: the world seed, which the noises the graph holds already carry.
+    fn new(c: &'a DensityCompiler, main_grid: Grid, root: Option<FunctionId>, _seed: i64) -> Self {
         Self {
             axes: Vec::new(),
             index_axes: HashMap::new(),
             kept: Vec::new(),
-            seed,
             c,
             defs: String::new(),
             tables: Vec::new(),
@@ -516,39 +514,6 @@ impl<'a> Gen<'a> {
         ))
     }
 
-    /// NoiseSampler (zeroed buffer then add_to_volume, amplitude 1) of a given stack, x, y, z axes.
-    fn fn_volume_key(&mut self, name: &str, n: &dyn Noise, xz: f64, y: f64) -> R<String> {
-        let mut c = Vec::new();
-        self.layers(n, xz, y, 1.0, &mut c)?;
-        let mut s = format!(
-            "__device__ __noinline__ float {name}(int x, int y, int z) {{\n  float acc = 0.0f;\n"
-        );
-        for (t, sxz, sy, a, fudge) in c {
-            let call = match fudge {
-                None => format!(
-                    "perlin_vol(PERM[{t}], OFF[{t}], x, {}, y, {}, z, {})",
-                    f64lit(sxz),
-                    f64lit(sy),
-                    f64lit(sxz)
-                ),
-                Some(f) => format!(
-                    "perlin_vol_smeared(PERM[{t}], OFF[{t}], x, {}, y, {}, z, {}, {})",
-                    f64lit(sxz),
-                    f64lit(sy),
-                    f64lit(sxz),
-                    f64lit(f)
-                ),
-            };
-            writeln!(
-                s,
-                "  acc = __fadd_rn(acc, __fmul_rn({}, {call}));",
-                f32lit(a)
-            )?;
-        }
-        writeln!(s, "  return acc;\n}}")?;
-        self.defs.push_str(&s);
-        Ok(name.to_string())
-    }
     fn point(&mut self, n: &dyn Noise) -> R<String> {
         if let Some(p) = n.as_perlin() {
             let t = self.table(p);
@@ -687,9 +652,13 @@ impl<'a> Gen<'a> {
         if let Some(v) = self.constant(id) {
             return Ok(f32lit(v));
         }
-        if ctx_3d && self.point_mode && self.hoisted.is_some() && self.y_free(id)? {
+        if ctx_3d
+            && self.point_mode
+            && self.hoisted.is_some()
+            && self.y_free(id)?
+            && let Some(h) = self.hoisted.as_mut()
+        {
             // Descent loop: computed once before the loop (surface_descent)
-            let h = self.hoisted.as_mut().unwrap();
             let slot = match h.iter().position(|&b| b == id) {
                 Some(s) => s,
                 None => {

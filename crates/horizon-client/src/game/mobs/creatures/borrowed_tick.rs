@@ -141,6 +141,7 @@ impl Game<'_> {
         let mut positions: Option<horizon_client::fast_hash::FxHashMap<u32, usize>> = None;
         let mut index = horizon_client::fast_hash::FxHashMap::<u32, u32>::default();
         let mut villager_slots = Vec::new();
+        let mut village = horizon_client::mobs::village_index::VillageIndex::default();
         let mut solid_slots = Vec::new();
         let mut species_slots = horizon_client::mobs::species_slots::SpeciesSlots::new(&snapshot);
         for (i, s) in snapshot.iter().enumerate() {
@@ -207,6 +208,7 @@ impl Game<'_> {
                         Some(positions) => {
                             let Some(&i) = positions.get(&snapshot[slot].id) else {
                                 keep[slot] = false;
+                                village.mark(slot, &snapshot[slot], &snapshot[slot]);
                                 snapshot[slot].alive = false;
                                 // The row's mob left the list at a boundary: the
                                 // tick view must answer a removed handle with nothing.
@@ -228,6 +230,7 @@ impl Game<'_> {
                     }
                     if m.removed && !resuming {
                         keep[slot] = false;
+                        village.mark(slot, &snapshot[slot], &snapshot[slot]);
                         snapshot[slot].alive = false;
                         // `removed` is the view's authoritative gone: a dead body
                         // that is still in the level keeps resolving (arismoko/horizon#795).
@@ -371,6 +374,7 @@ impl Game<'_> {
                                     others_grid: Some(&grid),
                                     others_index: Some(&index),
                                     others_villagers: Some(&villager_slots),
+                                    village: Some(&village),
                                     species_slots: Some(&species_slots),
                                     others_solid: Some(&solid_slots),
                                     live_mobs: None,
@@ -514,6 +518,7 @@ impl Game<'_> {
                         others_grid: Some(&grid),
                         others_index: Some(&index),
                         others_villagers: Some(&villager_slots),
+                        village: Some(&village),
                         species_slots: Some(&species_slots),
                         others_solid: Some(&solid_slots),
                         difficulty,
@@ -725,6 +730,7 @@ impl Game<'_> {
                     // ServerLevel ticks entities one after another: the ones
                     // after this mob see it as it is now.
                     let fresh = seen(m, uuid, world_items!(self));
+                    village.mark(slot, &snapshot[slot], &fresh);
                     let reclassified = snapshot[slot].species != fresh.species;
                     snapshot[slot] = fresh;
                     if reclassified {
@@ -838,6 +844,7 @@ impl Game<'_> {
                 }
             }
             villager_slots.clear();
+            village = horizon_client::mobs::village_index::VillageIndex::default();
             species_slots = horizon_client::mobs::species_slots::SpeciesSlots::new(&snapshot);
             solid_slots.clear();
             for (slot, s) in snapshot.iter().enumerate() {
