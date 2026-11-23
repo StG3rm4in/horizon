@@ -9,6 +9,7 @@ horizon-client game::creatures::mob_islands::tests::actual_reaches_cover_links_v
 horizon-client game::creatures::mob_islands::tests::foreign_lookup_observes_serial_visibility_and_unwind by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
 horizon-client game::creatures::mob_islands::tests::islands_tick_their_mobs_as_one_thread_does by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
 horizon-client game::creatures::mob_islands::tests::mobs_on_their_own_random_leave_the_level_stream_alone by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
+horizon-client game::creatures::mob_islands::tests::static_mannequin_turns_match_the_borrowed_loop by-hand manual # upstream-parallel-mob-islands + prepared resources
 horizon-client game::creatures::mob_islands::tests::moved_riders_use_loaded_and_ticking_state_at_their_turn by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
 horizon-client game::creatures::mob_islands::tests::startup_and_turn_failures_release_lanes_and_preserve_payload by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
 horizon-client game::creatures::mob_islands::tests::verification_detects_snapshot_and_gaussian_only_differences by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources

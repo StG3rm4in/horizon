@@ -295,6 +295,9 @@ impl Group {
         }
         let position = self.mobs[i].position;
         let (bx, bz) = (position.x.floor() as i32, position.z.floor() as i32);
+        if self.static_mannequin_turn(i, bx, bz, turns, shared) {
+            return;
+        }
         let seen_guest = self.bind_guest(i);
         if !turns.base.world.loaded(bx, bz) {
             self.unloaded(i);
@@ -329,6 +332,83 @@ impl Group {
         };
         let player = (seen_guest, nearest_player, controlling);
         self.tick(i, player, difficulty, turns.base, shared);
+    }
+
+    /// The borrowed loop's shortcut, before any guest binding or full-tick preparation.
+    fn static_mannequin_turn(
+        &mut self,
+        i: usize,
+        bx: i32,
+        bz: i32,
+        turns: &Turns,
+        shared: &Shared,
+    ) -> bool {
+        let at = self.at(i);
+        let m = &mut self.mobs[i];
+        let position = m.position;
+        let world = turns.base.world;
+        if m.species() != Species::Mannequin
+            || m.extra.static_env_stamp
+                != Some((
+                    world.revision,
+                    [
+                        position.x.to_bits(),
+                        position.y.to_bits(),
+                        position.z.to_bits(),
+                    ],
+                    [m.width().to_bits(), m.height().to_bits()],
+                ))
+            || mod_api::__private::listened(mod_api::HookId::LivingChangeTarget)
+        {
+            return false;
+        }
+        if !world.loaded(bx, bz) || !(turns.ticking)(bx, bz) {
+            self.keep.push(true);
+            return true;
+        }
+        if (turns.canceled)(m.id) {
+            m.despawn = mod_api::Despawn::default();
+            self.keep.push(true);
+            return true;
+        }
+        let reach = (16.0 * f64::from(m.model_scale().max(1.0))).powi(2);
+        let near = |pos: Vec3| {
+            let dx = pos.x - position.x;
+            let dy = pos.y - position.y;
+            let dz = pos.z - position.z;
+            dx * dx + dy * dy + dz * dz < reach
+        };
+        if turns.nearest.at(at, position).is_some_and(near)
+            || self.player.as_ref().is_some_and(|p| {
+                p.alive && !p.spectator && near(p.position)
+            })
+        {
+            return false;
+        }
+        let bounds = m.bounds();
+        if self.pushes.has_for(m.id)
+            || self.grid.any_in(bounds, self.snapshot.len(), |idx| {
+                let o = &self.snapshot[idx as usize];
+                o.id != m.id && o.alive && o.pushable && o.bounds.intersects(bounds)
+            })
+            || !m.is_static_mannequin()
+            || position.y < f64::from(world.bottom_y() - 64)
+        {
+            return false;
+        }
+        m.despawn = mod_api::Despawn::default();
+        super::super::inventory_tick::equipment_inventory_tick(
+            world,
+            turns.base.facts,
+            shared.level_id,
+            &mut m.extra.equipment,
+        );
+        if !horizon_client::mobs::ai::tick_static_mannequin(m, world.revision, world.bottom_y()) {
+            return false;
+        }
+        self.ticked.insert(m.id);
+        self.keep.push(true);
+        true
     }
 
     /// The guest mob `i` sees now, kept in the bindings: none while no guest is on.

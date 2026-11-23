@@ -2930,6 +2930,41 @@ mod tests {
         first.unwrap()
     }
 
+    #[test]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
+    fn static_mannequin_turns_match_the_borrowed_loop() {
+        for (x, stale) in [(15.5_f64, false), (15.5, true), (110.5, false)] {
+            let mut game = separated_herds_game();
+            assert!(game.run_command(&format!("summon mannequin {x} 65 15.5")));
+            let revision = game.world.revision;
+            let m = game.mobs.last_mut().unwrap();
+            m.first_tick = false;
+            m.invulnerable_flag = true;
+            m.extra.immovable = true;
+            m.effects_dirty = false;
+            m.velocity = Vec3::ZERO;
+            m.previous = m.position;
+            m.on_ground = true;
+            assert!(m.is_static_mannequin());
+            let stamp = (
+                revision,
+                m.position.components().map(f64::to_bits),
+                [m.width().to_bits(), m.height().to_bits()],
+            );
+            m.extra.static_env_stamp = Some((
+                if stale { revision.wrapping_sub(1) } else { revision },
+                stamp.1,
+                stamp.2,
+            ));
+            let (id, age) = (m.id, m.age);
+            let groups = grouped_as_serial(&mut game, 1, "static mannequin", |_| {});
+            assert_eq!(groups, groups_for(3));
+            let m = game.mobs.iter().find(|m| m.id == id).unwrap();
+            assert_eq!(m.age, age + 1);
+            assert_eq!(m.extra.static_env_stamp, Some(stamp));
+        }
+    }
+
     /// A pet teleports to its owner (`FollowOwnerGoal`) from one herd into another: the plan joins
     /// it with the herd around its owner, and the herd far from both still ticks in a group of its
     /// own.
