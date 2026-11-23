@@ -1462,6 +1462,9 @@ struct Game<'a> {
     level_pass: levels::Pass,
     /// Nether portals: the player's, items' and mobs' (game/blocks/nether_portal.rs).
     portals: nether_portal::Portals,
+    /// The resident chunks still holding generation's postprocessing marks
+    /// (game/world/postprocess.rs), kept per level.
+    postprocess_marks: horizon_client::postprocess_marks::PostprocessMarks,
     /// The respawn point when it is not the world spawn or a bed: a respawn
     /// anchor (`game/blocks/respawn_anchor.rs`).
     respawn_config: Option<respawn_anchor::RespawnConfig>,
@@ -10962,6 +10965,7 @@ impl<'a> Game<'a> {
             levels: Default::default(),
             level_pass: Default::default(),
             portals: Default::default(),
+            postprocess_marks: Default::default(),
             respawn_config: None,
             end_portal_travel: false,
             win: None,
