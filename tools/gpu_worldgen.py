@@ -10,10 +10,18 @@
 ten zones of seed 12345 in the three dimensions (one of them a frozen ocean with icebergs) and compares every dump with a reference: by default the
 same build on the CPU, which is enough for a change that leaves the CPU path alone; otherwise dumps made by
 another build (`--refs DIR`; `--refs-probe` makes them, for example with a probe of pure upstream). The
-overworld runs on the CPU (against foreign references), with everything on the GPU and in the GPU test modes;
-the Nether and the End with everything on the GPU. Every GPU run must show the GPU at work (a
-`GPU final_density: N chunks` line with N > 0): a stage that fell back to the CPU would compare equal and
-prove nothing. The test modes compare each chunk with the CPU inside the probe; their mismatches must be 0.
+overworld runs on the CPU (against foreign references), with everything on the GPU, in the GPU test modes
+(the surface's among them) and with the GPU surface and the compact sections in their test mode (the
+surface's test mode builds no compact sections); the Nether and the End with everything on the GPU. Every GPU run must show every stage its dimension uses
+at work (`STAGE_WORK`: final_density and the carvers everywhere, the surface and the biomes in the overworld
+and the Nether, the compact sections and the ores in the overworld), and no batch or region failed: a stage
+that fell back to the CPU would compare equal and prove nothing. The test modes compare each chunk with the
+CPU inside the probe; their mismatches must be 0. The probe never runs the light: the GPU light is the
+server's (horizon-client-render), which `light` checks.
+
+`light` runs the tick digest (tools/tick_digest.py) of a server build on the CPU, then with every GPU stage:
+the two must be identical tick by tick, blocks and light of every section included on its full lines, with
+the GPU light at work and no chunk failed or sent back to the CPU.
 
 `verify` is the check before a commit: optionally rustfmt and clippy -D warnings (the upstream CI's two
 commands, and horizon-gpu without CUDA), then `probe`, the vanilla parity of
@@ -64,7 +72,10 @@ PROBE_GPU = {"HORIZON_GPU_DENSITY": "wait", "HORIZON_GPU_SURFACE": "1", "HORIZON
 # The test modes: every stage compared with the CPU inside the probe, the surface too (its test mode
 # computes the GPU surface and compares it, block by block, with the CPU's)
 PROBE_TEST = {"HORIZON_GPU_DENSITY": "wait", "HORIZON_GPU_SURFACE_TEST": "1", "HORIZON_GPU_ORES": "test",
-              "HORIZON_GPU_CAVES": "test", "HORIZON_GPU_SECTIONS": "test", "HORIZON_GPU_BIOMES": "test"}
+              "HORIZON_GPU_CAVES": "test", "HORIZON_GPU_BIOMES": "test"}
+# The compact sections are built from the GPU surface, which the surface's test mode does not keep: their
+# test mode gets a run of its own.
+PROBE_SECTIONS = {"HORIZON_GPU_DENSITY": "wait", "HORIZON_GPU_SURFACE": "1", "HORIZON_GPU_SECTIONS": "test"}
 SERVER_GPU = {"HORIZON_GPU_DENSITY": "1", "HORIZON_GPU_SURFACE": "1", "HORIZON_GPU_ORES": "1",
               "HORIZON_GPU_CAVES": "1", "HORIZON_GPU_LIGHT": "1", "HORIZON_GPU_SECTIONS": "1",
               "HORIZON_GPU_BIOMES": "1"}
@@ -76,6 +87,18 @@ ZONES = [("overworld", "0,0,15,15"), ("overworld", "-1250,940,-1235,955"),
          ("the_end", "0,0,7,7"), ("the_end", "1000,-1200,1015,-1185"), ("the_end", "-2600,300,-2585,315")]
 NOTICES = re.compile(r"disabled|not added last|without CUDA|NVRTC library|driver library|refused|panicked|^Error",
                      re.M)
+# What each stage writes when it worked (crates/horizon-gpu), and the dimensions whose zones use it: the
+# Nether's sections stay on the CPU, the End has neither surface rules, ores nor multi-noise biomes (its
+# carvers run, carving nothing).
+STAGE_WORK = {
+    "final_density": (r"GPU final_density: (\d+) chunks", ("overworld", "the_nether", "the_end")),
+    "surface": (r"GPU surface: (\d+) chunks", ("overworld", "the_nether")),
+    "sections": (r"compact sections: (\d+) chunks", ("overworld",)),
+    "ores": (r"GPU ores: (\d+) batches", ("overworld",)),
+    "caves": (r"GPU caves: (\d+) batches", ("overworld", "the_nether", "the_end")),
+    "biomes": (r"GPU biomes: [^;]*; (\d+) chunks from the GPU", ("overworld", "the_nether")),
+}
+FAILED = re.compile(r"\b([1-9]\d*) (?:blobs|batches|regions) failed")
 
 
 def env_with(extra):
@@ -132,13 +155,21 @@ def make_refs(probe, res, folder, jobs):
         sys.exit("making the references failed:\n" + bad[0][-2000:])
 
 
-def gpu_problems(err, mode):
-    """What a GPU run's stderr says went wrong: the GPU idle, test-mode mismatches, notices."""
+def gpu_problems(err, mode, dim):
+    """What a GPU run's stderr says went wrong: a stage its dimension uses idle, failed batches,
+    test-mode mismatches, notices."""
     problems = []
-    counts = [int(n) for n in re.findall(r"GPU final_density: (\d+) chunks", err)]
-    if mode in ("gpu", "test") and not any(n > 0 for n in counts):
-        problems.append("the GPU did no final_density work")
-    if mode == "test":
+    if mode in ("gpu", "test", "sections"):
+        for stage, (pattern, dims) in STAGE_WORK.items():
+            # The surface's test run builds no compact sections; the `sections` run has only these.
+            if (mode == "test" and stage == "sections") or (
+                    mode == "sections" and stage not in ("final_density", "surface", "sections")):
+                continue
+            if dim in dims and not any(int(n) > 0 for n in re.findall(pattern, err)):
+                problems.append(f"the GPU did no {stage} work")
+        problems += [line.strip()[:200] for line in err.splitlines()
+                     if line.startswith("GPU ") and FAILED.search(line)]
+    if mode in ("test", "sections"):
         for line in err.splitlines():
             if line.startswith("GPU ") and re.search(r"\b[1-9]\d* (?:mismatch|mismatches|differ)", line):
                 problems.append(line.strip()[:200])
@@ -169,11 +200,12 @@ def probe(args, built=None):
         sys.exit(f"missing references in {refs}: {', '.join(missing)}")
     runs = []
     for dim, zone in ZONES:
-        modes = ["gpu"] if dim != "overworld" else ["gpu", "test"]
+        modes = ["gpu"] if dim != "overworld" else ["gpu", "test", "sections"]
         if not own_refs:
             modes = ["cpu"] + modes
         runs += [(dim, zone, m) for m in modes]
-    envs = {"cpu": env_with({}), "gpu": env_with(PROBE_GPU), "test": env_with(PROBE_TEST)}
+    envs = {"cpu": env_with({}), "gpu": env_with(PROBE_GPU), "test": env_with(PROBE_TEST),
+            "sections": env_with(PROBE_SECTIONS)}
 
     def one(run):
         dim, zone, mode = run
@@ -182,7 +214,7 @@ def probe(args, built=None):
         same = filecmp.cmp(target, refs / ref_name(dim, zone), shallow=False)
         target.unlink()
         (out / f"{dim}.{zone}.{mode}.err").write_text(err)
-        return run, same, gpu_problems(err, mode) if mode != "cpu" else [
+        return run, same, gpu_problems(err, mode, dim) if mode != "cpu" else [
             line for line in err.splitlines() if "panicked" in line or line.startswith("Error")]
 
     t = time.time()
@@ -207,6 +239,39 @@ def probe(args, built=None):
     for line in lines:
         print(line, flush=True)
     return ok, lines
+
+
+# ---------------------------------------------------------------------------------------------- light
+
+def light(args):
+    """The GPU light against the CPU's, through the tick digest of a server build."""
+    work = Path(args.work) if args.work else ROOT / ".local" / "gpu-light"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    common = ["--bin", args.bin, "--ticks", str(args.ticks), "--players", str(args.players), "--join-every", "2",
+              "--full", "50", "--work", str(work)]
+    # The serial tick: the parallel one is the tick digest's own business.
+    env = {k: v for k, v in os.environ.items() if k != "HORIZON_PARALLEL_TICK"}
+    for name, extra in (("cpu", []), ("gpu", ["--gpu"])):
+        print(f"== tick digest, {name}", flush=True)
+        code, outp = run_capture([sys.executable, str(ROOT / "tools" / "tick_digest.py"), "run", *common, *extra,
+                                  "--out", str(work / name)], env=env)
+        if code != 0:
+            sys.exit(f"the {name} run failed:\n" + "\n".join(outp.splitlines()[-20:]))
+    code, outp = run_capture([sys.executable, str(ROOT / "tools" / "tick_digest.py"), "compare",
+                              str(work / "cpu" / "digest.txt"), str(work / "gpu" / "digest.txt")])
+    same = code == 0
+    log = (work / "gpu" / "logs" / "latest.log").read_text(errors="replace")
+    stats = re.findall(r"GPU light: (\d+) chunks.*?(\d+) failed, (\d+) fell back to the CPU", log)
+    worked = bool(stats) and int(stats[-1][0]) > 0
+    clean = bool(stats) and stats[-1][1] == "0" and stats[-1][2] == "0"
+    print(f"== digest CPU against every GPU stage: {'IDENTICAL' if same else 'DIFFERENT'}")
+    print("\n".join(outp.splitlines()[-6:]))
+    last = [line for line in log.splitlines() if "GPU light:" in line][-1:]
+    print(f"== {last[0].split('GPU light:', 1)[1].strip()[:200] if last else 'no GPU light line'}")
+    ok = same and worked and clean
+    print(f"== verdict: {'OK' if ok else 'FAILED'}")
+    return 0 if ok else 1
 
 
 # --------------------------------------------------------------------------------------------- verify
@@ -798,6 +863,12 @@ def main():
     p.add_argument("--freeze", action="store_true",
                    help="/tick freeze before /pregen: no block, fluid or entity ticks during it")
     p.add_argument("--json", help="write every pass as JSON")
+    p = sub.add_parser("light", help="the GPU light against the CPU's, through the tick digest")
+    p.add_argument("--bin", default=str(ROOT / "target" / "release"),
+                   help="folder with horizon-server and horizon-client (default target/release)")
+    p.add_argument("--ticks", type=int, default=600)
+    p.add_argument("--players", type=int, default=100)
+    p.add_argument("--work", help="where the two runs go (default .local/gpu-light)")
     p = sub.add_parser("compare-worlds", help="blocks and biomes of two saved worlds, chunk by chunk")
     p.add_argument("a")
     p.add_argument("b")
@@ -815,6 +886,8 @@ def main():
         return verify(args)
     if args.command == "pregen":
         return pregen(args)
+    if args.command == "light":
+        return light(args)
     return compare_worlds(args)
 
 

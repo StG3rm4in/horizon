@@ -769,6 +769,10 @@ impl Game<'_> {
         world.shape = self.level_shapes.get(dim.id());
         world.fast_lava = self.dimension_type_of(dim).fast_lava;
         world.infiniburn = Some(self.resolve_level_infiniburn(self.dimension_type_of(dim)));
+        // The exactness harness reads every level's block writes (dedicated/tick_digest.rs).
+        if self.tick_digest_writes() {
+            world.digest_writes = Some(Vec::new());
+        }
         let tickets = ChunkTickets::with_saved_portal(save.load_portal_tickets());
         Ok(Parked {
             world,
@@ -1324,6 +1328,11 @@ impl Game<'_> {
             }
             #[cfg(feature = "state-digest")]
             self.state_digest_tick(dim, running);
+            // The exactness harness's parts of a level put back out of place before the tick's
+            // digest line (dedicated/tick_digest/parts.rs); nothing while it is off.
+            if k > 0 {
+                self.tick_digest_level(dim);
+            }
             horizon_client::spans::time("server_debug", || self.publish_server_debug(dim));
             // An entity that crossed into a level that already ticked this
             // server tick is in it when the tick ends (`addDuringTeleport`).

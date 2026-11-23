@@ -25,7 +25,8 @@
 //! regions) and the chunk goes to the CPU; any other CUDA error, or no memory even for 8 regions,
 //! turns the stage off for the session.
 //!
-//! Build: the `cuda` feature (on by default in horizon-world, horizon-client-render and the game)
+//! Build: the `cuda` feature (on by default in horizon-client-render and the game, which turn it on
+//! in horizon-world; the probe and the parity tool, which build horizon-world alone, ask for it)
 //! compiles the CUDA backend. It needs no CUDA toolkit: the bindings are those of CUDA 13.4, and the
 //! driver and NVRTC libraries (CUDA 11 to 13) are loaded at run time. Without the feature (the
 //! server build with `--no-default-features`, unless it adds `--features cuda`), `cuda_off.rs`
@@ -194,7 +195,7 @@ impl std::fmt::Debug for GpuFinalDensity {
 }
 
 impl GpuFinalDensity {
-    /// `None` if `HORIZON_GPU_DENSITY` is unset or 0, or if a graph node has no CUDA translation.
+    /// `None` unless `HORIZON_GPU_DENSITY` is `1` or `wait`, or if a graph node has no CUDA translation.
     /// `cpu` is the reference sampler of the self-test. A legacy random source (the Nether, the
     /// End) only changes how the compiler draws its noises, which the GPU reads from it.
     pub fn new(
@@ -209,7 +210,13 @@ impl GpuFinalDensity {
         aquifer: Option<AquiferSetup>,
     ) -> Option<Self> {
         let mode = std::env::var("HORIZON_GPU_DENSITY").ok()?;
-        if mode.is_empty() || mode == "0" {
+        // `1` or `wait`, as the other stages take `1` or `test`: `false` or `off` keep the CPU too.
+        if mode != "1" && mode != "wait" {
+            if !mode.is_empty() && mode != "0" {
+                log::warn!(
+                    "HORIZON_GPU_DENSITY={mode}: neither 1 nor wait, final_density stays on the CPU"
+                );
+            }
             return None;
         }
         let _ = legacy;
