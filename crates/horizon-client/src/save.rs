@@ -135,6 +135,65 @@ pub fn chunks_with_block_entities<'a, N: std::hash::BuildHasher>(
         .collect()
 }
 
+/// [`chunks_with_block_entities`] for the level's own block entities, each chunk's found through
+/// their index by chunk ([`BlockEntities::in_chunk`]) instead of a scan of every block entity of
+/// the level: `saveChunksEagerly` snapshots up to twenty chunks a tick one at a time, and each
+/// snapshot scanned the tens of thousands of block entities a crowded level holds. The names are
+/// read as there. Each chunk gets the same block entities: the index lists exactly the map's
+/// positions, by chunk (one taken out for its tick is in neither). Their order in a chunk's list
+/// is the index's where it was the map's, and neither means anything: the map's hasher is seeded
+/// at random in every process.
+///
+/// [`BlockEntities::in_chunk`]: crate::block_entities::BlockEntities::in_chunk
+pub fn chunks_with_indexed_block_entities<'a, N: std::hash::BuildHasher>(
+    chunks: impl IntoIterator<Item = &'a Arc<Chunk>>,
+    entities: &crate::block_entities::BlockEntities,
+    names: &HashMap<(i32, i32, i32), Tag, N>,
+) -> Vec<Chunk> {
+    let chunks: Vec<_> = chunks.into_iter().collect();
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    // A chunk's own block entities, each cloned once.
+    let own = |c: &Chunk| -> Vec<_> {
+        entities
+            .in_chunk((c.x, c.z))
+            .filter_map(|p| Some((*p, entities.get(p)?.clone())))
+            .collect()
+    };
+    if chunks.len() == 1 {
+        let mut c = (**chunks[0]).clone();
+        c.block_entities = own(&c);
+        c.block_names = names
+            .iter()
+            .filter(|(p, _)| p.0 >> 4 == c.x && p.2 >> 4 == c.z)
+            .map(|(p, n)| (*p, n.clone()))
+            .collect();
+        return vec![c];
+    }
+    // The names grouped by chunk in one pass over them, as `chunks_with_block_entities` does.
+    let mut grouped = crate::fast_hash::FxHashMap::<_, Vec<_>>::default();
+    grouped.reserve(chunks.len());
+    for c in &chunks {
+        grouped.entry((c.x, c.z)).or_default();
+    }
+    for (p, n) in names {
+        if let Some(entries) = grouped.get_mut(&(p.0 >> 4, p.2 >> 4)) {
+            entries.push((p, n));
+        }
+    }
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let mut c = (**chunk).clone();
+            c.block_entities = own(&c);
+            let names = &grouped[&(c.x, c.z)];
+            c.block_names = names.iter().map(|(p, n)| (**p, (*n).clone())).collect();
+            c
+        })
+        .collect()
+}
+
 use crate::block_entity_nbt::component as nbt_component;
 use horizon_client_core::nbt_value::string;
 pub use horizon_client_core::nbt_value::{float, number, text};

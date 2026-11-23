@@ -6281,7 +6281,10 @@ impl Game<'_> {
         &self,
         chunks: impl IntoIterator<Item = &'a Arc<horizon_client::chunk::Chunk>>,
     ) -> Vec<Arc<horizon_client::chunk::Chunk>> {
-        horizon_client::save::chunks_with_block_entities(
+        // Each chunk's block entities through the map's index by chunk: the eager saves take up
+        // to twenty snapshots a tick, one chunk each, and a scan of every block entity of the
+        // level for each was most of their cost.
+        horizon_client::save::chunks_with_indexed_block_entities(
             chunks,
             &self.world.block_entities,
             &self.world.block_names,

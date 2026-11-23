@@ -1790,6 +1790,83 @@ fn save_batch_preserves_order_coordinates_and_ownership() {
     assert_eq!(source.block_entities[0].0, (99, 0, 99));
 }
 
+/// The snapshots read through the block entities' index by chunk hold, chunk by chunk, what the
+/// scan of every block entity gives with the same map (the order of a chunk's list aside, which
+/// was the map's): over chunk edges and negative coordinates, for no chunk, one, and a batch with
+/// a repeated chunk and one that holds nothing, with a block entity out for its tick, one removed
+/// and one asleep. The names are the scan's, in its order.
+#[test]
+fn indexed_snapshots_hold_what_a_scan_of_every_block_entity_finds() {
+    use crate::block_entities::BlockEntities;
+    use crate::containers::BlockEntity;
+    let name = |text: String| Tag::String(text.as_str().into());
+    let mut entities = BlockEntities::default();
+    let mut names = HashMap::new();
+    for x in [-33i32, -17, -16, -1, 0, 15, 16, 31, 47] {
+        for z in [-17i32, -16, -1, 0, 15, 16] {
+            for y in [-64i32, 64, 300] {
+                let p = (x, y, z);
+                let slots = 1 + x.rem_euclid(5) as usize;
+                entities.insert(p, BlockEntity::Chest(vec![None; slots]));
+                if (x + y + z).rem_euclid(3) == 0 {
+                    names.insert(p, name(format!("container {x},{y},{z}")));
+                }
+            }
+        }
+    }
+    names.insert((-2, 80, -3), name("orphan name".to_owned()));
+    // One out for its tick and one removed are in neither the map nor the index; one asleep is.
+    let (_lease, _) = entities.take(&(0, 64, 0)).unwrap();
+    assert!(entities.remove(&(15, 64, 15)).is_some());
+    entities.sleep((16, 64, 16));
+    let batch: Vec<Arc<Chunk>> = [
+        (0, 0),
+        (-1, -1),
+        (1, 1),
+        (0, 0),
+        (2, -2),
+        (-3, 0),
+        (100, 100),
+    ]
+    .into_iter()
+    .map(|(x, z)| Arc::new(Chunk::empty(x, z)))
+    .collect();
+    let sorted = |c: &Chunk| {
+        let mut v: Vec<_> = (c.block_entities.iter())
+            .map(|(p, e)| (*p, format!("{e:?}")))
+            .collect();
+        v.sort();
+        v
+    };
+    for input in [&batch[..0], &batch[..1], &batch[1..2], &batch[..]] {
+        let indexed = chunks_with_indexed_block_entities(input, &entities, &names);
+        let scanned = chunks_with_block_entities(input, &*entities, &names);
+        assert_eq!(indexed.len(), input.len());
+        assert_eq!(scanned.len(), input.len());
+        for ((i, s), original) in indexed.iter().zip(&scanned).zip(input) {
+            assert_eq!((i.x, i.z), (original.x, original.z));
+            assert_eq!(sorted(i), sorted(s), "chunk {}, {}", i.x, i.z);
+            assert_eq!(i.block_names, s.block_names);
+            assert!(Arc::ptr_eq(&i.sections[0], &original.sections[0]));
+        }
+    }
+    // Not only empty lists were compared.
+    let all = chunks_with_indexed_block_entities(&batch, &entities, &names);
+    assert!(all.iter().filter(|c| c.block_entities.len() > 2).count() >= 4);
+    assert!(all.iter().any(|c| !c.block_names.is_empty()));
+    assert!(all[0].block_entities.iter().all(|(p, _)| *p != (0, 64, 0)));
+    assert!(
+        all.iter()
+            .all(|c| c.block_entities.iter().all(|(p, _)| *p != (15, 64, 15)))
+    );
+    assert!(
+        all[2]
+            .block_entities
+            .iter()
+            .any(|(p, _)| *p == (16, 64, 16))
+    );
+}
+
 #[test]
 fn work_shared_out_is_all_done_in_order_when_no_helper_can_start() {
     use super::share_out;
