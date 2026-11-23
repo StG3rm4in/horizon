@@ -1118,7 +1118,17 @@ impl Game<'_> {
         // vibration or a death: their tick would change nothing, so they
         // are passed over here (a vibration scheduled during these ticks is
         // chosen on the next tick at the earliest, as in vanilla).
+        //
+        // One found idle sleeps (`BlockEntities::sleep`), and a sleeping one is passed over
+        // without its block entity being read: a hashed look-up of the map and a read of the
+        // boxed entity, out of cache for each of the thousands of sculk blocks a level can hold,
+        // every tick. Every change to a block entity (a vibration heard, a charge taken, its data
+        // written, its removal or replacement, its chunk unloaded or loaded again, its block
+        // state set) goes through the map's mutable access, which wakes it: a sleeping one is
+        // still the idle one it was found to be. They sleep before any of the ticks below, which
+        // may wake them again.
         let entities = &self.world.block_entities;
+        let mut idle = Vec::new();
         let due: Vec<((i32, i32, i32), bool)> = self
             .sculk
             .index
@@ -1126,16 +1136,20 @@ impl Game<'_> {
             .filter_map(|&key| {
                 let (cx, cz) = (key.0 >> 4, key.2 >> 4);
                 // `LevelChunk.isTicking`: its own chunk's entities loaded too.
-                if !ticks(cx, cz)
-                    || pending.contains(&(cx, cz))
-                    || matches!(entities.get(&key), Some(BlockEntity::Sculk(e)) if e.idle())
-                {
+                if !ticks(cx, cz) || pending.contains(&(cx, cz)) || entities.is_asleep(&key) {
+                    return None;
+                }
+                if matches!(entities.get(&key), Some(BlockEntity::Sculk(e)) if e.idle()) {
+                    idle.push(key);
                     return None;
                 }
                 let adjacent = (-1..=1).all(|dx| (-1..=1).all(|dz| ticks(cx + dx, cz + dz)));
                 Some((key, adjacent))
             })
             .collect();
+        for key in idle {
+            self.world.block_entities.sleep(key);
+        }
         for (key, adjacent) in due {
             self.tick_sculk_block(key, adjacent)?;
         }
@@ -2809,6 +2823,103 @@ mod tests {
             assert_eq!(info.event, "minecraft:step");
             assert_eq!(info.source, Some(Who::Player.into()));
         });
+    }
+
+    /// A sculk block entity found idle sleeps, and is passed over without being read until
+    /// something changes it: two runs of the same sensors, shrieker and catalyst, with the same
+    /// game events and charge, one of them waking every block entity before each tick (so the
+    /// walk reads every one, as it did before they slept), leave the same block entities and
+    /// blocks after every tick. A sleeping one is always idle, and one that hears an event wakes.
+    #[test]
+    #[ignore = "daily"]
+    fn idle_sculk_sleeps_until_changed_and_ticks_as_when_every_one_is_read() {
+        use crate::game::native_entity_refs::tests::with_game;
+        use horizon_client::{chunk::Chunk, motion::PlayerMotion};
+        use horizon_core::{
+            geometry::Vec3,
+            random::{LegacyRandom, LevelRandom},
+        };
+        use std::sync::Arc;
+
+        const BLOCKS: [((i32, i32, i32), &str); 5] = [
+            ((1, 64, 1), "minecraft:sculk_sensor"),
+            ((20, 64, 3), "minecraft:sculk_sensor"),
+            ((9, 64, -9), "minecraft:calibrated_sculk_sensor"),
+            ((5, 64, 9), "minecraft:sculk_shrieker"),
+            ((-12, 64, 6), "minecraft:sculk_catalyst"),
+        ];
+        let run = |sleeping: bool| {
+            let mut rows = Vec::new();
+            let mut slept = 0;
+            with_game(|game| {
+                game.options.dedicated = Some(Vec::new());
+                game.sculk_prepare();
+                for cx in -2..=2 {
+                    for cz in -2..=2 {
+                        let mut chunk = Chunk::empty(cx, cz);
+                        chunk.lit = true;
+                        game.world.chunks.insert((cx, cz), Arc::new(chunk));
+                    }
+                }
+                game.player =
+                    Some(PlayerMotion::new(game.motion, Vec3::new(8.5, 65.0, 8.5)).unwrap());
+                game.update_chunk_tickets();
+                game.world.random = LevelRandom::for_level(LegacyRandom::new(12345));
+                game.world.game_time = 1000;
+                let registry = game.pack.assets.registry;
+                // A stone floor for the catalyst's charge to spread over.
+                let stone = registry.default_state("minecraft:stone").unwrap();
+                for x in -24..8 {
+                    for z in -8..24 {
+                        game.world.set(x, 63, z, stone).unwrap();
+                    }
+                }
+                for (at, name) in BLOCKS {
+                    let state = registry.default_state(name).unwrap();
+                    game.world.set(at.0, at.1, at.2, state).unwrap();
+                }
+                game.sculk_sync_index();
+                let place = "minecraft:block_place";
+                for tick in 0..80 {
+                    game.world.game_time += 1;
+                    match tick {
+                        3 | 40 => game.post_block_game_event(place, [3, 64, 1], None, None),
+                        9 => game.post_block_game_event(place, [17, 64, 3], None, None),
+                        15 => game.post_block_game_event(place, [9, 64, -6], None, None),
+                        20 => assert!(game.catalyst_takes_experience([-11.5, 64.0, 6.5], |_| 30)),
+                        _ => {}
+                    }
+                    if sleeping && tick == 3 {
+                        // Asleep since the first tick, woken by the event it heard.
+                        assert!(!game.world.block_entities.is_asleep(&(1, 64, 1)));
+                    }
+                    if !sleeping {
+                        game.world.block_entities.values_mut().count();
+                    }
+                    game.tick_sculk_blocks().unwrap();
+                    for (at, _) in BLOCKS {
+                        let Some(BlockEntity::Sculk(e)) = game.world.block_entities.get(&at) else {
+                            panic!("{at:?} lost its block entity");
+                        };
+                        let asleep = game.world.block_entities.is_asleep(&at);
+                        if asleep {
+                            assert!(e.idle(), "{at:?} sleeps while busy at tick {tick}");
+                            slept += usize::from(sleeping);
+                        }
+                        // Nothing happened before tick 3: every one sleeps.
+                        assert!(!sleeping || tick >= 3 || asleep, "{at:?} awake at tick {tick}");
+                        let state = game.world.block(at.0, at.1, at.2);
+                        rows.push(format!("{tick} {at:?} {state:?} {e:?}"));
+                    }
+                    rows.push(format!("{tick} revision {}", game.world.revision));
+                }
+            });
+            (rows, slept)
+        };
+        let (asleep, slept) = run(true);
+        let (awake, _) = run(false);
+        assert!(slept > 200, "only {slept} sleeping block entities seen");
+        assert_eq!(asleep, awake);
     }
 
     /// `vanilla_game_event` hears `GameEvent.Context.affectedState`: the state a context
