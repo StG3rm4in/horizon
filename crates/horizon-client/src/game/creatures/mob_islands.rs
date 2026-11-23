@@ -1008,8 +1008,8 @@ fn reaches_why(
             + locomotion(m).ok_or_else(|| Unbounded::of(Verdict::UnboundedLocomotion, m, s.id))?
             + SLACK;
         let mut body = grow(s.bounds, motion);
-        // ...then the drop to the ground below the landing, as deep as the world goes.
-        if meal.is_some() {
+        // Endermen and teleporting meals search down to the world's bottom.
+        if meal.is_some() || s.species == Species::Enderman {
             let floor = f64::from(i32::MIN);
             body = union_box(
                 body,
@@ -2280,6 +2280,9 @@ mod tests {
     #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
     fn actual_reaches_cover_links_villages_and_bounded_moves() {
         let mut game = super::super::super::native_machines::tests::server_game();
+        game.spawn_mob("minecraft:enderman", [0.5, 180.0, 0.5], true, SpawnSite::Plain)
+            .unwrap();
+        let enderman = game.mobs.pop().unwrap();
         game.spawn_mob("minecraft:cow", [0.5, 65.0, 0.5], true, SpawnSite::Plain)
             .unwrap();
         let kind = Arc::clone(&game.mobs[0].kind);
@@ -2381,6 +2384,15 @@ mod tests {
         mobs[0].extra.owner = Some([0, 0, 0, 8]);
         assert_eq!(plan(&mobs, &snapshot).groups.len(), 4, "no such owner here");
         mobs[0] = unchanged.clone();
+        // A nearby teleport candidate can land far below the enderman.
+        let watch = [enderman.seen(None, game.items())];
+        let reach = reaches(std::slice::from_ref(&enderman), &watch, &turns, &owners).unwrap();
+        let landing = enderman.bounds_at(Vec3::new(20.5, 65.0, 0.5));
+        assert!(enderman.position.y - landing.min(Axis::Y) > jump(Species::Enderman));
+        for axis in [Axis::X, Axis::Y, Axis::Z] {
+            assert!(reach[0].body.min(axis) <= landing.min(axis));
+            assert!(reach[0].body.max(axis) >= landing.max(axis));
+        }
         // Chorus fruit: half its 16-block diameter around the mob, and down to the world's floor.
         mobs[0]
             .extra
