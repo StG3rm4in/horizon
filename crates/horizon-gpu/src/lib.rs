@@ -40,10 +40,15 @@
 //! slightest difference or CUDA error, final_density and the aquifers stay on the CPU. The
 //! self-test covers final_density only: the other stages are checked by their `test` values and
 //! the parity harness, not at startup.
+//!
+//! Outside chunk generation, `locate` answers the biome searches of the tick thread
+//! (`HORIZON_GPU_LOCATE`: `/locate biome`, `findClosestBiome3d`, the map previews) with the
+//! climate of the biome stage, for the CPU to replay in each search's order.
 mod biomes;
 mod caves;
 mod codegen;
 mod light;
+mod locate;
 
 // The CUDA API: cudarc with the `cuda` feature, else a stand-in that reports CUDA as absent.
 #[cfg(feature = "cuda")]
@@ -55,6 +60,7 @@ use cuda_off as cuda;
 
 pub use biomes::{BiomeGpu, BiomeTree};
 pub use light::{LightGpu, LightInput, LightJob, LightSection};
+pub use locate::{LOCATE_BATCH, LocateGpu, LocateSamples};
 
 pub use caves::{
     CAVE_CANYON, CAVE_MASK_WORDS, CAVE_ROOM, CAVE_TUNNEL, CaveGpu, CaveItem, CaveJob, CaveTarget,

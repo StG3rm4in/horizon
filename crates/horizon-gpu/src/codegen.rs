@@ -227,6 +227,24 @@ impl<'a> Gen<'a> {
     /// V[j * step + k] for root k. As in `surface_descent`, the Y-free subgraphs are computed once
     /// before the loop, and shared between the roots (the same node, only once).
     fn column_points(&mut self, name: &str, roots: &[FunctionId]) -> R<String> {
+        self.column_function(name, roots, "int qy0, int nqy", "(qy0 + j)")
+    }
+    /// `__device__ void NAME(int x, int z, const int *QY, int nqy, float *V, long step)`: the
+    /// same at the Y quarts QY[j] of the column, which need not follow each other (the heights of
+    /// a biome search, `locate.cu`).
+    fn column_layers(&mut self, name: &str, roots: &[FunctionId]) -> R<String> {
+        self.column_function(name, roots, "const int *QY, int nqy", "QY[j]")
+    }
+    /// `column_points` and `column_layers`: `layers` declares the Y quarts of the column, `quart`
+    /// is the j-th. `column_points`'s code is the same as before this split, character for
+    /// character, so the biome region module keeps its PTX cache key.
+    fn column_function(
+        &mut self,
+        name: &str,
+        roots: &[FunctionId],
+        layers: &str,
+        quart: &str,
+    ) -> R<String> {
         let previous_mode = std::mem::replace(&mut self.point_mode, true);
         let previous_hoisted = self.hoisted.replace(Vec::new());
         let mut loop_ssa = Ssa::default();
@@ -260,7 +278,7 @@ impl<'a> Gen<'a> {
             writeln!(writes, "    V[j * step + {k}] = {v};")?;
         }
         Ok(format!(
-            "__device__ __noinline__ void {name}(int x, int z, int qy0, int nqy, float *V, long step) {{\n  int y = 0;\n{prelude}  for (int j = 0; j < nqy; ++j) {{\n    int y = (int)((unsigned)(qy0 + j) << 2);\n{loop_ssa}{writes}  }}\n}}",
+            "__device__ __noinline__ void {name}(int x, int z, {layers}, float *V, long step) {{\n  int y = 0;\n{prelude}  for (int j = 0; j < nqy; ++j) {{\n    int y = (int)((unsigned){quart} << 2);\n{loop_ssa}{writes}  }}\n}}",
             loop_ssa = loop_ssa.code
         ))
     }
@@ -1507,6 +1525,28 @@ pub(crate) fn generate_biomes(c: &DensityCompiler, roots: [FunctionId; 6], seed:
     let column = g.column_points("cl_column", &roots)?;
     Ok(format!(
         "{}{BASE}\n{OPS}\n{}\n{column}\n{BIOMES}",
+        tables_cuda(&g)?,
+        g.defs
+    ))
+}
+
+const LOCATE: &str = include_str!("locate.cu");
+
+/// CUDA of the biome searches (`LocateGpu`): the six climate roots at listed Y quarts of a column
+/// (`cl_layers`, see `Gen::column_layers`), then the kernels of `locate.cu`.
+pub(crate) fn generate_locate(c: &DensityCompiler, roots: [FunctionId; 6], seed: i64) -> R<String> {
+    let mut g = Gen::new(
+        c,
+        Grid {
+            sizes: [1, 1, 1],
+            step: [1, 1, 1],
+        },
+        None,
+        seed,
+    );
+    let column = g.column_layers("cl_layers", &roots)?;
+    Ok(format!(
+        "{}{BASE}\n{OPS}\n{}\n{column}\n{LOCATE}",
         tables_cuda(&g)?,
         g.defs
     ))
