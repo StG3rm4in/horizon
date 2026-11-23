@@ -227,23 +227,42 @@ impl MobWorld<'_> {
             .map(|shape| shape.boxes().iter().map(|b| b.move_by(offset)).collect())
             .unwrap_or_default()
     }
-    /// Whether the block's collision shape (empty context) has a box meeting `area`.
-    fn block_collides_with(&self, x: i32, y: i32, z: i32, area: Aabb) -> bool {
+    /// Whether the collision shape (empty context) of `state`, the block at `[x, y, z]`, has a
+    /// box meeting `area`. A state without a contextual rule has its cached shape under every
+    /// context (`collision_shape_with_context` hands out a clone of it), which is read in place;
+    /// any other state's shape is asked for as before.
+    fn block_collides_with(&self, state: BlockStateId, [x, y, z]: [i32; 3], area: Aabb) -> bool {
         let offset = Vec3::new(f64::from(x), f64::from(y), f64::from(z));
-        self.block_shape(x, y, z).is_some_and(|shape| {
+        let meets = |shape: &horizon_core::geometry::VoxelShape| {
             shape
                 .boxes()
                 .iter()
                 .any(|b| b.move_by(offset).intersects(area))
-        })
+        };
+        if !self.collision.has_context_rule(state)
+            && let Ok(Some(shape)) = self.collision.cached_shapes().cached_shape(state)
+        {
+            return meets(shape);
+        }
+        self.state_shape(state, x, y, z)
+            .is_some_and(|shape| meets(&shape))
     }
     fn block_shape(&self, x: i32, y: i32, z: i32) -> Option<horizon_core::geometry::VoxelShape> {
+        self.state_shape(self.world.block(x, y, z), x, y, z)
+    }
+    /// [`Self::block_shape`] for `state`, the block read at `(x, y, z)`.
+    fn state_shape(
+        &self,
+        state: BlockStateId,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Option<horizon_core::geometry::VoxelShape> {
         let mut scene = SceneCollisions {
             world: self.world,
             binding: self.collision,
             subject: None,
         };
-        let state = self.world.block(x, y, z);
         let at = horizon_core::position::BlockPos::new(x, y, z);
         let context = horizon_world::collision_context::CollisionContext::empty(false);
         self.collision
@@ -301,7 +320,8 @@ impl MobWorld<'_> {
                     {
                         continue;
                     }
-                    if !self.block_collides_with(x, y, z, area) {
+                    // The state just read: the chunk is the one `World::block` reads.
+                    if !self.block_collides_with(state, [x, y, z], area) {
                         continue;
                     }
                     let d = (f64::from(x) + 0.5 - from.x).powi(2)
@@ -3876,6 +3896,178 @@ mod climbable_tests;
 #[cfg(test)]
 #[path = "ice_friction_tests.rs"]
 mod ice_friction_tests;
+#[cfg(test)]
+mod support_shape_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    impl MobWorld<'_> {
+        /// `supporting_block` as it was before it read fixed shapes in place: each candidate's
+        /// state read again by `block_shape` and its shape cloned.
+        fn supporting_block_by_clones(&self, area: Aabb, from: Vec3) -> Option<[i32; 3]> {
+            use horizon_core::geometry::Axis;
+            let range = |axis| {
+                (area.min(axis) - 1.0e-7).floor() as i32 - 1
+                    ..=(area.max(axis) + 1.0e-7).floor() as i32 + 1
+            };
+            let meets = |axis, c: i32| {
+                let c = f64::from(c);
+                c < area.max(axis) && c + 1.0 > area.min(axis)
+            };
+            let (rx, ry, rz) = (range(Axis::X), range(Axis::Y), range(Axis::Z));
+            let outer = self.world.may_hold(
+                [*rx.start(), *ry.start(), *rz.start()],
+                [*rx.end(), *ry.end(), *rz.end()],
+                |s| self.collision.reaches_out(s),
+            );
+            let mut best: Option<(f64, [i32; 3])> = None;
+            for x in rx {
+                for z in rz.clone() {
+                    let column = meets(Axis::X, x) && meets(Axis::Z, z);
+                    if !outer && !column {
+                        continue;
+                    }
+                    let Some(chunk) = self.world.chunks.get(&(x >> 4, z >> 4)) else {
+                        continue;
+                    };
+                    for y in ry.clone() {
+                        if !outer && !meets(Axis::Y, y) {
+                            continue;
+                        }
+                        let state = chunk.block(x & 15, y, z & 15);
+                        let Ok(block) = self.collision.collision_block(state) else {
+                            continue;
+                        };
+                        if !(block.large_collision_shape
+                            || block.moving_piston
+                            || (column && meets(Axis::Y, y)))
+                        {
+                            continue;
+                        }
+                        let offset = Vec3::new(f64::from(x), f64::from(y), f64::from(z));
+                        let collides = self.block_shape(x, y, z).is_some_and(|shape| {
+                            shape
+                                .boxes()
+                                .iter()
+                                .any(|b| b.move_by(offset).intersects(area))
+                        });
+                        if !collides {
+                            continue;
+                        }
+                        let d = (f64::from(x) + 0.5 - from.x).powi(2)
+                            + (f64::from(y) + 0.5 - from.y).powi(2)
+                            + (f64::from(z) + 0.5 - from.z).powi(2);
+                        let greater = |b: [i32; 3]| (y, z, x) > (b[1], b[2], b[0]);
+                        if best.is_none_or(|(bd, b)| d < bd || d == bd && greater(b)) {
+                            best = Some((d, [x, y, z]));
+                        }
+                    }
+                }
+            }
+            best.map(|(_, p)| p)
+        }
+    }
+
+    /// The blocks a floor of the test is made of: full and partial blocks, blocks reaching out of
+    /// their cell (fences, walls), shapes offset by position (bamboo, dripstone), contextual ones
+    /// (scaffolding, powder snow, fluids), a block entity's (a shulker box) and plants.
+    const FLOOR: [&str; 20] = [
+        "minecraft:stone",
+        "minecraft:oak_slab",
+        "minecraft:oak_stairs",
+        "minecraft:oak_fence",
+        "minecraft:cobblestone_wall",
+        "minecraft:bamboo",
+        "minecraft:pointed_dripstone",
+        "minecraft:scaffolding",
+        "minecraft:powder_snow",
+        "minecraft:water",
+        "minecraft:lava",
+        "minecraft:snow",
+        "minecraft:farmland",
+        "minecraft:soul_sand",
+        "minecraft:honey_block",
+        "minecraft:shulker_box",
+        "minecraft:chest",
+        "minecraft:glass_pane",
+        "minecraft:short_grass",
+        "minecraft:air",
+    ];
+
+    /// Thin areas under boxes of every width, at random spots over a floor of mixed blocks two
+    /// layers deep (fences on top reach into the layer above): the support found reading fixed
+    /// shapes in place is the one found cloning every candidate's shape. Needs the prepared
+    /// resources.
+    #[test]
+    #[ignore = "daily"]
+    fn support_read_in_place_is_the_support_cloned_shapes_find() {
+        let mut seed = 0x243F_6A88_85A3_08D3u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut picks: Vec<u64> = (0..2 * 40 * 40).map(|_| next(FLOOR.len() as u64)).collect();
+        let build = |world: &mut crate::world::World,
+                     registry: &horizon_world::registry::BlockRegistry| {
+            for cx in -2..=1 {
+                for cz in -2..=1 {
+                    world
+                        .chunks
+                        .insert((cx, cz), Arc::new(crate::chunk::Chunk::empty(cx, cz)));
+                }
+            }
+            for y in 0..2 {
+                for x in -20..20 {
+                    for z in -20..20 {
+                        let pick = picks.pop().unwrap() as usize;
+                        world
+                            .set(x, y, z, registry.default_state(FLOOR[pick]).unwrap())
+                            .unwrap();
+                    }
+                }
+            }
+        };
+        let mut probes = Vec::new();
+        for _ in 0..6_000 {
+            let width = 0.1 + next(140) as f64 / 100.0;
+            let (x, z) = (
+                next(4_000) as f64 / 100.0 - 20.0,
+                next(4_000) as f64 / 100.0 - 20.0,
+            );
+            // Feet on either layer's block tops, on an upper bottom slab, or anywhere.
+            let feet = match next(4) {
+                0 => 1.0,
+                1 => 2.0,
+                2 => 1.5,
+                _ => next(300) as f64 / 100.0,
+            };
+            probes.push((width, x, z, feet, next(7) as f64 / 10.0 - 0.3));
+        }
+        let mut found = 0;
+        let ran = crate::mobs::world::with_built_test_world(&[], build, |w, _| {
+            for &(width, x, z, feet, dx) in &probes {
+                let h = width / 2.0;
+                let area = Aabb::new(
+                    Vec3::new(x - h, feet - 1.0e-6, z - h),
+                    Vec3::new(x + h, feet, z + h),
+                );
+                let from = Vec3::new(x + dx, feet, z - dx);
+                let support = w.supporting_block(area, from);
+                assert_eq!(
+                    support,
+                    w.supporting_block_by_clones(area, from),
+                    "{area:?} from {from:?}"
+                );
+                found += usize::from(support.is_some());
+            }
+        });
+        if ran {
+            assert!(found > 1_000, "{found} supports found");
+        }
+    }
+}
 #[cfg(test)]
 #[path = "splash_sound_tests.rs"]
 mod splash_sound_tests;
