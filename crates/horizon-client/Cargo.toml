@@ -131,8 +131,9 @@ winit = { version = "0.30.13", features = ["android-native-activity"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["gles"] }
 
 [features]
-# Source retention only: not compiled/tested on the fork; incompatible with typed residency.
-# Do not enable (including via --all-features); integration is tracked in arismoko/horizon#3491.
+# On parallel-mobs, enable this for natural spawning on helper threads with the parallel tick
+# active outside exact mode. The islands feature below enables it automatically. Enable that
+# feature to also let independent groups of mobs tick on helper threads.
 upstream-parallel-mobs = ["horizon-gameplay/upstream-parallel-mobs", "horizon-world/send-attributes"]
 # The mob loop in islands on several threads under the parallel tick (game/creatures/mob_islands.rs
 # and mob_group.rs, their call site game/mobs/creatures/island_tick.rs), for the ticks the borrowed

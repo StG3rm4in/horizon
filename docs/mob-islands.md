@@ -3,8 +3,8 @@
 Design: [#14457](https://github.com/horizon-rust/horizon/issues/14457).
 Implementation: `crates/horizon-client/src/game/creatures/mob_islands.rs`.
 The parallel mob loop (`mob_group.rs`, `mob_islands.rs`, `prep.rs`) is currently compiled only with the nondefault
-`upstream-parallel-mobs` feature (`game/mobs/creatures/mod.rs`), so `parallel_tick` does not run mob islands in the
-default build; the other parallel phases follow the setting.
+`upstream-parallel-mob-islands` feature (`game/mobs/creatures/mod.rs`). This feature also enables
+`upstream-parallel-mobs`, which builds natural spawning on helper threads.
 Design approval and normal implementation review are separate gates.
 
 ## Reach is a correctness contract
@@ -246,7 +246,8 @@ parallel safety for dynamically loaded mods; integration remains behind the gate
 Acceptance command (not validation of the default build, which keeps the loop serial):
 
 ```sh
-cargo test -p horizon-client --lib game::creatures::mob_islands:: -- --include-ignored --test-threads=1
+cargo test -p horizon-client --lib --features upstream-parallel-mob-islands \
+  game::creatures::mob_islands:: -- --include-ignored --test-threads=1
 ```
 
 Set `HORIZON_TEST_RESOURCES` to prepared resources and isolate game homes as `CLAUDE.md`
