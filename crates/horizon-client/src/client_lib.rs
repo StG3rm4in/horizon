@@ -143,6 +143,7 @@ pub mod pick_item;
 pub mod player_sync;
 pub mod portal_sections;
 pub mod pose;
+pub mod postprocess_marks;
 pub mod pregen;
 pub mod projectiles;
 pub mod raid;

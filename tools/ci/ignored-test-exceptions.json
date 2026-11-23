@@ -178,6 +178,14 @@
   {
     "package": "horizon-client",
     "target": "lib",
+    "test": "game::explosion::tests::ray_cells_timing",
+    "path": "crates/horizon-client/src/game/entities/explosion.rs",
+    "reason": "a timing, needs prepared resources in HORIZON_TEST_RESOURCES",
+    "rationale": "Manual wall-clock measurement, not a daily correctness check: prints the time of a TNT's block rays asking every cell at every step and keeping the cells' answers (RayCells), in stone, water, a jumble of blocks and air, asserting both explode as many positions (the daily ray_cells_explode_what_each_ray_asked checks them exactly). Run by hand on an idle machine with the optimized profile and HORIZON_TEST_RESOURCES, exact-selecting the full test path with --ignored --exact --nocapture; RAY_BLASTS optionally sets the blasts a scene (300)."
+  },
+  {
+    "package": "horizon-client",
+    "target": "lib",
     "test": "game::fishing::tests::breeze_hook_parity_fixture",
     "path": "crates/horizon-client/src/game/items/fishing.rs",
     "reason": "run by tools/test_breeze_hook_parity.py",
@@ -1218,10 +1226,34 @@
   {
     "package": "horizon-world",
     "target": "lib",
+    "test": "worldgen::generator::tests::monument_boxes_on_the_cpu_and_the_gpu",
+    "path": "crates/horizon-world/src/worldgen/generator.rs",
+    "reason": "benchmark",
+    "rationale": "Opt-in measurement, not an ordinary daily correctness check: times the ocean monuments' surrounding-biome boxes of seed 1234's candidates on the CPU and, with HORIZON_GPU_LOCATE and a CUDA GPU, on the GPU, asserting the same biomes and the same checks. Run by hand on an idle machine with the optimized profile, HORIZON_RESOURCES and --features cuda; all assertions remain in the test."
+  },
+  {
+    "package": "horizon-world",
+    "target": "lib",
     "test": "worldgen::terrain::tests::benchmark_fill_noise",
     "path": "crates/horizon-world/src/worldgen/terrain.rs",
     "reason": "benchmark",
     "rationale": "Opt-in measurement, not an ordinary daily correctness check: benchmark. Run by hand on an idle machine with the optimized profile and its explicitly requested inputs; all assertions remain in the test."
+  },
+  {
+    "package": "horizon-world",
+    "target": "lib",
+    "test": "worldgen::generator::tests::locate_biome_on_the_cpu_and_the_gpu",
+    "path": "crates/horizon-world/src/worldgen/generator.rs",
+    "reason": "benchmark",
+    "rationale": "Opt-in measurement, not an ordinary daily correctness check: times /locate biome and a map preview on the CPU and, with HORIZON_GPU_LOCATE and a CUDA GPU, on the GPU, asserting the same answers. Run by hand on an idle machine with the optimized profile, HORIZON_TEST_RESOURCES and --features cuda; all assertions remain in the test."
+  },
+  {
+    "package": "horizon-world",
+    "target": "lib",
+    "test": "worldgen::generator::tests::stronghold_squares_on_the_cpu_and_the_gpu",
+    "path": "crates/horizon-world/src/worldgen/generator.rs",
+    "reason": "benchmark",
+    "rationale": "Opt-in measurement, not an ordinary daily correctness check: times the stronghold rings' 128 biome squares on the CPU and, with HORIZON_GPU_LOCATE and a CUDA GPU, from one GPU batch, asserting the same biomes and vanilla's ring positions for seed 1234. Run by hand on an idle machine with the optimized profile, HORIZON_RESOURCES and --features cuda; all assertions remain in the test."
   },
   {
     "package": "horizon-world",

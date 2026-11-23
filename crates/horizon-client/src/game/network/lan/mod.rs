@@ -63,17 +63,20 @@ pub(super) struct LanHost {
     /// The mods heard that everyone still here leaves with the server.
     pub players_told_left: bool,
     pub settings: LanSettings,
-    pub play: HashMap<u32, super::lan_actions::GuestPlay>,
-    /// Each guest's menu owners, outside `play` (`as_guest` lifts that).
-    pub menus: HashMap<u32, super::lan_menus::GuestMenus>,
+    /// Each guest's own play state, by connection: looked up many times for every guest each
+    /// tick, and taken out and put back by each of its turns, so with the fast hasher. Its order
+    /// is no vanilla order; with the default hasher it was a random one in every process.
+    pub play: horizon_client::fast_hash::FxHashMap<u32, super::lan_actions::GuestPlay>,
+    /// Each guest's menu owners, outside `play` (`as_guest` lifts that); hashed as `play` is.
+    pub menus: horizon_client::fast_hash::FxHashMap<u32, super::lan_menus::GuestMenus>,
     /// Blocks broken this tick (their sound is a level event for the guests).
     pub broken: Vec<[f64; 3]>,
     /// Hurt time, death and swing time (while swinging) of the mobs guests
     /// see; the players' hurt time by entity id.
     mob_state: HashMap<super::Dim, MobFlags>,
     /// Each placed guest's pose as the mods last heard it
-    /// (`native_entity_pose_change`), by connection.
-    pub poses: HashMap<u32, horizon_client::pose::Pose>,
+    /// (`native_entity_pose_change`), by connection; hashed as `play` is.
+    pub poses: horizon_client::fast_hash::FxHashMap<u32, horizon_client::pose::Pose>,
     /// The guest each mob sees as its player, when not the host (game/network/lan_mobs.rs).
     /// Looked up per mob each tick: a fast hasher (never iterated).
     pub mob_players: horizon_client::fast_hash::FxHashMap<u32, u32>,
@@ -1316,11 +1319,11 @@ impl Game<'_> {
             players_told_left: false,
             hub,
             settings: LanSettings { port, ..settings },
-            play: HashMap::new(),
-            menus: HashMap::new(),
+            play: Default::default(),
+            menus: Default::default(),
             broken: Vec::new(),
             mob_state: HashMap::new(),
-            poses: HashMap::new(),
+            poses: Default::default(),
             mob_players: Default::default(),
             owner: None,
             waypoints: Default::default(),

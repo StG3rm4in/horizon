@@ -292,6 +292,7 @@ horizon-client-lib mobs::living::climbable_tests::a_horse_pressed_into_a_ladder_
 horizon-client-lib mobs::living::climbable_tests::an_equine_and_a_flying_monster_are_never_on_a_climbable lib daily resources
 horizon-client-lib mobs::living::farmland_event_tests::a_mob_trampling_farmland_posts_block_change_from_it lib daily resources
 horizon-client-lib mobs::living::fluid_heights::tests::a_mob_measures_fluids_from_its_bottom_and_tracks_lava_at_its_eyes lib daily resources
+horizon-client-lib mobs::living::support_shape_tests::support_read_in_place_is_the_support_cloned_shapes_find lib daily resources
 horizon-client-lib mobs::living::tests::a_bubble_column_lifts_a_mob_after_travel_not_inside_it lib daily resources
 horizon-client-lib mobs::living::tests::a_gliding_mob_passes_through_vines_but_not_a_ladder lib daily resources
 horizon-client-lib mobs::living::tests::a_mob_in_vines_slides_down_slowly lib daily resources
@@ -380,6 +381,7 @@ horizon-client-lib mobs::warden::warden_target_tests::the_warden_leaves_its_alli
 horizon-client-lib mobs::warden_brain::tests::a_warden_forced_aboard_gets_off_to_dig lib daily resources
 horizon-client-lib mobs::wither::upstream_sync_tests::a_withers_side_head_does_not_pick_through_a_wall lib daily resources
 horizon-client-lib mobs::wither::upstream_sync_tests::idle_blue_skull_volleys_come_only_on_normal_and_hard lib daily resources
+horizon-client-lib mobs::world::collision_bounds_tests::bounds_read_in_place_are_the_cloned_shapes_bounds lib daily resources
 horizon-client-lib mobs::world::missing_data_report_tests::missing_mob_data_reports_one_counted_skip_per_test lib daily child-process
 horizon-client-lib mobs::world::scaffolding_sight_tests::scaffolding_blocks_sight_only_from_above lib daily resources
 horizon-client-lib mod_content::tests::registered_conditions_tests::failed_condition_build_removes_generated_staging lib daily resources

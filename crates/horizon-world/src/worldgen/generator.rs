@@ -420,6 +420,32 @@ struct Pipeline<R: RandomSource> {
     biomes_gpu: Option<horizon_gpu::BiomeGpu>,
     biomes_test: bool,
     biome_regions: Mutex<GpuBiomeRegions>,
+    /// `findClosestBiome3d` and the map previews of a multi-noise source on the GPU, by batches
+    /// of quarts that the CPU replays in its own order (HORIZON_GPU_LOCATE=1, or `test` to check
+    /// each answer against the CPU's).
+    locate_gpu: Option<horizon_gpu::LocateGpu>,
+    locate_test: bool,
+}
+/// Quarts below which `noise_biomes` stays on the CPU: a GPU round trip costs about what the CPU
+/// takes for a few dozen quarts, and a map preview asks for 16,384.
+const LOCATE_GPU_QUARTS: usize = 1024;
+/// The spiral's quarts `find_closest_biome` walks on the CPU first when the GPU searches: some
+/// 0.5 ms (about 2 us a quart), less than a GPU batch's round trip.
+const LOCATE_CPU_QUARTS: usize = 256;
+/// The spiral's columns by batches for the GPU's biome search: 1,024 quarts first, so that a
+/// biome nearby comes after a short wait, then four times more each batch up to a full batch of
+/// the GPU, `per_column` quarts a column. Put end to end, the batches are the spiral, in order.
+fn locate_batches(
+    mut spiral: impl Iterator<Item = [i32; 2]>,
+    per_column: usize,
+) -> impl Iterator<Item = Vec<[i32; 2]>> {
+    let most = (horizon_gpu::LOCATE_BATCH / per_column.max(1)).max(1);
+    let mut size = (1024 / per_column.max(1)).clamp(1, most);
+    std::iter::from_fn(move || {
+        let batch: Vec<[i32; 2]> = spiral.by_ref().take(size).collect();
+        size = size.saturating_mul(4).min(most);
+        (!batch.is_empty()).then_some(batch)
+    })
 }
 /// The planned carvers of 8 x 8 origin chunks (key: origin x >> 3, z >> 3), at (x & 7) * 8 + (z & 7).
 struct OriginBlock {
@@ -654,7 +680,8 @@ where
             default("minecraft:air")?,
         );
         let mut surface_gpu = None;
-        let surface_test = std::env::var_os("HORIZON_GPU_SURFACE_TEST").is_some();
+        // `1`, as the other stages' switches: `=0` used to turn the test on.
+        let surface_test = std::env::var("HORIZON_GPU_SURFACE_TEST").is_ok_and(|v| v == "1");
         let surface_inline =
             !surface_test && std::env::var("HORIZON_GPU_SURFACE").is_ok_and(|v| v == "1");
         if (surface_test || surface_inline) && gpu.is_some() {
@@ -897,6 +924,28 @@ where
                 }
                 _ => (None, false),
             };
+        // HORIZON_GPU_LOCATE=1: the biome searches of a multi-noise source on the GPU, whatever
+        // HORIZON_GPU_BIOMES says; `test` checks each answer against the CPU's.
+        let (locate_gpu, locate_test) =
+            match (std::env::var("HORIZON_GPU_LOCATE").as_deref(), &source) {
+                (Ok(v @ ("1" | "test")), ResolvedBiomeSource::MultiNoise(multi)) => {
+                    let (spaces, links) = multi.parameters().tree();
+                    match horizon_gpu::LocateGpu::new(
+                        library.compiler(),
+                        climate_roots,
+                        seed,
+                        &spaces,
+                        links,
+                    ) {
+                        Ok(g) => (Some(g), v == "test"),
+                        Err(e) => {
+                            eprintln!("GPU locate: no biome searches on the GPU: {e}");
+                            (None, false)
+                        }
+                    }
+                }
+                _ => (None, false),
+            };
         let mut pipeline = Self {
             zoom: BiomeZoom::new(obfuscate_seed(seed)),
             data,
@@ -943,6 +992,8 @@ where
             biomes_gpu,
             biomes_test,
             biome_regions: Mutex::new(GpuBiomeRegions::default()),
+            locate_gpu,
+            locate_test,
         };
         pipeline.decoration = pipeline
             .data
@@ -2543,6 +2594,80 @@ where
         self.worker.structure_biomes.insert(quart, id);
         id
     }
+    /// HORIZON_GPU_LOCATE: a box of many quarts (an ocean monument's 3,600) from one GPU batch,
+    /// once a few of its quarts, spread over it, pass on the CPU: most boxes fail on the first
+    /// one (land), and many others (a coast) on one of the next. Each quart's biome is
+    /// `noise_biome`'s, a search of its own, and nothing is drawn or written between them but
+    /// that memo, so the answer does not depend on which are asked first. In test mode, the
+    /// CPU's answer, after comparing every quart of the batch and timing both.
+    fn all_noise_biomes(&mut self, quarts: &[[i32; 3]], allowed: &dyn Fn(BiomeId) -> bool) -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // The quarts asked on the CPU first: every `len / HEAD`-th, from the first.
+        const HEAD: usize = 16;
+        // One box on the GPU at a time: a worker checking another meanwhile stays on the CPU,
+        // and the batches' pool keeps one set of buffers for these.
+        static ON_GPU: AtomicBool = AtomicBool::new(false);
+        let pipeline = self.pipeline;
+        let gpu = (pipeline.locate_gpu.as_ref()).filter(|_| quarts.len() >= LOCATE_GPU_QUARTS);
+        let Some(gpu) = gpu else {
+            return quarts.iter().all(|&quart| allowed(self.noise_biome(quart)));
+        };
+        let stride = quarts.len().div_ceil(HEAD);
+        if !(quarts.iter().step_by(stride)).all(|&quart| allowed(self.noise_biome(quart))) {
+            return false;
+        }
+        if ON_GPU.swap(true, Ordering::Acquire) {
+            return quarts.iter().all(|&quart| allowed(self.noise_biome(quart)));
+        }
+        let started = std::time::Instant::now();
+        let found = pipeline.fresh_biomes_gpu(gpu, quarts);
+        ON_GPU.store(false, Ordering::Release);
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => {
+                gpu.note_fallback();
+                log::warn!(
+                    "GPU locate: a box of {} quarts on the CPU: {e}",
+                    quarts.len()
+                );
+                return quarts.iter().all(|&quart| allowed(self.noise_biome(quart)));
+            }
+        };
+        let answer = found.iter().all(|&biome| allowed(biome));
+        if !pipeline.locate_test {
+            return answer;
+        }
+        let gpu_ms = started.elapsed().as_secs_f64() * 1e3;
+        let started = std::time::Instant::now();
+        let cpu: Vec<BiomeId> = quarts
+            .iter()
+            .map(|&quart| self.noise_biome(quart))
+            .collect();
+        let cpu_ms = started.elapsed().as_secs_f64() * 1e3;
+        let expected = cpu.iter().all(|&biome| allowed(biome));
+        let gaps: Vec<usize> = (0..quarts.len()).filter(|&k| found[k] != cpu[k]).collect();
+        let n = gpu.note_test(!gaps.is_empty() || answer != expected);
+        if let Some(&k) = gaps.first()
+            && gpu.mismatches() <= 16
+        {
+            log::warn!(
+                "GPU locate test: quart {:?} ({k} of a box of {}): GPU {:?}, CPU {:?}",
+                quarts[k],
+                quarts.len(),
+                found[k],
+                cpu[k]
+            );
+        }
+        log::info!(
+            "GPU locate test: {n} answers compared; a box of {} quarts from {:?}: GPU {gpu_ms:.1} \
+             ms, CPU {cpu_ms:.1} ms, {expected}, {} quarts differ; {} mismatches",
+            quarts.len(),
+            quarts[0],
+            gaps.len(),
+            gpu.mismatches()
+        );
+        expected
+    }
     fn noise_biomes(&mut self, quarts: &[[i32; 3]]) -> Vec<BiomeId> {
         let mut resolver = self.pipeline.source.resolver(
             &self.pipeline.climate,
@@ -2558,6 +2683,61 @@ where
                     .unwrap_or(BiomeId(0))
             })
             .collect()
+    }
+    fn biomes_from_source(&self) -> bool {
+        true
+    }
+    /// HORIZON_GPU_LOCATE: every list from the GPU's climate and search
+    /// (`Pipeline::noise_biome_lists_gpu`); in test mode, the CPU's lists, after comparing every
+    /// quart of them and timing both. `None` (each list on the CPU, by its search's thread)
+    /// without the GPU or after a failed batch.
+    fn noise_biome_lists(&mut self, lists: &[Vec<[i32; 3]>]) -> Option<Vec<Vec<BiomeId>>> {
+        let pipeline = self.pipeline;
+        let gpu = pipeline.locate_gpu.as_ref()?;
+        let started = std::time::Instant::now();
+        let found = match pipeline.noise_biome_lists_gpu(gpu, lists) {
+            Ok(found) => found,
+            Err(e) => {
+                gpu.note_fallback();
+                log::warn!(
+                    "GPU locate: {} lists of quarts on the CPU: {e}",
+                    lists.len()
+                );
+                return None;
+            }
+        };
+        if !pipeline.locate_test {
+            return Some(found);
+        }
+        let gpu_ms = started.elapsed().as_secs_f64() * 1e3;
+        let started = std::time::Instant::now();
+        let cpu: Vec<Vec<BiomeId>> = lists.iter().map(|list| self.noise_biomes(list)).collect();
+        let cpu_ms = started.elapsed().as_secs_f64() * 1e3;
+        let mut differ = 0usize;
+        for (l, list) in lists.iter().enumerate() {
+            for (k, quart) in list.iter().enumerate() {
+                let (on_gpu, on_cpu) = (found[l][k], cpu[l][k]);
+                if on_gpu != on_cpu {
+                    differ += 1;
+                    if differ <= 16 {
+                        log::warn!(
+                            "GPU locate test: list {l}, quart {quart:?} ({k} of {}): GPU \
+                             {on_gpu:?}, CPU {on_cpu:?}",
+                            list.len()
+                        );
+                    }
+                }
+            }
+        }
+        let n = gpu.note_test(differ > 0);
+        let quarts: usize = lists.iter().map(Vec::len).sum();
+        log::info!(
+            "GPU locate test: {n} answers compared; {} lists of {quarts} quarts in all: GPU \
+             {gpu_ms:.1} ms, CPU {cpu_ms:.1} ms, {differ} quarts differ; {} mismatches",
+            lists.len(),
+            gpu.mismatches()
+        );
+        Some(cpu)
     }
     /// `None` is `/place structure`'s `biome -> true`: every biome the bundle
     /// knows counts as valid.
@@ -3558,6 +3738,11 @@ trait SeededPipeline: Send + Sync {
     ) -> Result<(), String>;
     fn forget_structure_starts(&self);
     fn ring_positions(&self, worker: &mut WorkerState, set: &str) -> Option<Vec<ChunkPos>>;
+    /// Whether biome searches over many quarts come from the GPU's batches (HORIZON_GPU_LOCATE):
+    /// the stronghold rings' squares are then one batch.
+    fn biome_batches(&self) -> bool {
+        false
+    }
     /// The structures whose random-spread set may start in `chunk`, each with whether a
     /// search's start check lets it start there.
     #[cfg(test)]
@@ -3594,6 +3779,268 @@ trait SeededPipeline: Send + Sync {
         worker: &mut WorkerState,
         query: &JigsawQuery<'_>,
     ) -> Option<JigsawPieces>;
+}
+impl<R: RandomSource + 'static> Pipeline<R>
+where
+    R::Positional: Clone + Send + Sync,
+{
+    /// `find_closest_biome` on the CPU, as it always ran: one resolver, the spiral's columns,
+    /// each column's heights from the origin's outwards; `most` quarts at most (`usize::MAX`: the
+    /// whole spiral), and None as well when the biome is not among them.
+    fn closest_biome_cpu(
+        &self,
+        worker: &mut WorkerState,
+        search: &BiomeSearch<'_>,
+        candidates: &BTreeSet<&str>,
+        most: usize,
+    ) -> Option<(String, [i32; 3])> {
+        let mut resolver = self.source.resolver(
+            &self.climate,
+            self.router.get(RouterField::Erosion).as_ref(),
+        );
+        let ys = out_from_origin(
+            search.origin[1],
+            search.min_y + 1,
+            search.max_y + 1,
+            search.vertical,
+        );
+        let radius = search.radius.div_euclid(search.horizontal);
+        let mut left = most;
+        for [sx, sz] in spiral_around(radius) {
+            let x = search.origin[0].wrapping_add(sx.wrapping_mul(search.horizontal));
+            let z = search.origin[2].wrapping_add(sz.wrapping_mul(search.horizontal));
+            for &y in &ys {
+                if left == 0 {
+                    return None;
+                }
+                left -= 1;
+                let quart = [x >> 2, y >> 2, z >> 2];
+                let Ok(name) = resolver.sample(&mut worker.carver_context, quart) else {
+                    continue;
+                };
+                if candidates.contains(name) {
+                    return Some((name.to_owned(), [x, y, z]));
+                }
+            }
+        }
+        None
+    }
+    /// `find_closest_biome` with the GPU's climate and search (`horizon_gpu::LocateGpu`): the
+    /// spiral's columns go by batches (`locate_batches`), and the CPU replays each batch in the
+    /// CPU path's order with one climate search kept from quart to quart, as its resolver keeps
+    /// one, up to the first allowed biome. The positions and heights are computed here as there.
+    /// Err: the CPU searches instead (not a multi-noise source, a batch the GPU failed); nothing
+    /// was changed then, so the CPU's search starts as it would have.
+    fn closest_biome_gpu(
+        &self,
+        gpu: &horizon_gpu::LocateGpu,
+        search: &BiomeSearch<'_>,
+        candidates: &BTreeSet<&str>,
+    ) -> Result<Option<(String, [i32; 3])>, String> {
+        let ResolvedBiomeSource::MultiNoise(multi) = &self.source else {
+            return Err("not a multi-noise source".into());
+        };
+        let index = multi.parameters();
+        // Whether each entry's biome is a candidate, asked once per entry instead of per quart.
+        let allowed: Vec<bool> = index
+            .entries()
+            .iter()
+            .map(|(_, name)| candidates.contains(name.as_str()))
+            .collect();
+        let ys = out_from_origin(
+            search.origin[1],
+            search.min_y + 1,
+            search.max_y + 1,
+            search.vertical,
+        );
+        let layers: Vec<i32> = ys.iter().map(|&y| y >> 2).collect();
+        let radius = search.radius.div_euclid(search.horizontal);
+        let mut searcher = index.searcher();
+        let mut samples = horizon_gpu::LocateSamples::default();
+        let (mut columns, mut blocks) = (Vec::new(), Vec::new());
+        for offsets in locate_batches(spiral_around(radius), layers.len()) {
+            if layers.is_empty() {
+                // No height to sample: the CPU walks the spiral without a quart, then gives up.
+                continue;
+            }
+            columns.clear();
+            blocks.clear();
+            for [sx, sz] in offsets {
+                let x = search.origin[0].wrapping_add(sx.wrapping_mul(search.horizontal));
+                let z = search.origin[2].wrapping_add(sz.wrapping_mul(search.horizontal));
+                blocks.push([x, z]);
+                columns.push([x >> 2, z >> 2]);
+            }
+            gpu.sample_columns(&columns, &layers, &mut samples)?;
+            for (c, &[x, z]) in blocks.iter().enumerate() {
+                for (j, &y) in ys.iter().enumerate() {
+                    let k = c * ys.len() + j;
+                    let target = super::climate::TargetPoint::from_values(samples.fields[k]);
+                    // The CPU's resolver passes a quart its search fails on, keeping its leaf.
+                    let Ok(entry) = searcher.find_entry_from_first(target, samples.first[k]) else {
+                        continue;
+                    };
+                    if allowed[entry] {
+                        gpu.note_search();
+                        return Ok(Some((index.entries()[entry].1.clone(), [x, y, z])));
+                    }
+                }
+            }
+        }
+        gpu.note_search();
+        Ok(None)
+    }
+    /// The biomes of `quarts` with the GPU's climate and search, each as
+    /// `StructureQueries::noise_biome` answers it: a climate search of its own per quart, whose
+    /// answer is the GPU's first leaf (`find_entry_from_first` with no previous leaf). An
+    /// answer's entry is the biome of its name, or biome 0 where the bundle has none, and a
+    /// failed search biome 0, as `noise_biome` maps them.
+    fn fresh_biomes_gpu(
+        &self,
+        gpu: &horizon_gpu::LocateGpu,
+        quarts: &[[i32; 3]],
+    ) -> Result<Vec<BiomeId>, String> {
+        let ResolvedBiomeSource::MultiNoise(multi) = &self.source else {
+            return Err("not a multi-noise source".into());
+        };
+        let index = multi.parameters();
+        let entries = index.entries();
+        // Each entry's biome, looked up once.
+        let mut ids: Vec<Option<BiomeId>> = vec![None; entries.len()];
+        let mut samples = horizon_gpu::LocateSamples::default();
+        let mut biomes = Vec::with_capacity(quarts.len());
+        for batch in quarts.chunks(horizon_gpu::LOCATE_BATCH) {
+            gpu.sample_quarts(batch, &mut samples)?;
+            if samples.fields.len() != batch.len() || samples.first.len() != batch.len() {
+                return Err(format!(
+                    "{} answers for {} quarts",
+                    samples.first.len(),
+                    batch.len()
+                ));
+            }
+            for (&fields, &first) in samples.fields.iter().zip(&samples.first) {
+                let target = super::climate::TargetPoint::from_values(fields);
+                biomes.push(
+                    match index.searcher().find_entry_from_first(target, first) {
+                        Ok(entry) => *ids[entry].get_or_insert_with(|| {
+                            self.data.biome_id(&entries[entry].1).unwrap_or(BiomeId(0))
+                        }),
+                        Err(_) => BiomeId(0),
+                    },
+                );
+            }
+        }
+        gpu.note_search();
+        Ok(biomes)
+    }
+    /// `noise_biomes` on the CPU, as it always ran: one fresh resolver, the quarts in order.
+    fn noise_biomes_cpu(
+        &self,
+        worker: &mut WorkerState,
+        quarts: &[[i32; 3]],
+    ) -> Vec<Option<String>> {
+        let mut resolver = self.source.resolver(
+            &self.climate,
+            self.router.get(RouterField::Erosion).as_ref(),
+        );
+        quarts
+            .iter()
+            .map(|&quart| {
+                resolver
+                    .sample(&mut worker.carver_context, quart)
+                    .ok()
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+    /// `noise_biomes` with the GPU's climate and search: the quarts by batches, replayed in their
+    /// order with one fresh climate search for the whole call, as the CPU's fresh resolver.
+    fn noise_biomes_gpu(
+        &self,
+        gpu: &horizon_gpu::LocateGpu,
+        quarts: &[[i32; 3]],
+    ) -> Result<Vec<Option<String>>, String> {
+        let ResolvedBiomeSource::MultiNoise(multi) = &self.source else {
+            return Err("not a multi-noise source".into());
+        };
+        let index = multi.parameters();
+        let mut searcher = index.searcher();
+        let mut samples = horizon_gpu::LocateSamples::default();
+        let mut biomes = Vec::with_capacity(quarts.len());
+        for batch in quarts.chunks(horizon_gpu::LOCATE_BATCH) {
+            gpu.sample_quarts(batch, &mut samples)?;
+            for k in 0..batch.len() {
+                let target = super::climate::TargetPoint::from_values(samples.fields[k]);
+                biomes.push(
+                    searcher
+                        .find_entry_from_first(target, samples.first[k])
+                        .ok()
+                        .map(|entry| index.entries()[entry].1.clone()),
+                );
+            }
+        }
+        gpu.note_search();
+        Ok(biomes)
+    }
+    /// `StructureQueries::noise_biomes` of many lists with the GPU's climate and search (the
+    /// stronghold rings' squares): whole lists by batches of the GPU, each list replayed in its
+    /// order with a climate search of its own, as each `noise_biomes` call starts a resolver of
+    /// its own. An answer's entry is the biome of its name, or biome 0 where the bundle has none,
+    /// and a failed search biome 0, as `noise_biomes` maps them.
+    fn noise_biome_lists_gpu(
+        &self,
+        gpu: &horizon_gpu::LocateGpu,
+        lists: &[Vec<[i32; 3]>],
+    ) -> Result<Vec<Vec<BiomeId>>, String> {
+        let ResolvedBiomeSource::MultiNoise(multi) = &self.source else {
+            return Err("not a multi-noise source".into());
+        };
+        let index = multi.parameters();
+        let entries = index.entries();
+        // Each entry's biome, looked up once.
+        let mut ids: Vec<Option<BiomeId>> = vec![None; entries.len()];
+        let mut samples = horizon_gpu::LocateSamples::default();
+        let mut quarts: Vec<[i32; 3]> = Vec::new();
+        let mut out = Vec::with_capacity(lists.len());
+        let mut rest = lists;
+        while !rest.is_empty() {
+            // Whole lists, as many as one batch of the GPU holds.
+            let (mut take, mut n) = (0, 0);
+            while take < rest.len() && n + rest[take].len() <= horizon_gpu::LOCATE_BATCH {
+                n += rest[take].len();
+                take += 1;
+            }
+            if take == 0 {
+                return Err(format!("a list of {} quarts", rest[0].len()));
+            }
+            let (group, next) = rest.split_at(take);
+            quarts.clear();
+            quarts.extend(group.iter().flatten().copied());
+            gpu.sample_quarts(&quarts, &mut samples)?;
+            if samples.fields.len() != n || samples.first.len() != n {
+                return Err(format!("{} answers for {n} quarts", samples.first.len()));
+            }
+            let mut answers = samples.fields.iter().zip(&samples.first);
+            for list in group {
+                let mut searcher = index.searcher();
+                let biomes: Vec<BiomeId> = (answers.by_ref().take(list.len()))
+                    .map(|(&fields, &first)| {
+                        let target = super::climate::TargetPoint::from_values(fields);
+                        match searcher.find_entry_from_first(target, first) {
+                            Ok(entry) => *ids[entry].get_or_insert_with(|| {
+                                self.data.biome_id(&entries[entry].1).unwrap_or(BiomeId(0))
+                            }),
+                            Err(_) => BiomeId(0),
+                        }
+                    })
+                    .collect();
+                out.push(biomes);
+            }
+            rest = next;
+        }
+        gpu.note_search();
+        Ok(out)
+    }
 }
 impl<R: RandomSource + 'static> SeededPipeline for Pipeline<R>
 where
@@ -3790,6 +4237,9 @@ where
             set,
         )
     }
+    fn biome_batches(&self) -> bool {
+        self.locate_gpu.is_some()
+    }
     fn region_random(&self, center: ChunkPos) -> Box<dyn super::structure::legacy::PieceRandom> {
         Box::new(self.region_random_at(center))
     }
@@ -3849,31 +4299,51 @@ where
         if candidates.is_empty() {
             return None;
         }
-        let mut resolver = self.source.resolver(
-            &self.climate,
-            self.router.get(RouterField::Erosion).as_ref(),
-        );
-        let ys = out_from_origin(
-            search.origin[1],
-            search.min_y + 1,
-            search.max_y + 1,
-            search.vertical,
-        );
-        let radius = search.radius.div_euclid(search.horizontal);
-        for [sx, sz] in spiral_around(radius) {
-            let x = search.origin[0].wrapping_add(sx.wrapping_mul(search.horizontal));
-            let z = search.origin[2].wrapping_add(sz.wrapping_mul(search.horizontal));
-            for &y in &ys {
-                let quart = [x >> 2, y >> 2, z >> 2];
-                let Ok(name) = resolver.sample(&mut worker.carver_context, quart) else {
-                    continue;
-                };
-                if candidates.contains(name) {
-                    return Some((name.to_owned(), [x, y, z]));
+        // HORIZON_GPU_LOCATE: the GPU's climate and search, replayed in the spiral's order.
+        if let Some(gpu) = &self.locate_gpu {
+            // The spiral's nearest quarts on the CPU first, in its order and with its one resolver,
+            // so that the first allowed biome among them is the whole search's answer: a biome
+            // nearby comes without a GPU round trip. Not found there, the GPU searches from the
+            // start, as without this pass. The test mode compares the GPU's whole search.
+            if !self.locate_test
+                && let Some(found) =
+                    self.closest_biome_cpu(worker, search, &candidates, LOCATE_CPU_QUARTS)
+            {
+                return Some(found);
+            }
+            let started = std::time::Instant::now();
+            match self.closest_biome_gpu(gpu, search, &candidates) {
+                Ok(found) if !self.locate_test => return found,
+                Ok(found) => {
+                    let gpu_ms = started.elapsed().as_secs_f64() * 1e3;
+                    let started = std::time::Instant::now();
+                    let cpu = self.closest_biome_cpu(worker, search, &candidates, usize::MAX);
+                    let cpu_ms = started.elapsed().as_secs_f64() * 1e3;
+                    let n = gpu.note_test(found != cpu);
+                    if found != cpu && gpu.mismatches() <= 16 {
+                        log::warn!(
+                            "GPU locate test: search from {:?}: GPU {found:?}, CPU {cpu:?}",
+                            search.origin
+                        );
+                    }
+                    log::info!(
+                        "GPU locate test: search {n} from {:?}: GPU {gpu_ms:.1} ms, CPU \
+                         {cpu_ms:.1} ms, {cpu:?}; {} mismatches",
+                        search.origin,
+                        gpu.mismatches()
+                    );
+                    return cpu;
+                }
+                Err(e) => {
+                    gpu.note_fallback();
+                    log::warn!(
+                        "GPU locate: search from {:?} on the CPU: {e}",
+                        search.origin
+                    );
                 }
             }
         }
-        None
+        self.closest_biome_cpu(worker, search, &candidates, usize::MAX)
     }
     fn surface_sample(
         &self,
@@ -4298,19 +4768,43 @@ where
         Ok(result)
     }
     fn noise_biomes(&self, worker: &mut WorkerState, quarts: &[[i32; 3]]) -> Vec<Option<String>> {
-        let mut resolver = self.source.resolver(
-            &self.climate,
-            self.router.get(RouterField::Erosion).as_ref(),
-        );
-        quarts
-            .iter()
-            .map(|&quart| {
-                resolver
-                    .sample(&mut worker.carver_context, quart)
-                    .ok()
-                    .map(str::to_owned)
-            })
-            .collect()
+        // HORIZON_GPU_LOCATE: a map preview's quarts from the GPU's climate and search, replayed
+        // in their order; a few quarts cost the CPU less than a GPU round trip.
+        if let Some(gpu) = &self.locate_gpu
+            && quarts.len() >= LOCATE_GPU_QUARTS
+        {
+            match self.noise_biomes_gpu(gpu, quarts) {
+                Ok(found) if !self.locate_test => return found,
+                Ok(found) => {
+                    let cpu = self.noise_biomes_cpu(worker, quarts);
+                    let gap = (0..quarts.len()).find(|&i| found[i] != cpu[i]);
+                    let n = gpu.note_test(gap.is_some());
+                    if let Some(i) = gap
+                        && gpu.mismatches() <= 16
+                    {
+                        log::warn!(
+                            "GPU locate test: quart {:?} ({i} of {}): GPU {:?}, CPU {:?}",
+                            quarts[i],
+                            quarts.len(),
+                            found[i],
+                            cpu[i]
+                        );
+                    }
+                    if n.is_power_of_two() {
+                        log::info!(
+                            "GPU locate test: {n} answers compared, {} mismatches",
+                            gpu.mismatches()
+                        );
+                    }
+                    return cpu;
+                }
+                Err(e) => {
+                    gpu.note_fallback();
+                    log::warn!("GPU locate: {} quarts on the CPU: {e}", quarts.len());
+                }
+            }
+        }
+        self.noise_biomes_cpu(worker, quarts)
     }
     fn jigsaw_pieces(
         &self,
@@ -4588,6 +5082,11 @@ impl OverworldGenerator {
     pub fn spawn_position(&self) -> Result<[i32; 2], GeneratorError> {
         self.pipeline.spawn_position()
     }
+    /// Whether biome searches over many quarts come from the GPU's batches (HORIZON_GPU_LOCATE):
+    /// the stronghold rings then take some tens of milliseconds, not a second of CPU.
+    pub fn biome_batches(&self) -> bool {
+        self.pipeline.biome_batches()
+    }
     /// A new `WorldGenRegion` random centred on the chunk: what its generation
     /// steps draw from (`level.getRandom()`).
     pub fn region_random(
@@ -4816,6 +5315,225 @@ mod region_tests;
 mod tests {
     use super::super::biome_chunks::CACHE_LIMIT;
     use super::*;
+    /// The GPU's biome search walks the spiral by batches: put end to end they are the spiral,
+    /// in its order, and none holds more quarts than a batch of the GPU (but one column).
+    #[test]
+    fn locate_batches_walk_the_spiral_in_order() {
+        for (radius, per_column) in [(0, 1), (0, 0), (3, 7), (40, 6), (200, 7), (5, 600_000)] {
+            let all: Vec<[i32; 2]> = spiral_around(radius).collect();
+            let batches: Vec<Vec<[i32; 2]>> =
+                locate_batches(spiral_around(radius), per_column).collect();
+            assert_eq!(
+                batches.concat(),
+                all,
+                "radius {radius}, {per_column} a column"
+            );
+            let most = (horizon_gpu::LOCATE_BATCH / per_column.max(1)).max(1);
+            assert!(batches.iter().all(|b| !b.is_empty() && b.len() <= most));
+        }
+    }
+    /// `/locate biome minecraft:mushroom_fields` from three places and a search through the
+    /// whole spiral (the deep dark, which no quart at y 200 or above has), then a map preview's
+    /// quarts, on the CPU and, when HORIZON_GPU_LOCATE is set and a GPU answers, on the GPU:
+    /// timed, and the same answers. `HORIZON_GPU_LOCATE=1 cargo test -p horizon-world --release
+    /// --features cuda --lib -- --ignored --nocapture locate_biome_on_the_cpu_and_the_gpu`
+    #[test]
+    #[ignore = "benchmark"]
+    fn locate_biome_on_the_cpu_and_the_gpu() {
+        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3")
+            });
+        if !root.join("worldgen/world_presets.json").exists() {
+            eprintln!("skipping: no worldgen bundle at {}", root.display());
+            return;
+        }
+        let registry = Box::leak(Box::new(crate::level::data::load_registry(&root).unwrap()));
+        let data = GeneratorData::load(&root.join("worldgen"), registry).unwrap();
+        let preset: Value = serde_json::from_str(&data.world_presets["minecraft:normal"]).unwrap();
+        let generator_json = &preset["dimensions"]["minecraft:overworld"]["generator"];
+        let settings: Value =
+            serde_json::from_str(&data.settings[generator_json["settings"].as_str().unwrap()])
+                .unwrap();
+        let pipeline = Arc::new(
+            Pipeline::new(
+                data,
+                12345,
+                XoroshiroRandom::new(12345),
+                generator_json,
+                &settings,
+                false,
+                Some((-64, 384)),
+                None,
+            )
+            .expect("pipeline"),
+        );
+        let mut worker = OverworldGenerator {
+            pipeline: pipeline.clone(),
+            noise_clamped: None,
+        }
+        .worker();
+        let ms = |started: std::time::Instant| started.elapsed().as_secs_f64() * 1e3;
+        for (biome, origin, min_y) in [
+            ("minecraft:mushroom_fields", [0, 64, 0], -64),
+            ("minecraft:mushroom_fields", [5000, 64, -3000], -64),
+            ("minecraft:mushroom_fields", [-20000, 64, 12000], -64),
+            ("minecraft:deep_dark", [0, 250, 0], 200),
+        ] {
+            let allowed = |name: &str| name == biome;
+            let search = BiomeSearch {
+                allowed: &allowed,
+                origin,
+                radius: 6400,
+                horizontal: 32,
+                vertical: 64,
+                min_y,
+                max_y: 319,
+            };
+            let candidates: BTreeSet<&str> = pipeline
+                .source
+                .possible_biomes()
+                .into_iter()
+                .filter(|name| allowed(name))
+                .collect();
+            let started = std::time::Instant::now();
+            let cpu =
+                pipeline.closest_biome_cpu(&mut worker.state, &search, &candidates, usize::MAX);
+            let cpu_ms = ms(started);
+            // The near pass, when it finds, finds what the whole search finds.
+            let near = pipeline.closest_biome_cpu(
+                &mut worker.state,
+                &search,
+                &candidates,
+                LOCATE_CPU_QUARTS,
+            );
+            assert!(
+                near.is_none() || near == cpu,
+                "{biome} from {origin:?}: near {near:?}"
+            );
+            let Some(gpu) = &pipeline.locate_gpu else {
+                eprintln!("{biome} from {origin:?}: CPU {cpu_ms:.0} ms, {cpu:?} (no GPU)");
+                continue;
+            };
+            let started = std::time::Instant::now();
+            let found = pipeline
+                .closest_biome_gpu(gpu, &search, &candidates)
+                .expect("GPU search");
+            let gpu_ms = ms(started);
+            eprintln!("{biome} from {origin:?}: CPU {cpu_ms:.0} ms, GPU {gpu_ms:.1} ms, {cpu:?}");
+            assert_eq!(found, cpu, "{biome} from {origin:?}");
+        }
+        // A map preview: 128 x 128 quarts at sea level, in pixel order.
+        let quarts: Vec<[i32; 3]> = (0..128)
+            .flat_map(|row| (0..128).map(move |column| [column * 2 - 128, 15, row * 2 - 128]))
+            .collect();
+        let started = std::time::Instant::now();
+        let cpu = pipeline.noise_biomes_cpu(&mut worker.state, &quarts);
+        let cpu_ms = ms(started);
+        if let Some(gpu) = &pipeline.locate_gpu {
+            let started = std::time::Instant::now();
+            let found = pipeline
+                .noise_biomes_gpu(gpu, &quarts)
+                .expect("GPU preview");
+            eprintln!("map preview: CPU {cpu_ms:.1} ms, GPU {:.1} ms", ms(started));
+            assert_eq!(found, cpu);
+        }
+    }
+    /// The stronghold rings' 128 squares of seed 1234 (3,249 quarts each) on the CPU, one
+    /// `noise_biomes` call a square as the ring searches make them, and, with HORIZON_GPU_LOCATE
+    /// and a GPU, from the GPU's batch (`noise_biome_lists_gpu`): timed, the same biomes, and
+    /// the positions `stronghold_rings_match_vanilla` expects. `HORIZON_GPU_LOCATE=1
+    /// HORIZON_RESOURCES=... cargo test -p horizon-world --release --features cuda --lib --
+    /// --ignored --nocapture stronghold_squares_on_the_cpu_and_the_gpu`
+    #[test]
+    #[ignore = "benchmark"]
+    fn stronghold_squares_on_the_cpu_and_the_gpu() {
+        use crate::worldgen::structure::{start::StartContext as _, stronghold::RingSearch};
+        let Some(data) = prepared_data() else {
+            return;
+        };
+        let preset: Value = serde_json::from_str(&data.world_presets["minecraft:normal"]).unwrap();
+        let generator_json = &preset["dimensions"]["minecraft:overworld"]["generator"];
+        let settings: Value =
+            serde_json::from_str(&data.settings[generator_json["settings"].as_str().unwrap()])
+                .unwrap();
+        let pipeline = Arc::new(
+            Pipeline::new(
+                data,
+                1234,
+                XoroshiroRandom::new(1234),
+                generator_json,
+                &settings,
+                true,
+                Some((-64, 384)),
+                None,
+            )
+            .expect("pipeline"),
+        );
+        let mut worker = OverworldGenerator {
+            pipeline: pipeline.clone(),
+            noise_clamped: None,
+        }
+        .worker();
+        let registry = &pipeline.structures.as_ref().expect("structures").registry;
+        let set = (registry.sets.iter())
+            .position(|set| set.name == "minecraft:strongholds")
+            .expect("the strongholds' set");
+        let searches: Vec<RingSearch> = (registry.ring_searches(&[set], 1234).into_iter())
+            .flat_map(|(_, searches)| searches)
+            .collect();
+        let squares: Vec<Vec<[i32; 3]>> = searches.iter().map(RingSearch::square).collect();
+        let positions = |lists: &[Vec<BiomeId>]| -> Vec<ChunkPos> {
+            (searches.iter().zip(lists))
+                .map(|(search, list)| {
+                    search.find(registry.ring_biomes(set), &mut |_: &[[i32; 3]]| {
+                        list.clone()
+                    })
+                })
+                .collect()
+        };
+        let ms = |started: std::time::Instant| started.elapsed().as_secs_f64() * 1e3;
+        let mut queries = StructureQueries {
+            pipeline: &*pipeline,
+            worker: &mut worker.state,
+            valid: BTreeSet::new(),
+        };
+        let started = std::time::Instant::now();
+        let cpu: Vec<Vec<BiomeId>> = (squares.iter())
+            .map(|square| queries.noise_biomes(square))
+            .collect();
+        let cpu_ms = ms(started);
+        // Seed 1234's strongholds where vanilla 26.3 puts them.
+        let expected = positions(&cpu);
+        for (i, x, z) in [
+            (0, -100, -125),
+            (1, 131, -12),
+            (111, 1190, -560),
+            (113, 1305, -112),
+        ] {
+            assert_eq!(expected[i], ChunkPos::new(x, z), "stronghold {i}");
+        }
+        let quarts: usize = squares.iter().map(Vec::len).sum();
+        let Some(gpu) = &pipeline.locate_gpu else {
+            eprintln!(
+                "{} squares, {quarts} quarts: CPU {cpu_ms:.0} ms (no GPU)",
+                squares.len()
+            );
+            return;
+        };
+        let started = std::time::Instant::now();
+        let found = pipeline
+            .noise_biome_lists_gpu(gpu, &squares)
+            .expect("GPU batch");
+        let gpu_ms = ms(started);
+        eprintln!(
+            "{} squares, {quarts} quarts: CPU {cpu_ms:.0} ms, GPU {gpu_ms:.1} ms",
+            squares.len()
+        );
+        assert_eq!(found, cpu);
+        assert_eq!(positions(&found), expected);
+    }
     #[test]
     fn out_from_origin_preserves_order_and_handles_extreme_positive_steps() {
         assert_eq!(out_from_origin(4, 0, 8, 2), [4, 6, 2, 8, 0]);
@@ -5458,6 +6176,122 @@ mod tests {
         );
     }
 
+    /// The ocean monuments' surroundings (`monument_box`: 3,600 quarts) at seed 1234's monument
+    /// candidates within 8 sectors of the origin: every quart's biome on the CPU (a search of its
+    /// own, as `noise_biome` asks it) and, with HORIZON_GPU_LOCATE and a GPU, from the GPU
+    /// (`fresh_biomes_gpu`); then each box's check as structure starts ask it
+    /// (`all_noise_biomes`) against the CPU's loop, each side from a fresh worker: timed, the
+    /// same biomes and answers. `HORIZON_GPU_LOCATE=1 HORIZON_RESOURCES=... cargo test -p
+    /// horizon-world --release --features cuda --lib -- --ignored --nocapture
+    /// monument_boxes_on_the_cpu_and_the_gpu`
+    #[test]
+    #[ignore = "benchmark"]
+    fn monument_boxes_on_the_cpu_and_the_gpu() {
+        use crate::worldgen::structure::start::{
+            StartContext as _, StructureKind, StructureRegistry, monument_box,
+        };
+        let Some(data) = prepared_data() else {
+            return;
+        };
+        let preset: Value = serde_json::from_str(&data.world_presets["minecraft:normal"]).unwrap();
+        let generator_json = &preset["dimensions"]["minecraft:overworld"]["generator"];
+        let settings: Value =
+            serde_json::from_str(&data.settings[generator_json["settings"].as_str().unwrap()])
+                .unwrap();
+        let pipeline = Arc::new(
+            Pipeline::new(
+                data,
+                1234,
+                XoroshiroRandom::new(1234),
+                generator_json,
+                &settings,
+                true,
+                Some((-64, 384)),
+                None,
+            )
+            .expect("pipeline"),
+        );
+        let generator = OverworldGenerator {
+            pipeline: pipeline.clone(),
+            noise_clamped: None,
+        };
+        let registry = &pipeline.structures.as_ref().expect("structures").registry;
+        let set = (registry.sets.iter())
+            .find(|set| set.name == "minecraft:ocean_monuments")
+            .expect("the monuments' set");
+        let spacing = set.spacing().expect("a random spread");
+        let surrounding = (registry.structures.iter())
+            .find_map(|structure| match &structure.kind {
+                StructureKind::Monument(surrounding) => Some(surrounding),
+                _ => None,
+            })
+            .expect("the monument");
+        let allowed = |biome: BiomeId| surrounding.contains(&biome);
+        let sea_level = pipeline.settings.sea_level;
+        let boxes: Vec<Vec<[i32; 3]>> = (-8..8)
+            .flat_map(|sx| (-8..8).map(move |sz| (sx * spacing, sz * spacing)))
+            .filter_map(|(x, z)| StructureRegistry::potential_chunk(set, 1234, x, z))
+            .map(|chunk| monument_box(chunk, sea_level))
+            .collect();
+        let ms = |started: std::time::Instant| started.elapsed().as_secs_f64() * 1e3;
+        // Every quart, each a search of its own.
+        let mut worker = generator.worker();
+        let mut queries = StructureQueries {
+            pipeline: &*pipeline,
+            worker: &mut worker.state,
+            valid: BTreeSet::new(),
+        };
+        let started = std::time::Instant::now();
+        let cpu: Vec<Vec<BiomeId>> = (boxes.iter())
+            .map(|quarts| {
+                (quarts.iter())
+                    .map(|&q| queries.noise_biomes(&[q])[0])
+                    .collect()
+            })
+            .collect();
+        let cpu_ms = ms(started);
+        let full = (cpu.iter())
+            .filter(|biomes| biomes.iter().all(|&biome| allowed(biome)))
+            .count();
+        eprintln!(
+            "{} boxes, {full} all surrounding: every quart on the CPU {cpu_ms:.0} ms",
+            boxes.len()
+        );
+        if let Some(gpu) = &pipeline.locate_gpu {
+            let started = std::time::Instant::now();
+            let found: Vec<Vec<BiomeId>> = (boxes.iter())
+                .map(|quarts| pipeline.fresh_biomes_gpu(gpu, quarts).expect("GPU box"))
+                .collect();
+            eprintln!("every quart on the GPU {:.1} ms", ms(started));
+            assert_eq!(found, cpu);
+        }
+        // The check as structure starts ask it, each side from a fresh worker.
+        let mut worker = generator.worker();
+        let mut queries = StructureQueries {
+            pipeline: &*pipeline,
+            worker: &mut worker.state,
+            valid: BTreeSet::new(),
+        };
+        let started = std::time::Instant::now();
+        let loops: Vec<bool> = (boxes.iter())
+            .map(|quarts| (quarts.iter()).all(|&quart| allowed(queries.noise_biome(quart))))
+            .collect();
+        let loop_ms = ms(started);
+        let mut worker = generator.worker();
+        let mut queries = StructureQueries {
+            pipeline: &*pipeline,
+            worker: &mut worker.state,
+            valid: BTreeSet::new(),
+        };
+        let started = std::time::Instant::now();
+        let checks: Vec<bool> = (boxes.iter())
+            .map(|quarts| queries.all_noise_biomes(quarts, &allowed))
+            .collect();
+        let check_ms = ms(started);
+        eprintln!("the checks: the CPU's loop {loop_ms:.1} ms, all_noise_biomes {check_ms:.1} ms");
+        assert_eq!(checks, loops);
+        assert_eq!(loops.iter().filter(|&&all| all).count(), full);
+    }
     /// Seed 1234's strongholds where vanilla 26.3 puts them
     /// (VanillaStructureStartOracle with HORIZON_RINGS). Each search sampled
     /// its quarts through fresh resolvers, which broke climate ties their own

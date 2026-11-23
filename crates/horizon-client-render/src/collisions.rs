@@ -143,6 +143,14 @@ impl<W: BlockCollisionWorld> BlockCollisionWorld for EntityCollisions<'_, W> {
     ) -> std::result::Result<VoxelShape, Self::Error> {
         self.blocks.context_shape(block, p, context)
     }
+    fn context_shape_ref(
+        &mut self,
+        block: CollisionBlock,
+        p: BlockPos,
+        context: &CollisionContext<'_>,
+    ) -> std::result::Result<std::borrow::Cow<'_, VoxelShape>, Self::Error> {
+        self.blocks.context_shape_ref(block, p, context)
+    }
 }
 impl<W: EntityMovementWorld<Error = io::Error>> EntityMovementWorld for EntityCollisions<'_, W> {
     type Error = io::Error;
@@ -326,6 +334,14 @@ impl<'w> SceneCollisions<'w, '_> {
         let block = self.collision_block(chunk, p)?;
         if block.moving_piston || block.empty_shape {
             return Ok(false);
+        }
+        // A block without a contextual rule has its cached shape under every context
+        // (`collision_shape_with_context` hands out a clone of it): it is asked in place.
+        let binding = self.binding;
+        if !binding.has_context_rule(block.state)
+            && let Ok(Some(shape)) = binding.cached_shapes().cached_shape(block.state)
+        {
+            return Ok(shape.is_block());
         }
         let context = self.context(bounds);
         Ok(self.context_shape(block, p, &context)?.is_block())
@@ -591,6 +607,25 @@ impl<'w> BlockCollisionWorld for SceneCollisions<'w, '_> {
         self.binding
             .collision_shape_with_context(self, block.state, p, context)
             .map_err(io::Error::other)
+    }
+    /// A block without a contextual rule has its cached shape under every context:
+    /// `collision_shape_with_context` hands out a clone of it, and it is lent here instead.
+    /// Every other block (a contextual or declared context shape, a dynamic one, a state the
+    /// cache cannot answer) asks `context_shape`.
+    fn context_shape_ref(
+        &mut self,
+        block: CollisionBlock,
+        p: BlockPos,
+        context: &CollisionContext<'_>,
+    ) -> io::Result<std::borrow::Cow<'_, VoxelShape>> {
+        let binding = self.binding;
+        if !binding.has_context_rule(block.state)
+            && let Ok(Some(shape)) = binding.cached_shapes().cached_shape(block.state)
+        {
+            return Ok(std::borrow::Cow::Borrowed(shape));
+        }
+        self.context_shape(block, p, context)
+            .map(std::borrow::Cow::Owned)
     }
 }
 impl EntityMovementWorld for SceneCollisions<'_, '_> {
@@ -1221,8 +1256,185 @@ mod section_tests {
 }
 
 #[cfg(test)]
+mod lent_shape_tests {
+    use super::*;
+    use horizon_world::collision_context::EntityContextKind;
+    use std::borrow::Cow;
+
+    /// Every state's shape at two spots, under the contexts the scans hand out (none, a
+    /// position's, a living entity's): `context_shape_ref` lends the very shape `context_shape`
+    /// clones (the same identity, bounds and boxes), or gives the shape it gives; it fails where
+    /// it fails; an entity collision world over the scene passes the same answer on. Needs the
+    /// prepared resources.
+    #[test]
+    #[ignore = "daily"]
+    fn lent_shapes_are_the_shapes_the_scene_gives() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
+        if !root.join("cached-collision.nbt").exists() {
+            eprintln!("no prepared resources: skipped");
+            return;
+        }
+        let assets = crate::assets::Assets::load(&root).unwrap();
+        let render = assets
+            .reload(&horizon_assets::resource_source::ResourceRoot::directory(
+                root.to_path_buf(),
+            ))
+            .unwrap();
+        let binding = load(&root, assets.registry).unwrap();
+        let world = World::test_scene(&assets, &render, 3).unwrap();
+        let living = CollisionEntity {
+            identity: EntityIdentity(0),
+            kind: EntityContextKind::Living,
+            y: 5.0,
+            descending: false,
+            main_hand: Some(CollisionItem::EMPTY),
+        };
+        let contexts = [
+            CollisionContext::empty(false),
+            CollisionContext::position(5.5),
+            CollisionContext::for_entity(living, false),
+        ];
+        let boxes = |shape: &VoxelShape| (shape.bounds(), shape.boxes().to_vec());
+        let (mut lent, mut given) = (0, 0);
+        for i in 0..assets.registry.len() {
+            let state = BlockStateId(i as u32);
+            let Ok(block) = binding.collision_block(state) else {
+                continue;
+            };
+            for p in [BlockPos::new(0, 5, 0), BlockPos::new(-7, 30, 12)] {
+                for context in &contexts {
+                    let mut scene = SceneCollisions {
+                        world: &world,
+                        binding: &binding,
+                        subject: None,
+                    };
+                    let cloned = scene.context_shape(block, p, context);
+                    let answer = scene
+                        .context_shape_ref(block, p, context)
+                        .map(|shape| (matches!(shape, Cow::Borrowed(_)), shape.into_owned()));
+                    let mut entities = EntityCollisions {
+                        blocks: SceneCollisions {
+                            world: &world,
+                            binding: &binding,
+                            subject: None,
+                        },
+                        entities: &[],
+                        border: None,
+                    };
+                    let passed = entities
+                        .context_shape_ref(block, p, context)
+                        .map(|shape| shape.into_owned());
+                    match (cloned, answer, passed) {
+                        (Ok(cloned), Ok((borrowed, shape)), Ok(passed)) => {
+                            assert_eq!(boxes(&shape), boxes(&cloned), "state {i} at {p:?}");
+                            assert_eq!(boxes(&passed), boxes(&cloned), "state {i} at {p:?}");
+                            if borrowed {
+                                lent += 1;
+                                assert!(shape.same_identity(&cloned), "state {i} at {p:?}");
+                                assert!(passed.same_identity(&cloned), "state {i} at {p:?}");
+                            } else {
+                                given += 1;
+                            }
+                        }
+                        (Err(_), Err(_), Err(_)) => {}
+                        (cloned, answer, passed) => panic!(
+                            "state {i} at {p:?}: {:?} / {:?} / {:?}",
+                            cloned.is_ok(),
+                            answer.is_ok(),
+                            passed.is_ok()
+                        ),
+                    }
+                }
+            }
+        }
+        assert!(lent > 10_000 && given > 0, "{lent} lent, {given} given");
+    }
+}
+
+#[cfg(test)]
 mod rest_tests {
     use super::*;
+
+    impl SceneCollisions<'_, '_> {
+        /// `rests_on_full_block` as it was before it read fixed shapes in place: the shape of
+        /// the block under the box cloned through `context_shape`.
+        fn rests_on_full_block_by_clone(
+            &mut self,
+            bounds: Aabb,
+            movement: Vec3,
+            entities: &[Aabb],
+        ) -> io::Result<bool> {
+            let (lo, hi) = (bounds.min_position(), bounds.max_position());
+            let bottom = lo.y;
+            if movement.x != 0.0
+                || movement.z != 0.0
+                || movement.y.is_nan()
+                || movement.y >= 0.0
+                || !entities.is_empty()
+                || !bottom.is_finite()
+                || bottom != bottom.floor()
+            {
+                return Ok(false);
+            }
+            let under = Vec3::new((lo.x + hi.x) / 2.0, bottom - 0.5, (lo.z + hi.z) / 2.0);
+            let p = BlockPos::containing(under);
+            let Some(chunk) = self.collision_chunk(ChunkPos::new(p.x >> 4, p.z >> 4))? else {
+                return Ok(false);
+            };
+            let block = self.collision_block(chunk, p)?;
+            if block.moving_piston || block.empty_shape {
+                return Ok(false);
+            }
+            let context = self.context(bounds);
+            Ok(self.context_shape(block, p, &context)?.is_block())
+        }
+    }
+
+    /// Every state of the registry under a box, for a scene without a subject (a position's
+    /// context) and with one (a living entity's): `rests_on_full_block` answers as asking the
+    /// cloned shape does, errors included. Needs the prepared resources.
+    #[test]
+    #[ignore = "daily"]
+    fn every_state_rests_as_its_cloned_shape_says() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
+        if !root.join("cached-collision.nbt").exists() {
+            eprintln!("no prepared resources: skipped");
+            return;
+        }
+        let assets = crate::assets::Assets::load(&root).unwrap();
+        let render = assets
+            .reload(&horizon_assets::resource_source::ResourceRoot::directory(
+                root.to_path_buf(),
+            ))
+            .unwrap();
+        let binding = load(&root, assets.registry).unwrap();
+        let mut world = World::test_scene(&assets, &render, 3).unwrap();
+        let bounds = Aabb::new(Vec3::new(40.05, 61.0, 40.05), Vec3::new(40.95, 62.4, 40.95));
+        let gravity = Vec3::new(0.0, -0.0784, 0.0);
+        let mut rested = 0;
+        for i in 0..assets.registry.len() {
+            world.set(40, 60, 40, BlockStateId(i as u32)).unwrap();
+            for subject in [None, Some(PowderSnowSubject::default())] {
+                let scene = || SceneCollisions {
+                    world: &world,
+                    binding: &binding,
+                    subject,
+                };
+                let rests = scene().rests_on_full_block(bounds, gravity, &[]);
+                let cloned = scene().rests_on_full_block_by_clone(bounds, gravity, &[]);
+                assert_eq!(rests.is_ok(), cloned.is_ok(), "state {i}");
+                if let (Ok(rests), Ok(cloned)) = (rests, cloned) {
+                    assert_eq!(rests, cloned, "state {i}");
+                    rested += usize::from(rests);
+                }
+            }
+        }
+        assert!(rested > 1_000, "{rested} rested");
+    }
 
     /// Boxes over full blocks (stone, glass, a closed shulker box), partial ones (a slab, soul
     /// sand, honey, a fence), blocks whose shape depends on the entity (powder snow, scaffolding)

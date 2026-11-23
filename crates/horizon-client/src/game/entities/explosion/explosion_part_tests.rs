@@ -619,3 +619,106 @@ fn a_block_part_keeps_its_block_from_a_dangerous_skull_cap() {
         });
     });
 }
+
+/// Oak planks' part: 2 everywhere, declared pure, counting the asks.
+#[derive(Clone, Default)]
+struct PureResist(Arc<AtomicI32>);
+#[mod_api::horizon_part]
+impl BlockPart for PureResist {
+    fn explosion_resistance(
+        &self,
+        _: &dyn LevelHost,
+        _: &mut ExplosionResistanceEvent<'_>,
+    ) -> Option<f32> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Some(2.0)
+    }
+    fn explosion_resistance_is_pure(&self) -> bool {
+        true
+    }
+}
+/// Dirt answering through `Resist`, which does not declare its answer pure, and oak planks
+/// through `PureResist`.
+#[derive(Clone, Default)]
+struct RayParts {
+    dirt: Resist,
+    planks: PureResist,
+}
+#[mod_api::__subscriptions]
+impl Hooks for RayParts {
+    fn register(&self, r: &mut dyn Registrar, _: &mod_api::RegistrationContext) {
+        let dirt = r.block_key("minecraft:dirt");
+        r.block_part(dirt, self.dirt.clone());
+        let planks = r.block_key("minecraft:oak_planks");
+        r.block_part(planks, self.planks.clone());
+    }
+}
+
+/// A blast's rays ask a block's `explosion_resistance` part at every ray's step into its block, as
+/// they did before `RayCells`, whether the part declares its answer pure or not; they explode the
+/// same positions in the same order and draw the same either way.
+#[test]
+#[ignore = "daily"]
+fn ray_cells_ask_impure_parts_at_each_ray() {
+    let parts = RayParts::default();
+    *parts.dirt.0.lock().unwrap() = Some(1.0);
+    let mods: mod_api::Mods =
+        vec![mod_api::ModEntry::new("ray_parts", Box::new(parts.clone()))].into();
+    mod_platform::testing::with_mods(mods.clone(), || {
+        crate::game::api_values::install_parts(&mods).unwrap();
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            game.options.dedicated = Some(Vec::new());
+            game.world
+                .chunks
+                .insert((0, 0), Arc::new(horizon_client::chunk::Chunk::empty(0, 0)));
+            let registry = game.pack.assets.registry;
+            let blocks = ["minecraft:dirt", "minecraft:oak_planks", "minecraft:stone"]
+                .map(|name| registry.default_state(name).unwrap());
+            // Dirt, planks and stone in turn around the blast's own cell, which stays air.
+            for x in 2..=12 {
+                for y in 60..=70 {
+                    for z in 2..=12 {
+                        if [x, y, z] != [7, 65, 7] {
+                            let state = blocks[((x + 2 * y + 3 * z) % 3) as usize];
+                            game.world.set(x, y, z, state).unwrap();
+                        }
+                    }
+                }
+            }
+            let center = [7.5, 65.06125, 7.5];
+            let start = ExplosionStart::from(mod_api::__private::built::ExplosionStart {
+                dimension: "minecraft:overworld",
+                center,
+                radius: 4.0,
+                fire: false,
+                interaction: mod_api::BlockInteraction::Destroy,
+                damage_type: "minecraft:explosion",
+                source: None,
+                owner: None,
+            });
+            // The positions, the level random after the rays, and how often each part was asked.
+            let rays = |game: &mut Game<'_>, cells: RayCells| {
+                let asks = || {
+                    let dirt = parts.dirt.1.load(Ordering::Relaxed);
+                    (dirt, parts.planks.0.load(Ordering::Relaxed))
+                };
+                let before = asks();
+                game.world.random.set_seed(7);
+                let exploded =
+                    game.exploded_positions_with(center, 4.0, None, false, &start, cells);
+                let after = asks();
+                let drawn = game.world.random.next_int();
+                (exploded, drawn, after.0 - before.0, after.1 - before.1)
+            };
+            let asked = rays(game, RayCells::none());
+            let kept = rays(game, RayCells::around(center, 4.0));
+            assert!(asked.0.len() > 20, "{}", asked.0.len());
+            assert_eq!(kept.0, asked.0);
+            assert_eq!(kept.1, asked.1, "the level random");
+            assert!(asked.2 > 0);
+            assert_eq!(kept.2, asked.2, "dirt's part is asked at every ray's step");
+            assert!(asked.3 > 0);
+            assert_eq!(kept.3, asked.3, "planks' pure part is asked at every ray's step too");
+        });
+    });
+}

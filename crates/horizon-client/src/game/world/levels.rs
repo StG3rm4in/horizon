@@ -153,6 +153,9 @@ pub(super) struct Parked {
     /// Which of this level's chunks may hold a portal (`Game::find_portals`), kept per level:
     /// one cache asked by two levels in turn read every palette of both again each tick.
     pub(super) portal_sections: horizon_client::portal_sections::PortalSections,
+    /// Which of this level's chunks still hold postprocessing marks (`Game::postprocess_chunks`),
+    /// kept per level for the same reason.
+    postprocess_marks: horizon_client::postprocess_marks::PostprocessMarks,
     falling: horizon_client::join_seq::JoinList<FallingBlock, false>,
     paintings: horizon_client::join_seq::JoinList<horizon_client::entities::Painting>,
     item_frames: horizon_client::join_seq::JoinList<horizon_client::entities::ItemFrame>,
@@ -794,6 +797,7 @@ impl Game<'_> {
             level_events: Vec::new(),
             portal_states: HashMap::new(),
             portal_sections: Default::default(),
+            postprocess_marks: Default::default(),
             falling: Default::default(),
             paintings: Default::default(),
             item_frames: Default::default(),
@@ -951,6 +955,7 @@ impl Game<'_> {
         swap(&mut self.level_events, &mut p.level_events);
         swap(&mut self.portals.entities, &mut p.portal_states);
         swap(&mut self.portals.sections, &mut p.portal_sections);
+        swap(&mut self.postprocess_marks, &mut p.postprocess_marks);
         swap(&mut self.falling, &mut p.falling);
         swap(&mut self.paintings, &mut p.paintings);
         swap(&mut self.item_frames, &mut p.item_frames);

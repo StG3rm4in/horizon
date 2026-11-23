@@ -155,6 +155,18 @@ def make_refs(probe, res, folder, jobs):
         sys.exit("making the references failed:\n" + bad[0][-2000:])
 
 
+# A test mode's nonzero mismatches: a count before the word ("3 mismatches"), a count after it ("mismatches
+# with the CPU (test mode): 3 masks, 0 substances", the caves), or the surface's first one.
+MISMATCH_BEFORE = re.compile(r"\b[1-9]\d* (?:mismatch|mismatches|differ)")
+MISMATCH_AFTER = re.compile(r"\bmismatches\b[^:;]*:\s*([^;]*)")
+
+
+def mismatched(line):
+    if MISMATCH_BEFORE.search(line) or "first mismatch" in line:
+        return True
+    return any(re.search(r"\b[1-9]\d*\b", m.group(1)) for m in MISMATCH_AFTER.finditer(line))
+
+
 def gpu_problems(err, mode, dim):
     """What a GPU run's stderr says went wrong: a stage its dimension uses idle, failed batches,
     test-mode mismatches, notices."""
@@ -171,7 +183,7 @@ def gpu_problems(err, mode, dim):
                      if line.startswith("GPU ") and FAILED.search(line)]
     if mode in ("test", "sections"):
         for line in err.splitlines():
-            if line.startswith("GPU ") and re.search(r"\b[1-9]\d* (?:mismatch|mismatches|differ)", line):
+            if line.startswith("GPU ") and mismatched(line):
                 problems.append(line.strip()[:200])
     problems += [line.strip()[:200] for line in err.splitlines() if NOTICES.search(line)]
     return problems
@@ -245,33 +257,48 @@ def probe(args, built=None):
 
 def light(args):
     """The GPU light against the CPU's, through the tick digest of a server build."""
-    work = Path(args.work) if args.work else ROOT / ".local" / "gpu-light"
+    ok, lines = light_check(args.bin, args.ticks, args.players, args.work)
+    for line in lines:
+        print(line, flush=True)
+    return 0 if ok else 1
+
+
+def light_check(bin_dir, ticks, players, work=None):
+    """`light`'s runs and verdict, as (ok, lines). The light's counts are its final summary, which it writes
+    to stderr as the server stops (the run's run.log), else its last periodic line (latest.log)."""
+    work = Path(work) if work else ROOT / ".local" / "gpu-light"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    common = ["--bin", args.bin, "--ticks", str(args.ticks), "--players", str(args.players), "--join-every", "2",
+    common = ["--bin", bin_dir, "--ticks", str(ticks), "--players", str(players), "--join-every", "2",
               "--full", "50", "--work", str(work)]
     # The serial tick: the parallel one is the tick digest's own business.
     env = {k: v for k, v in os.environ.items() if k != "HORIZON_PARALLEL_TICK"}
+    lines = []
     for name, extra in (("cpu", []), ("gpu", ["--gpu"])):
         print(f"== tick digest, {name}", flush=True)
         code, outp = run_capture([sys.executable, str(ROOT / "tools" / "tick_digest.py"), "run", *common, *extra,
                                   "--out", str(work / name)], env=env)
         if code != 0:
-            sys.exit(f"the {name} run failed:\n" + "\n".join(outp.splitlines()[-20:]))
+            return False, [f"== the {name} run failed:", *outp.splitlines()[-20:]]
     code, outp = run_capture([sys.executable, str(ROOT / "tools" / "tick_digest.py"), "compare",
                               str(work / "cpu" / "digest.txt"), str(work / "gpu" / "digest.txt")])
     same = code == 0
-    log = (work / "gpu" / "logs" / "latest.log").read_text(errors="replace")
-    stats = re.findall(r"GPU light: (\d+) chunks.*?(\d+) failed, (\d+) fell back to the CPU", log)
+    texts = []
+    for name in ("logs/latest.log", "run.log"):
+        path = work / "gpu" / name
+        texts.append(path.read_text(errors="replace") if path.exists() else "")
+    final = [line for line in texts[1].splitlines() if "GPU light:" in line][-1:]
+    last = final or [line for line in texts[0].splitlines() if "GPU light:" in line][-1:]
+    stats = re.findall(r"GPU light: (\d+) chunks.*?(\d+) failed, (\d+) fell back to the CPU", "".join(last))
     worked = bool(stats) and int(stats[-1][0]) > 0
     clean = bool(stats) and stats[-1][1] == "0" and stats[-1][2] == "0"
-    print(f"== digest CPU against every GPU stage: {'IDENTICAL' if same else 'DIFFERENT'}")
-    print("\n".join(outp.splitlines()[-6:]))
-    last = [line for line in log.splitlines() if "GPU light:" in line][-1:]
-    print(f"== {last[0].split('GPU light:', 1)[1].strip()[:200] if last else 'no GPU light line'}")
+    lines.append(f"== digest CPU against every GPU stage: {'IDENTICAL' if same else 'DIFFERENT'}")
+    lines += outp.splitlines()[-6:]
+    source = "final summary" if final else "last periodic line, no final summary"
+    lines.append(f"== {last[0].split('GPU light:', 1)[1].strip()[:200] if last else 'no GPU light line'} ({source})")
     ok = same and worked and clean
-    print(f"== verdict: {'OK' if ok else 'FAILED'}")
-    return 0 if ok else 1
+    lines.append(f"== verdict: {'OK' if ok else 'FAILED'}")
+    return ok, lines
 
 
 # --------------------------------------------------------------------------------------------- verify
@@ -375,6 +402,12 @@ def verify(args):
         ok, lines = tests(args.tests, resources(args))
         verdict &= ok
         sections.append(("unit tests", ok, lines))
+    if args.light_bin:
+        ok, lines = light_check(args.light_bin, 600, 100)
+        verdict &= ok
+        sections.append(("GPU light against the CPU's (tick digest)", ok, lines))
+    else:
+        sections.append(("GPU light", True, ["== not checked: --light-bin DIR (a server build) runs it"]))
     summary = f"== verdict: {'OK' if verdict else 'FAILED'} in {time.time() - t:.0f} s at {git_head()}"
     print(summary, flush=True)
     if args.report:
@@ -847,6 +880,8 @@ def main():
     p.add_argument("--lint", action="store_true", help="rustfmt and clippy -D warnings first")
     p.add_argument("--tests", nargs="*", default=[], metavar="CRATE[:FILTER]")
     p.add_argument("--report", help="write the results as Markdown")
+    p.add_argument("--light-bin", metavar="DIR",
+                   help="also check the GPU light with this server build (horizon-server, horizon-client)")
     p = sub.add_parser("pregen", help="/pregen on fresh servers: builds and settings compared")
     p.add_argument("--accept-eula", action="store_true", help="accept the Minecraft EULA for the servers made")
     p.add_argument("--bin", action="append", metavar="NAME=DIR", help="a build to measure (default: target/release)")

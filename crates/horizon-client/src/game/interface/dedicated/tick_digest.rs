@@ -252,6 +252,12 @@ impl Fixture {
         let Ok(ticks) = std::env::var("HORIZON_TICK_FIXTURE_TICKS") else {
             return Ok(None);
         };
+        // Only with the digest it serves: a HORIZON_TICK_FIXTURE_* left over on a real server
+        // must not bring simulated players in.
+        if std::env::var_os("HORIZON_TICK_DIGEST").is_none() {
+            log::warn!("HORIZON_TICK_FIXTURE_TICKS without HORIZON_TICK_DIGEST: no tick fixture");
+            return Ok(None);
+        }
         let mut commands = Vec::new();
         if let Some(path) = std::env::var_os("HORIZON_TICK_FIXTURE_COMMANDS") {
             for line in std::fs::read_to_string(path)?.lines() {
@@ -274,12 +280,19 @@ impl Fixture {
                 Err(_) => default,
             })
         };
+        let player_count = number("HORIZON_TICK_FIXTURE_PLAYERS", 0)? as usize;
+        // Said in the log: this server runs a fixture, not a world for players.
+        log::warn!(
+            "Tick digest fixture: {} ticks, {player_count} simulated players, {} commands",
+            ticks.trim(),
+            commands.len()
+        );
         horizon_client::streaming::set_deterministic(true);
         Ok(Some(Self {
             ticks: ticks.trim().parse()?,
             ran: 0,
             commands,
-            player_count: number("HORIZON_TICK_FIXTURE_PLAYERS", 0)? as usize,
+            player_count,
             join_every: number("HORIZON_TICK_FIXTURE_JOIN_EVERY", 10)?.max(1),
             players: Vec::new(),
             hostile: Vec::new(),

@@ -841,16 +841,27 @@ impl VanillaTerrain {
     /// which don't need the rings, made those 3 s slower. An eye of ender
     /// thrown later finds the rings ready, and a chunk or a query that
     /// needs them first shares the remaining searches with this thread.
+    /// With the GPU's biome batches (HORIZON_GPU_LOCATE) the searches are one
+    /// batch and a few milliseconds of replay: this thread searches as soon as
+    /// the world opens, at its own priority, so nothing waits for the rings,
+    /// and the thread asking for the batch cannot starve in the idle class
+    /// behind busy workers, which would then search on the CPU instead. When
+    /// they are searched does not change what they are.
     pub fn search_rings_behind(self: &Arc<Self>) {
         const QUIET: u64 = 2_000;
         const LATEST: u64 = 60_000;
+        let at_once = self.generator.biome_batches();
         let terrain = Arc::downgrade(self);
         let spawned = horizon_guest_stack::builder()
             .name("Ring search".into())
             .spawn(move || {
-                horizon_threads::idle_current();
+                if !at_once {
+                    horizon_threads::idle_current();
+                }
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if !at_once {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
                     // The world closed: nothing to search for.
                     let Some(terrain) = terrain.upgrade() else {
                         return;
@@ -859,7 +870,7 @@ impl VanillaTerrain {
                     let last = terrain
                         .last_proto
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    if now >= LATEST || (last > 0 && now - last >= QUIET) {
+                    if at_once || now >= LATEST || (last > 0 && now - last >= QUIET) {
                         let _ = terrain
                             .generator
                             .worker()

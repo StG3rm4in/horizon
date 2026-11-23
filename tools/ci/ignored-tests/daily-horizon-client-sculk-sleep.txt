@@ -1,0 +1,2 @@
+# The sleeping sculk block entities test boots Game with prepared resources.
+horizon-client game::sculk::tests::idle_sculk_sleeps_until_changed_and_ticks_as_when_every_one_is_read lib daily resources

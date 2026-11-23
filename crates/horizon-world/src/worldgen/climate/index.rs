@@ -416,6 +416,12 @@ pub struct ClimateSearch<'a, T> {
 }
 impl<'a, T> ClimateSearch<'a, T> {
     pub fn find(&mut self, target: TargetPoint) -> Result<&'a T, IndexError> {
+        let entry = self.find_entry(target)?;
+        Ok(&self.index.entries[entry].1)
+    }
+    /// `find`, as the index of the entry in [`ClimateIndex::entries`].
+    #[inline]
+    pub fn find_entry(&mut self, target: TargetPoint) -> Result<usize, IndexError> {
         let parameters = target.parameters();
         let values = std::array::from_fn(|i| parameters[i]);
         let result = if self.index.links[0].1 == 0 {
@@ -433,7 +439,53 @@ impl<'a, T> ClimateSearch<'a, T> {
         let (entry, 0) = self.index.links[result] else {
             unreachable!("search returns a leaf");
         };
-        Ok(&self.index.entries[entry as usize].1)
+        Ok(entry as usize)
+    }
+    /// `find_entry` told `first`: the node of the first leaf at the smallest distance from
+    /// `target` in this index's traversal order, what a search without a previous leaf finds
+    /// (the GPU's `kbl_search`, in [`ClimateIndex::tree`] numbering). The same entry and the same
+    /// previous leaf as `find_entry`: a search from the previous leaf keeps it when it is as
+    /// close as `first`, and otherwise reaches `first`, as every leaf before `first` is farther
+    /// and a box is never farther than the leaves inside it, and no later leaf replaces it.
+    /// That needs distances that do not wrap, which bounded boxes and targets have; for others,
+    /// and for a `first` that is no leaf or is farther than the previous leaf (no minimum is),
+    /// the search runs here as `find_entry`.
+    pub fn find_entry_from_first(
+        &mut self,
+        target: TargetPoint,
+        first: u32,
+    ) -> Result<usize, IndexError> {
+        let parameters = target.parameters();
+        let values: [i64; 6] = std::array::from_fn(|i| parameters[i]);
+        let first = first as usize;
+        let leaf = self
+            .index
+            .links
+            .get(first)
+            .is_some_and(|&(_, count)| count == 0);
+        if !leaf || !(self.index.bounded && values.iter().all(|value| bounded(*value))) {
+            return self.find_entry(target);
+        }
+        let result = if self.index.links[0].1 == 0 {
+            0
+        } else {
+            match self.last {
+                Some(last) if last != first => {
+                    let near = self.index.spaces[first].distance(&values);
+                    let kept = self.index.spaces[last].distance(&values);
+                    if near > kept {
+                        return self.find_entry(target);
+                    }
+                    if near == kept { last } else { first }
+                }
+                _ => first,
+            }
+        };
+        self.last = Some(result);
+        let (entry, 0) = self.index.links[result] else {
+            unreachable!("the root or a leaf");
+        };
+        Ok(entry as usize)
     }
 }
 
@@ -635,6 +687,90 @@ mod tests {
                 .map(|(id, (point, _))| (*point, id))
                 .collect(),
         )
+    }
+
+    /// `find_entry_from_first`, told the leaf a search without a previous leaf finds (as the
+    /// GPU's biome searches are), follows `find_entry` step by step, in its answers and in the
+    /// previous leaf it keeps: on walks with many ties, around the bound past which distances
+    /// may wrap (where it searches itself), and on the vanilla lists.
+    #[test]
+    fn a_replay_from_the_first_leaf_matches_find() {
+        let check = |entries: Vec<(ParameterPoint, usize)>, branching, targets: &[TargetPoint]| {
+            let Ok(index) = ClimateIndex::with_branching(entries, branching) else {
+                return false;
+            };
+            let (mut search, mut replay) = (index.searcher(), index.searcher());
+            for (step, &target) in targets.iter().enumerate() {
+                let parameters = target.parameters();
+                let values = std::array::from_fn(|i| parameters[i]);
+                let first = if index.links[0].1 == 0 {
+                    Some(0)
+                } else {
+                    index
+                        .search(0, &values, false, None, i64::MAX)
+                        .ok()
+                        .map(|(leaf, _)| leaf as u32)
+                };
+                let expected = search.find_entry(target).ok();
+                let actual = match first {
+                    Some(first) => replay.find_entry_from_first(target, first).ok(),
+                    None => replay.find_entry(target).ok(),
+                };
+                assert_eq!(actual, expected, "step {step}, target {target:?}");
+                assert_eq!(replay.last, search.last, "step {step}, target {target:?}");
+            }
+            true
+        };
+        let mut rng = Rng(0x10ca7e);
+        let edges = [
+            -BOUND,
+            1 - BOUND,
+            -BOUND / 2,
+            0,
+            BOUND / 2,
+            BOUND - 1,
+            BOUND,
+        ];
+        let mut built = 0;
+        for case in 0..48 {
+            let branching = 2 + case % 31;
+            let count = 1 + rng.below([8, 40, 400, 2000][case % 4]);
+            let edge = case % 3 == 2;
+            let value = |rng: &mut Rng| {
+                if edge {
+                    rng.pick(&edges)
+                } else {
+                    rng.range(-6, 6) * 100
+                }
+            };
+            let mut entries: Vec<(ParameterPoint, usize)> = Vec::with_capacity(count);
+            for id in 0..count {
+                let point = if id > 0 && rng.below(5) == 0 {
+                    entries[rng.below(id)].0
+                } else {
+                    ParameterPoint {
+                        coordinates: std::array::from_fn(|_| {
+                            let (a, b) = (value(&mut rng), value(&mut rng));
+                            Parameter::new(a.min(b), a.max(b))
+                        }),
+                        offset: if rng.below(3) == 0 {
+                            value(&mut rng).abs()
+                        } else {
+                            0
+                        },
+                    }
+                };
+                entries.push((point, id));
+            }
+            let span = if edge { BOUND + (1 << 24) } else { 800 };
+            let targets = walk(&mut rng, &entries, 1200, span);
+            built += usize::from(check(entries, branching, &targets));
+        }
+        assert!(built > 40, "{built} trees built");
+        if let Some(entries) = vanilla_list("overworld") {
+            let targets = walk(&mut Rng(0x0b5e), &entries, 50_000, 25_000);
+            assert!(check(entries, 19, &targets));
+        }
     }
 
     #[test]

@@ -9,9 +9,11 @@ Minecraft: Java Edition 26.3 (client, serveur et lanceur), vérifiée contre le 
 choses, avec la même règle que l'amont : **rien ne doit différer du vanilla**.
 
 1. **La génération du monde sur le GPU.** La densité, les aquifères, le beardifier, les règles de surface, les
-   minerais, les grottes, la lumière, les sections et les biomes tournent sur un GPU NVIDIA (CUDA), dans
-   l'Overworld, le Nether et l'End. Chaque chunk sort identique, bloc par bloc, au chemin CPU, lui-même identique
-   au vanilla.
+   minerais, les grottes, la lumière, les sections et les biomes tournent sur un GPU NVIDIA (CUDA) dans
+   l'Overworld. Le Nether et l'End n'ont pas d'aquifères ; le GPU y fait la densité et les grottes, et dans le
+   Nether aussi les règles de surface et les biomes ; les biomes de l'End et les sections compactes du Nether
+   restent sur le CPU (`crates/horizon-gpu/NETHER_END.md`). Chaque chunk sort identique, bloc par bloc, au chemin
+   CPU, lui-même identique au vanilla.
 2. **Un tick du serveur dédié plus rapide à 100 joueurs.** Chaque optimisation garde le tick identique au bit
    près au code d'avant, ce que vérifie un harnais tick par tick sur une scène fixe (voir plus bas).
 
@@ -51,16 +53,20 @@ que le fork intègre régulièrement.
   (785 chunks, 27 biomes, 74 sites de structures : 0 différence, sur le GPU comme sur le CPU), et une sonde compare
   les chemins CPU et GPU dans les trois dimensions. Une seule graine est comparée au vanilla ; les étapes GPU ont
   aussi des modes de test qui comparent chaque résultat à celui du CPU.
-- **Tick du serveur :** un harnais fait tourner une scène fixe, 600 ticks avec 100 joueurs simulés, et hache, à
-  chaque tick, l'état de l'aléa du niveau, les écritures de blocs, les ticks planifiés, les entités (id, type,
-  position, vitesse, rotation), les joueurs (position), les paquets envoyés à chaque joueur et les chunks chargés
-  (et tous les 50 ticks les blocs et la lumière de chaque section). Deux builds doivent donner les mêmes lignes,
-  en série et avec le tick parallèle (`HORIZON_PARALLEL_TICK=exact`).
+- **Tick du serveur :** un harnais fait tourner deux scènes fixes, 600 ticks avec 100 joueurs simulés : celle
+  par défaut (des joueurs en créatif qui volent dans l'Overworld, de jour) et une scène de survie (la nuit, en
+  difficile, une arène de générateurs et de dangers, des mobs qui combattent les joueurs, des joueurs dans le
+  Nether et l'End). À chaque tick, il hache l'aléa du niveau et sa gaussienne, les écritures de blocs, les ticks
+  planifiés, le mouvement de chaque entité et ses champs lus tels quels (santé, absorption, temps de blessure et
+  de mort, feu, gel, air, effets, cible et joueur auquel elle est liée, orientations, coups…), l'aléa propre de
+  chaque entité, les compteurs, le NBT des block entities qui tickent, les données de chaque joueur, chaque
+  paquet envoyé à chaque joueur, chaque niveau qui tick et les chunks chargés (et tous les 50 ticks les blocs et
+  la lumière de chaque section). Deux builds doivent donner les mêmes lignes, en série et avec le tick parallèle
+  (`HORIZON_PARALLEL_TICK=exact`).
 
-  Cela montre qu'une optimisation ne change rien par rapport au build d'avant, sur cette scène ; ce n'est pas une
-  comparaison avec le vanilla. Les joueurs de la scène sont en créatif et volent dans l'Overworld, de jour ; la
-  santé, l'IA et l'inventaire des entités et les block entities ne sont pas hachés, et les paquets ne le sont
-  que depuis le 22/11/2026. L'élargissement du harnais est à l'étude.
+  Cela montre qu'une optimisation ne change rien par rapport au build d'avant, sur ces scènes ; ce n'est pas une
+  comparaison avec le vanilla. Le harnais est dans chaque build du serveur, mais ne tourne qu'avec
+  `HORIZON_TICK_DIGEST` (que `tools/tick_digest.py` définit).
 - **Îlots de mobs :** `HORIZON_PARALLEL_TICK=verify` fait tourner les mobs à la fois en groupes et en série, et
   compare les deux.
 

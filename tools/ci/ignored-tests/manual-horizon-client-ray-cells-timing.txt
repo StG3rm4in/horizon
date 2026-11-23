@@ -1,0 +1,3 @@
+# The ray-cell memo's timing (explosion.rs): an opt-in measurement, never selected by daily shards; its exact
+# reason and rationale are in ../ignored-test-exceptions.json.
+horizon-client game::explosion::tests::ray_cells_timing by-hand manual # timing-only measurement; needs HORIZON_TEST_RESOURCES; optional RAY_BLASTS; exact-select full test path with --ignored --exact --nocapture on an idle machine

@@ -13,21 +13,13 @@ const POSTPROCESS_FLAGS: i32 = 276;
 
 impl Game<'_> {
     pub(super) fn postprocess_chunks(&mut self) -> Result<()> {
-        let mut ready: Vec<(i32, i32)> = self
-            .world
-            .chunks
-            .iter()
-            .filter(|(_, c)| c.lit && !c.postprocess.is_empty())
-            .map(|(k, _)| *k)
-            .filter(|&(x, z)| {
-                (-1..=1)
-                    .all(|dz| (-1..=1).all(|dx| self.world.chunks.contains_key(&(x + dx, z + dz))))
-            })
-            .collect();
+        // The lit chunks with marks whose eight neighbours are resident, in position order, kept
+        // from the chunks touched since the last ask (`PostprocessMarks`): reading every resident
+        // chunk for them missed the cache once for each of thousands of chunks, every tick.
+        let ready = self.postprocess_marks.ready(&self.world.chunks);
         if ready.is_empty() {
             return Ok(());
         }
-        ready.sort_unstable();
         // The ticks the marks schedule go to the chunks' containers, which a
         // chunk that arrived since the last tick doesn't have yet
         // (`LevelChunk.registerTickContainerInLevel` comes before

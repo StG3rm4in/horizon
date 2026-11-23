@@ -1848,6 +1848,7 @@ dependencies = [
  "horizon-friends",
  "horizon-game-discovery",
  "horizon-gameplay",
+ "horizon-gpu",
  "horizon-guest-stack",
  "horizon-hooks",
  "horizon-items",

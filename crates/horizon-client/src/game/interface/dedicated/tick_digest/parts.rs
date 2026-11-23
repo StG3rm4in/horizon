@@ -508,6 +508,13 @@ impl Game<'_> {
         // Each entity of the entity lists, list by list: its motion (`entities`), its fields
         // and its join number (`fields`), its own random (`randoms`).
         let (mut entities, mut fields, mut randoms) = (Part::new(), Part::new(), Part::new());
+        // A mob's target is `Who::Player` whoever the player is: the guest it is bound to
+        // (`LanHost::mob_players`) says which one.
+        let guests = self
+            .lan
+            .as_ref()
+            .map(|host| host.mob_players.clone())
+            .unwrap_or_default();
         for_each_entity!(entity_lists_of!(self), entity => {
             let (p, v, r) = (entity.position(), entity.velocity(), entity.rotation());
             entities.add((
@@ -519,6 +526,7 @@ impl Game<'_> {
             ));
             let mut own = Fields::new(detailed);
             entity.digest_fields(&mut own);
+            own.int("guest", guests.get(&entity.id()).map_or(-1, |&g| i64::from(g)));
             fields.add((entity.id(), entity.join_seq(), own.h.finish()));
             let random = entity.digest_random();
             let random = random.map(|g| (g.state(), g.cached_gaussian().map(f64::to_bits)));

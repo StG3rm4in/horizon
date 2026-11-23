@@ -248,6 +248,69 @@ pub(super) struct NearestPlayers<'p> {
     bounds: (i64, i64, i64, i64),
     /// Few players, or one too far out for cells: every question scans.
     scan: bool,
+    /// `cells` laid out as one table over `bounds`, when that box spans few enough squares
+    /// ([`CellTable::MOST`]): a question looks at dozens of squares, nearly all empty, and each
+    /// is then read by its index instead of hashed into `cells`.
+    table: Option<CellTable>,
+}
+/// [`NearestPlayers`]' squares row by row over their bounding box: square `(kx, kz)` is entry
+/// `e = (kz - z0) * width + (kx - x0)`, and its players are `players[starts[e]..starts[e + 1]]`,
+/// in the order `cells` lists them.
+struct CellTable {
+    x0: i64,
+    z0: i64,
+    width: i64,
+    depth: i64,
+    starts: Vec<u32>,
+    players: Vec<usize>,
+}
+impl CellTable {
+    /// The most squares a table spans (256 KiB of starts, players within about 8 km of each
+    /// other); players further apart keep the hashed squares.
+    const MOST: i64 = 1 << 16;
+    /// The table of `cells`, whose keys all lie in `(x0, z0, x1, z1)`; `None` past [`Self::MOST`].
+    fn new(
+        cells: &horizon_client::fast_hash::FxHashMap<(i64, i64), Vec<usize>>,
+        (x0, z0, x1, z1): (i64, i64, i64, i64),
+    ) -> Option<Self> {
+        let (width, depth) = (x1 - x0 + 1, z1 - z0 + 1);
+        if width < 1 || depth < 1 || width.checked_mul(depth)? > Self::MOST {
+            return None;
+        }
+        let entry = |(kx, kz): (i64, i64)| ((kz - z0) * width + (kx - x0)) as usize;
+        let mut starts = vec![0u32; (width * depth) as usize + 1];
+        for (&key, list) in cells {
+            starts[entry(key)] = list.len() as u32;
+        }
+        // Each entry's start: the players of the squares before it (the last, all of them).
+        let mut before = 0;
+        for start in &mut starts {
+            (*start, before) = (before, before + *start);
+        }
+        let mut players = vec![0; before as usize];
+        for (&key, list) in cells {
+            let at = starts[entry(key)] as usize;
+            players[at..at + list.len()].copy_from_slice(list);
+        }
+        Some(Self {
+            x0,
+            z0,
+            width,
+            depth,
+            starts,
+            players,
+        })
+    }
+    /// The players of square `(kx, kz)`, as `cells` lists them; none outside the box.
+    #[inline]
+    fn get(&self, kx: i64, kz: i64) -> &[usize] {
+        let (x, z) = (kx - self.x0, kz - self.z0);
+        if x < 0 || z < 0 || x >= self.width || z >= self.depth {
+            return &[];
+        }
+        let entry = (z * self.width + x) as usize;
+        &self.players[self.starts[entry] as usize..self.starts[entry + 1] as usize]
+    }
 }
 impl<'p> NearestPlayers<'p> {
     const CELL: f64 = 64.0;
@@ -272,11 +335,18 @@ impl<'p> NearestPlayers<'p> {
                 bounds.3.max(key.1),
             );
         }
+        // Only the rings read the squares: while every question scans, no table is made.
+        let table = if scan || cells.is_empty() {
+            None
+        } else {
+            CellTable::new(&cells, bounds)
+        };
         Self {
             players,
             cells,
             bounds,
             scan,
+            table,
         }
     }
     fn cell(x: f64, z: f64) -> (i64, i64) {
@@ -306,7 +376,12 @@ impl<'p> NearestPlayers<'p> {
         for ring in 0..=last {
             let mut look = |kx: i64, kz: i64| {
                 looked += 1;
-                for &i in self.cells.get(&(kx, kz)).into_iter().flatten() {
+                // The same players in the same order from the table as from the map.
+                let square = match &self.table {
+                    Some(table) => table.get(kx, kz),
+                    None => self.cells.get(&(kx, kz)).map_or(&[][..], Vec::as_slice),
+                };
+                for &i in square {
                     let d = self.players[i].distance_sqr(x, y, z);
                     if best.is_none_or(|(b, bd)| d < bd || d == bd && i < b) {
                         best = Some((i, d));
@@ -2171,6 +2246,51 @@ mod tests {
                 .nearest(0.0, 0.0, 0.0)
                 .is_none()
         );
+    }
+
+    /// The table of the squares gives every question the player the hashed squares give, after
+    /// the same squares (so the scan they fall back to comes at the same point), and the player
+    /// a look at every one finds: players close together, spread out, many on one square, some
+    /// spectators, and too far apart for a table.
+    #[test]
+    fn nearest_players_by_table_answer_as_by_hashed_squares() {
+        let mut seed = 0x6A09_E667_F3BC_C909u64;
+        let mut next = |m: f64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 1_000_000) as f64 / 1_000_000.0 * 2.0 * m - m
+        };
+        let index = |p: Option<&LevelPlayer>| p.map(|p| std::ptr::from_ref(p) as usize);
+        // (players, how far they spread on x and z, whether that fits a table)
+        let spreads = [
+            (9, 50.0, true),
+            (40, 600.0, true),
+            (100, 3_000.0, true),
+            (100, 8_000.0, true),
+            (60, 20_000.0, false),
+            (150, 3.0e5, false),
+        ];
+        for (count, spread, fits) in spreads {
+            let mut players: Vec<LevelPlayer> = (0..count)
+                .map(|i| player(next(spread), 64.0 + next(40.0), next(spread), i % 7 == 3))
+                .collect();
+            // Three more beside the second player: two at its very spot (a tie), one 3.5 east.
+            let at = players[1].position;
+            for dx in [0.0, 0.0, 3.5] {
+                players.push(player(at.x + dx, at.y, at.z, false));
+            }
+            let by_table = NearestPlayers::new(&players);
+            let mut hashed = NearestPlayers::new(&players);
+            hashed.table = None;
+            assert_eq!(by_table.table.is_some(), fits, "{count} players over {spread}");
+            for _ in 0..600 {
+                let (x, y, z) = (next(spread * 1.5), 64.0 + next(80.0), next(spread * 1.5));
+                let found = index(by_table.nearest(x, y, z));
+                assert_eq!(found, index(hashed.nearest(x, y, z)), "{spread}: ({x}, {y}, {z})");
+                assert_eq!(found, index(nearest_player(&players, x, y, z)), "({x}, {y}, {z})");
+            }
+        }
     }
 
     /// Answers both spawn checks with one fixed result.

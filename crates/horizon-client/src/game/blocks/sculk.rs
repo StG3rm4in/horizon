@@ -90,7 +90,7 @@ pub(super) struct SculkState {
     tables: Tables,
     /// The sculk block entities in the order they were added.
     index: Index,
-    pub known: HashSet<(i32, i32)>,
+    pub known: FxHashSet<(i32, i32)>,
     /// The chunk map's membership revision `known` was taken at.
     pub known_revision: Option<u64>,
     // Keyed by mob ids the server gives out: the fast hasher is safe.
@@ -464,20 +464,35 @@ impl Game<'_> {
         let revision = self.world.chunks.membership_revision();
         if self.sculk.ticks.is_multiple_of(10) && self.sculk.known_revision != Some(revision) {
             self.sculk.known_revision = Some(revision);
-            let loaded: HashSet<(i32, i32)> = self.world.chunks.keys().copied().collect();
-            let arrived: Vec<(i32, i32)> = loaded.difference(&self.sculk.known).copied().collect();
+            // The resident chunks not known yet, and the known ones no longer resident, each
+            // from one pass: a set of every resident chunk made anew and its two differences
+            // with the last one hashed tens of thousands of positions every half second. Then
+            // `known` is the resident chunks again. Nothing below loads or unloads a chunk.
+            let chunks = &self.world.chunks;
+            let known = &mut self.sculk.known;
+            let mut arrived: Vec<(i32, i32)> =
+                chunks.keys().copied().filter(|key| !known.contains(key)).collect();
+            // In position order: the old set's order was another in every process.
+            arrived.sort_unstable();
+            let mut gone = FxHashSet::<(i32, i32)>::default();
+            known.retain(|key| {
+                let resident = chunks.contains_key(key);
+                if !resident {
+                    gone.insert(*key);
+                }
+                resident
+            });
+            known.extend(arrived.iter().copied());
             for key in arrived {
                 self.sculk_scan_chunk(key);
             }
             // The blocks of every chunk that left, in one pass: a player
             // leaving unloads thousands of chunks at once.
-            let gone: HashSet<(i32, i32)> = self.sculk.known.difference(&loaded).copied().collect();
             if !gone.is_empty() {
                 self.sculk
                     .index
                     .retain(|p| !gone.contains(&(p.0 >> 4, p.2 >> 4)));
             }
-            self.sculk.known = loaded;
         }
         self.sculk_sync_writes();
     }
@@ -1118,7 +1133,17 @@ impl Game<'_> {
         // vibration or a death: their tick would change nothing, so they
         // are passed over here (a vibration scheduled during these ticks is
         // chosen on the next tick at the earliest, as in vanilla).
+        //
+        // One found idle sleeps (`BlockEntities::sleep`), and a sleeping one is passed over
+        // without its block entity being read: a hashed look-up of the map and a read of the
+        // boxed entity, out of cache for each of the thousands of sculk blocks a level can hold,
+        // every tick. Every change to a block entity (a vibration heard, a charge taken, its data
+        // written, its removal or replacement, its chunk unloaded or loaded again, its block
+        // state set) goes through the map's mutable access, which wakes it: a sleeping one is
+        // still the idle one it was found to be. They sleep before any of the ticks below, which
+        // may wake them again.
         let entities = &self.world.block_entities;
+        let mut idle = Vec::new();
         let due: Vec<((i32, i32, i32), bool)> = self
             .sculk
             .index
@@ -1126,16 +1151,20 @@ impl Game<'_> {
             .filter_map(|&key| {
                 let (cx, cz) = (key.0 >> 4, key.2 >> 4);
                 // `LevelChunk.isTicking`: its own chunk's entities loaded too.
-                if !ticks(cx, cz)
-                    || pending.contains(&(cx, cz))
-                    || matches!(entities.get(&key), Some(BlockEntity::Sculk(e)) if e.idle())
-                {
+                if !ticks(cx, cz) || pending.contains(&(cx, cz)) || entities.is_asleep(&key) {
+                    return None;
+                }
+                if matches!(entities.get(&key), Some(BlockEntity::Sculk(e)) if e.idle()) {
+                    idle.push(key);
                     return None;
                 }
                 let adjacent = (-1..=1).all(|dx| (-1..=1).all(|dz| ticks(cx + dx, cz + dz)));
                 Some((key, adjacent))
             })
             .collect();
+        for key in idle {
+            self.world.block_entities.sleep(key);
+        }
         for (key, adjacent) in due {
             self.tick_sculk_block(key, adjacent)?;
         }
@@ -2764,6 +2793,82 @@ mod tests {
         });
     }
 
+    /// The half-second look at the chunk map scans the chunks that arrived since the last one,
+    /// in position order, and drops the sculk blocks of the ones that left: after chunks come,
+    /// go, come back and stay, `known` is the resident chunks and the index holds the sculk
+    /// blocks of those, each once.
+    #[test]
+    #[ignore = "daily"]
+    fn sculk_chunk_looks_follow_the_resident_chunks() {
+        use crate::game::native_entity_refs::tests::with_game;
+        use horizon_client::chunk::Chunk;
+        use std::sync::Arc;
+
+        /// `known` is the resident chunks, and the index the sensors of `resident`, once each.
+        fn check(game: &Game<'_>, resident: &[(i32, i32)]) {
+            let mut known: Vec<(i32, i32)> = game.sculk.known.iter().copied().collect();
+            let mut chunks: Vec<(i32, i32)> = game.world.chunks.keys().copied().collect();
+            known.sort_unstable();
+            chunks.sort_unstable();
+            assert_eq!(known, chunks);
+            let mut expected: Vec<(i32, i32, i32)> =
+                (resident.iter()).map(|&(x, z)| (x * 16 + 1, 64, z * 16 + 1)).collect();
+            let mut indexed: Vec<(i32, i32, i32)> = game.sculk.index.iter().copied().collect();
+            assert_eq!(indexed.len(), game.sculk.index.set.len());
+            expected.sort_unstable();
+            indexed.sort_unstable();
+            assert_eq!(indexed, expected);
+        }
+
+        with_game(|game| {
+            game.options.dedicated = Some(Vec::new());
+            game.sculk_prepare();
+            let registry = game.pack.assets.registry;
+            let sensor = registry.default_state("minecraft:sculk_sensor").unwrap();
+            // A chunk with a sensor at its corner, made before it comes, as streaming makes one.
+            let with_sensor = |x: i32, z: i32| {
+                let mut chunk = Chunk::empty(x, z);
+                chunk.set(1, 64, 1, sensor.0);
+                Arc::new(chunk)
+            };
+            for key in [(1, 0), (0, 0), (-1, 2)] {
+                game.world.chunks.insert(key, with_sensor(key.0, key.1));
+            }
+            game.sculk_sync_index();
+            check(game, &[(0, 0), (1, 0), (-1, 2)]);
+            // Scanned in position order, whatever the order they came in.
+            let order: Vec<(i32, i32, i32)> = game.sculk.index.iter().copied().collect();
+            assert_eq!(order, [(-15, 64, 33), (1, 64, 1), (17, 64, 1)]);
+            // One leaves, one comes.
+            game.world.chunks.remove(&(1, 0));
+            game.world.chunks.insert((3, -3), with_sensor(3, -3));
+            game.sculk_sync_index();
+            check(game, &[(0, 0), (-1, 2), (3, -3)]);
+            // The one that left comes back, another leaves, one without sculk comes.
+            game.world.chunks.insert((1, 0), with_sensor(1, 0));
+            game.world.chunks.remove(&(3, -3));
+            game.world.chunks.insert((5, 5), Arc::new(Chunk::empty(5, 5)));
+            game.sculk_sync_index();
+            check(game, &[(0, 0), (-1, 2), (1, 0)]);
+            // Nothing came or went: no look, the same index in the same order.
+            let order: Vec<(i32, i32, i32)> = game.sculk.index.iter().copied().collect();
+            game.sculk_sync_index();
+            assert_eq!(game.sculk.index.iter().copied().collect::<Vec<_>>(), order);
+            // A chunk leaves and comes back between two looks: it is neither arrived nor gone.
+            game.world.chunks.remove(&(0, 0));
+            game.world.chunks.insert((0, 0), with_sensor(0, 0));
+            game.sculk_sync_index();
+            check(game, &[(0, 0), (-1, 2), (1, 0)]);
+            assert_eq!(game.sculk.index.iter().copied().collect::<Vec<_>>(), order);
+            // Every chunk leaves.
+            for key in [(0, 0), (-1, 2), (1, 0), (5, 5)] {
+                game.world.chunks.remove(&key);
+            }
+            game.sculk_sync_index();
+            check(game, &[]);
+        });
+    }
+
     #[test]
     #[ignore = "daily"]
     fn sculk_step_on_skips_empty_index_and_detects_sensor_steps() {
@@ -2809,6 +2914,103 @@ mod tests {
             assert_eq!(info.event, "minecraft:step");
             assert_eq!(info.source, Some(Who::Player.into()));
         });
+    }
+
+    /// A sculk block entity found idle sleeps, and is passed over without being read until
+    /// something changes it: two runs of the same sensors, shrieker and catalyst, with the same
+    /// game events and charge, one of them waking every block entity before each tick (so the
+    /// walk reads every one, as it did before they slept), leave the same block entities and
+    /// blocks after every tick. A sleeping one is always idle, and one that hears an event wakes.
+    #[test]
+    #[ignore = "daily"]
+    fn idle_sculk_sleeps_until_changed_and_ticks_as_when_every_one_is_read() {
+        use crate::game::native_entity_refs::tests::with_game;
+        use horizon_client::{chunk::Chunk, motion::PlayerMotion};
+        use horizon_core::{
+            geometry::Vec3,
+            random::{LegacyRandom, LevelRandom},
+        };
+        use std::sync::Arc;
+
+        const BLOCKS: [((i32, i32, i32), &str); 5] = [
+            ((1, 64, 1), "minecraft:sculk_sensor"),
+            ((20, 64, 3), "minecraft:sculk_sensor"),
+            ((9, 64, -9), "minecraft:calibrated_sculk_sensor"),
+            ((5, 64, 9), "minecraft:sculk_shrieker"),
+            ((-12, 64, 6), "minecraft:sculk_catalyst"),
+        ];
+        let run = |sleeping: bool| {
+            let mut rows = Vec::new();
+            let mut slept = 0;
+            with_game(|game| {
+                game.options.dedicated = Some(Vec::new());
+                game.sculk_prepare();
+                for cx in -2..=2 {
+                    for cz in -2..=2 {
+                        let mut chunk = Chunk::empty(cx, cz);
+                        chunk.lit = true;
+                        game.world.chunks.insert((cx, cz), Arc::new(chunk));
+                    }
+                }
+                game.player =
+                    Some(PlayerMotion::new(game.motion, Vec3::new(8.5, 65.0, 8.5)).unwrap());
+                game.update_chunk_tickets();
+                game.world.random = LevelRandom::for_level(LegacyRandom::new(12345));
+                game.world.game_time = 1000;
+                let registry = game.pack.assets.registry;
+                // A stone floor for the catalyst's charge to spread over.
+                let stone = registry.default_state("minecraft:stone").unwrap();
+                for x in -24..8 {
+                    for z in -8..24 {
+                        game.world.set(x, 63, z, stone).unwrap();
+                    }
+                }
+                for (at, name) in BLOCKS {
+                    let state = registry.default_state(name).unwrap();
+                    game.world.set(at.0, at.1, at.2, state).unwrap();
+                }
+                game.sculk_sync_index();
+                let place = "minecraft:block_place";
+                for tick in 0..80 {
+                    game.world.game_time += 1;
+                    match tick {
+                        3 | 40 => game.post_block_game_event(place, [3, 64, 1], None, None),
+                        9 => game.post_block_game_event(place, [17, 64, 3], None, None),
+                        15 => game.post_block_game_event(place, [9, 64, -6], None, None),
+                        20 => assert!(game.catalyst_takes_experience([-11.5, 64.0, 6.5], |_| 30)),
+                        _ => {}
+                    }
+                    if sleeping && tick == 3 {
+                        // Asleep since the first tick, woken by the event it heard.
+                        assert!(!game.world.block_entities.is_asleep(&(1, 64, 1)));
+                    }
+                    if !sleeping {
+                        game.world.block_entities.values_mut().count();
+                    }
+                    game.tick_sculk_blocks().unwrap();
+                    for (at, _) in BLOCKS {
+                        let Some(BlockEntity::Sculk(e)) = game.world.block_entities.get(&at) else {
+                            panic!("{at:?} lost its block entity");
+                        };
+                        let asleep = game.world.block_entities.is_asleep(&at);
+                        if asleep {
+                            assert!(e.idle(), "{at:?} sleeps while busy at tick {tick}");
+                            slept += usize::from(sleeping);
+                        }
+                        // Nothing happened before tick 3: every one sleeps.
+                        assert!(!sleeping || tick >= 3 || asleep, "{at:?} awake at tick {tick}");
+                        let state = game.world.block(at.0, at.1, at.2);
+                        rows.push(format!("{tick} {at:?} {state:?} {e:?}"));
+                    }
+                    rows.push(format!("{tick} revision {}", game.world.revision));
+                }
+            });
+            (rows, slept)
+        };
+        let (asleep, slept) = run(true);
+        let (awake, _) = run(false);
+        assert!(slept > 200, "only {slept} sleeping block entities seen");
+        assert_eq!(asleep, awake);
     }
 
     /// `vanilla_game_event` hears `GameEvent.Context.affectedState`: the state a context

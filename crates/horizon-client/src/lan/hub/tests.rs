@@ -1361,6 +1361,50 @@ fn equipment_is_converted_again_only_when_a_stack_changes() {
     assert_eq!(hub.guest_equipment(0), cleared);
 }
 
+/// `Hub::stack` gives what converting the stack with the hub's own tables gives, the first
+/// time an item is asked for and once its id is kept, an item the registry lacks included.
+#[test]
+fn a_stack_converts_as_the_tables_say_before_and_after_its_id_is_kept() {
+    let mut sync = SyncData::empty();
+    sync.builtin.registries.insert(
+        "minecraft:item".into(),
+        horizon_protocol::registry::Ids::from_names(vec![
+            "minecraft:stone".into(),
+            "minecraft:bow".into(),
+            "minecraft:iron_sword".into(),
+        ]),
+    );
+    let (mut hub, _rx) = hub_with_sync(sync);
+    let mut damaged = ItemStack::new("minecraft:iron_sword", 1);
+    damaged.damage = 12;
+    let stacks = [
+        ItemStack::new("minecraft:bow", 1),
+        ItemStack::new("minecraft:stone", 64),
+        damaged,
+        ItemStack::new("minecraft:no_such_item", 1),
+    ];
+    let sync = hub.sync.clone();
+    let expected = |s: &ItemStack| {
+        let item = |name: &str| {
+            (sync.builtin.get("minecraft:item"))
+                .and_then(|items| items.id(name))
+                .unwrap_or(0)
+        };
+        crate::lan::guest::stack_to_network(item, |r, n| sync.id(r, n), &Some(s.clone()))
+    };
+    for round in 0..3 {
+        for s in stacks.iter().cycle().skip(round).take(stacks.len()) {
+            assert_eq!(
+                hub.stack(&Some(s.clone())),
+                expected(s),
+                "{} ({round})",
+                s.item
+            );
+        }
+    }
+    assert_eq!(hub.stack(&None), None);
+}
+
 /// `LivingEntity.collectEquipmentChanges` walks every `EquipmentSlot`: a
 /// player's body (wire slot 6) and saddle (7) reach the players who see
 /// them, with the hands and armor.

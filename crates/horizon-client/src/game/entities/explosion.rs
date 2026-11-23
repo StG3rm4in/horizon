@@ -154,6 +154,10 @@ impl JavaKey for Key {
     }
 }
 
+/// The rays `ServerExplosion.calculateExplodedPositions` casts, one through each cell on the
+/// faces of a cube 16 cells a side: 16³ - 14³.
+const BLAST_RAYS: usize = 1352;
+
 /// `Explosion.BlockInteraction` for the explosions Horizon produces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BlockInteraction {
@@ -313,8 +317,123 @@ thread_local! {
     /// Client-side randomness (explosion sound pitch), separate from the level random.
     static CLIENT_RANDOM: std::cell::RefCell<LegacyRandom> = std::cell::RefCell::new(LegacyRandom::new(0x5eed));
 }
+/// The sample points of `ServerExplosion.getSeenPercent` on an entity box, in its order, each
+/// given to `visit`; false, and no point, when the box has a negative extent, which the blast
+/// then does not see (0). The CPU's rays and the GPU's (`explosion_gpu.rs`) start here.
+pub(super) fn exposure_starts(min: [f64; 3], max: [f64; 3], mut visit: impl FnMut(Vec3)) -> bool {
+    let xs = 1.0 / ((max[0] - min[0]) * 2.0 + 1.0);
+    let ys = 1.0 / ((max[1] - min[1]) * 2.0 + 1.0);
+    let zs = 1.0 / ((max[2] - min[2]) * 2.0 + 1.0);
+    let x_offset = (1.0 - (1.0 / xs).floor() * xs) / 2.0;
+    let z_offset = (1.0 - (1.0 / zs).floor() * zs) / 2.0;
+    if xs < 0.0 || ys < 0.0 || zs < 0.0 {
+        return false;
+    }
+    let mut xx = 0.0;
+    while xx <= 1.0 {
+        let mut yy = 0.0;
+        while yy <= 1.0 {
+            let mut zz = 0.0;
+            while zz <= 1.0 {
+                let x = min[0] + (max[0] - min[0]) * xx;
+                let y = min[1] + (max[1] - min[1]) * yy;
+                let z = min[2] + (max[2] - min[2]) * zz;
+                visit(Vec3::new(x + x_offset, y, z + z_offset));
+                zz += zs;
+            }
+            yy += ys;
+        }
+        xx += xs;
+    }
+    true
+}
+/// `ClipContext(..., entity)` of `getSeenPercent`: the entity standing at the box's bottom `y`.
+pub(super) fn exposure_context(y: f64) -> CollisionContext<'static> {
+    CollisionContext::for_entity(
+        CollisionEntity {
+            identity: EntityIdentity(0),
+            kind: horizon_world::collision_context::EntityContextKind::None,
+            y,
+            descending: false,
+            main_hand: Some(CollisionItem::EMPTY),
+        },
+        false,
+    )
+}
 pub(super) fn client_float() -> f32 {
     CLIENT_RANDOM.with(|r| r.borrow_mut().next_float())
+}
+
+/// The exposures (`seen_percent`) the entity walk of the blast going off now has measured, by
+/// box: the TNT of a stack share one box, so a cannon's blast traces it once instead of once per
+/// TNT. Each answer is kept with the `RegionStamp` of the blocks its rays may cross (the write
+/// counts of their sections and the columns missing) and taken again only while that stamp is
+/// the same; it holds for this blast's centre only, and for as long as its walk.
+struct ExposureMemo {
+    center: [u64; 3],
+    seen: std::collections::HashMap<[u64; 6], (horizon_client::world::RegionStamp, f32)>,
+}
+thread_local! {
+    static EXPOSURE_MEMO: std::cell::RefCell<Option<ExposureMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// Keeps a blast's exposure memo for as long as it lives, then puts back the memo of the blast
+/// around it, if any (a hook may set off a blast inside a walk).
+pub(super) struct ExposureMemoScope(Option<ExposureMemo>);
+impl ExposureMemoScope {
+    /// No memo where a collision shape can change between two asks without a block write: a
+    /// level with moving pistons or shulker boxes (as `stand_rest_key` refuses them).
+    pub(super) fn enter(game: &Game<'_>, center: [f64; 3]) -> Self {
+        let memo = (game.world.moving_pistons.is_empty() && game.world.shulkers.is_empty())
+            .then(|| ExposureMemo {
+                center: center.map(f64::to_bits),
+                seen: Default::default(),
+            });
+        Self(EXPOSURE_MEMO.with(|m| m.replace(memo)))
+    }
+}
+impl Drop for ExposureMemoScope {
+    fn drop(&mut self) {
+        let outer = self.0.take();
+        EXPOSURE_MEMO.with(|m| *m.borrow_mut() = outer);
+    }
+}
+
+impl Game<'_> {
+    /// `seen_percent`, from the memo of the blast going off at `center` when it has this box
+    /// measured and none of the blocks the rays may cross was written since; the answer of the
+    /// rays otherwise, which the memo then keeps.
+    pub(super) fn seen_percent_memo(&self, center: [f64; 3], min: [f64; 3], max: [f64; 3]) -> f32 {
+        let at = center.map(f64::to_bits);
+        let active = EXPOSURE_MEMO.with(|m| m.borrow().as_ref().is_some_and(|m| m.center == at));
+        if !active {
+            return self.seen_percent(center, min, max);
+        }
+        // Every cell a ray from the box (its sample points lie up to half a step past its
+        // corner) to the centre visits, with a block to spare for the traversal's ends.
+        let lo = std::array::from_fn(|i| (min[i].min(center[i]).floor() as i32).saturating_sub(1));
+        let hi = std::array::from_fn(|i| (max[i].max(center[i]).floor() as i32).saturating_add(1));
+        let Some(stamp) = self.world.region_stamp(lo, hi) else {
+            return self.seen_percent(center, min, max);
+        };
+        let key: [u64; 6] =
+            std::array::from_fn(|i| (if i < 3 { min[i] } else { max[i - 3] }).to_bits());
+        let known = EXPOSURE_MEMO.with(|m| {
+            let m = m.borrow();
+            let (seen_at, seen) = *m.as_ref()?.seen.get(&key)?;
+            (seen_at == stamp).then_some(seen)
+        });
+        if let Some(seen) = known {
+            return seen;
+        }
+        let seen = self.seen_percent(center, min, max);
+        EXPOSURE_MEMO.with(|m| {
+            if let Some(memo) = m.borrow_mut().as_mut().filter(|m| m.center == at) {
+                memo.seen.insert(key, (stamp, seen));
+            }
+        });
+        seen
+    }
 }
 
 impl Game<'_> {
@@ -463,15 +582,14 @@ impl Game<'_> {
         min: [f64; 3],
         max: [f64; 3],
     ) -> f32 {
-        let xs = 1.0 / ((max[0] - min[0]) * 2.0 + 1.0);
-        let ys = 1.0 / ((max[1] - min[1]) * 2.0 + 1.0);
-        let zs = 1.0 / ((max[2] - min[2]) * 2.0 + 1.0);
-        let x_offset = (1.0 - (1.0 / xs).floor() * xs) / 2.0;
-        let z_offset = (1.0 - (1.0 / zs).floor() * zs) / 2.0;
-        if xs < 0.0 || ys < 0.0 || zs < 0.0 {
-            return 0.0;
+        // HORIZON_GPU_TNT: the blast's boxes traced on the GPU at once, while what they read holds.
+        if let Some(seen) = super::explosion_gpu::gpu_seen_percent(self, center, min, max) {
+            return seen;
         }
-        // ClipContext(..., entity): the entity standing at the box's bottom.
+        self.seen_percent_cpu(center, min, max)
+    }
+    /// `seen_percent` on the CPU: a ray from each sample point of the box to the centre.
+    pub(super) fn seen_percent_cpu(&self, center: [f64; 3], min: [f64; 3], max: [f64; 3]) -> f32 {
         let mut rays = ColliderRays {
             clip_data: None,
             scene: SceneCollisions {
@@ -479,47 +597,27 @@ impl Game<'_> {
                 binding: self.collision,
                 subject: None,
             },
-            context: CollisionContext::for_entity(
-                CollisionEntity {
-                    identity: EntityIdentity(0),
-                    kind: horizon_world::collision_context::EntityContextKind::None,
-                    y: min[1],
-                    descending: false,
-                    main_hand: Some(CollisionItem::EMPTY),
-                },
-                false,
-            ),
+            context: exposure_context(min[1]),
         };
+        let to = Vec3::new(center[0], center[1], center[2]);
         let (mut hits, mut count) = (0, 0);
-        let mut xx = 0.0;
-        while xx <= 1.0 {
-            let mut yy = 0.0;
-            while yy <= 1.0 {
-                let mut zz = 0.0;
-                while zz <= 1.0 {
-                    let x = min[0] + (max[0] - min[0]) * xx;
-                    let y = min[1] + (max[1] - min[1]) * yy;
-                    let z = min[2] + (max[2] - min[2]) * zz;
-                    let from = Vec3::new(x + x_offset, y, z + z_offset);
-                    let to = Vec3::new(center[0], center[1], center[2]);
-                    let missed = clip_world(
-                        &mut rays,
-                        from,
-                        to,
-                        RayBlockMode::Collider,
-                        RayFluidMode::None,
-                        4096,
-                    )
-                    .is_ok_and(|r| r.miss);
-                    if missed {
-                        hits += 1;
-                    }
-                    count += 1;
-                    zz += zs;
-                }
-                yy += ys;
+        let sampled = exposure_starts(min, max, |from| {
+            let missed = clip_world(
+                &mut rays,
+                from,
+                to,
+                RayBlockMode::Collider,
+                RayFluidMode::None,
+                4096,
+            )
+            .is_ok_and(|r| r.miss);
+            if missed {
+                hits += 1;
             }
-            xx += xs;
+            count += 1;
+        });
+        if !sampled {
+            return 0.0;
         }
         hits as f32 / count as f32
     }
@@ -538,6 +636,19 @@ impl Game<'_> {
         answers: Option<&mut PartAnswers>,
     ) -> (Option<f32>, bool) {
         let state = self.world.block(pos[0], pos[1], pos[2]);
+        self.state_explosion_resistance(pos, state, rules, explosion, answers)
+    }
+    /// `cell_explosion_resistance` for the cell at `pos`, which holds `state`. The rays keep
+    /// its answer for the rest of a blast (`RayCells`): a hook asked here, or a read of the
+    /// level that may change during the rays, must be one `ray_cell_kept` knows.
+    fn state_explosion_resistance(
+        &mut self,
+        pos: [i32; 3],
+        state: BlockStateId,
+        rules: &BlastRules,
+        explosion: &ExplosionStart<'_>,
+        answers: Option<&mut PartAnswers>,
+    ) -> (Option<f32>, bool) {
         let f = self.res.facts().get(state);
         if let Some(step) = self.blast_calculator_step(&f.name) {
             return step;
@@ -619,6 +730,8 @@ impl Game<'_> {
     }
     /// `ServerExplosion.calculateExplodedPositions`; `resists` overrides one
     /// block's resistance (`ExplosionDamageCalculator.getBlockExplosionResistance`).
+    /// What a cell answers the rays is kept for the rest of the blast where no
+    /// hook would be asked again (`RayCells`).
     fn exploded_positions(
         &mut self,
         center: [f64; 3],
@@ -627,11 +740,33 @@ impl Game<'_> {
         portal_proof: bool,
         explosion: &ExplosionStart<'_>,
     ) -> Vec<[i32; 3]> {
+        let cells = RayCells::around(center, radius);
+        self.exploded_positions_with(center, radius, resists, portal_proof, explosion, cells)
+    }
+    /// `exploded_positions` keeping what the rays' cells answer in `cells`:
+    /// with `RayCells::none()`, every ray's step into a cell asks it, as before.
+    fn exploded_positions_with(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        resists: Option<([i32; 3], f32)>,
+        portal_proof: bool,
+        explosion: &ExplosionStart<'_>,
+        mut cells: RayCells,
+    ) -> Vec<[i32; 3]> {
         let (min_y, max_y) = self.with_level(|_, level, _| {
             use horizon_world::level::LevelAccess;
             (level.min_y(), level.max_y())
         });
         let rules = self.blast_rules(resists, portal_proof);
+        // A blast in water: every ray stops in the centre's cell having put nothing in the
+        // set, and only draws its power.
+        if self.rays_stop_in_their_first_cell(center, radius, (min_y, max_y), &rules, explosion) {
+            for _ in 0..BLAST_RAYS {
+                self.world.random.next_float();
+            }
+            return Vec::new();
+        }
         let mut set: JavaHashMap<Key, ()> = JavaHashMap::default();
         for xx in 0..16 {
             for yy in 0..16 {
@@ -665,15 +800,15 @@ impl Game<'_> {
                         let (taken, spared, again) = match last {
                             Some((at, taken, spared)) if at == pos => (taken, spared, true),
                             _ => {
-                                let (resistance, spared) =
-                                    self.cell_explosion_resistance(pos, &rules, explosion, None);
-                                let taken = resistance.map_or(0.0, |r| (r + 0.3) * 0.3);
+                                let (taken, spared) =
+                                    self.ray_step_cost(&mut cells, pos, &rules, explosion);
                                 last = Some((pos, taken, spared));
                                 (taken, spared, false)
                             }
                         };
                         power -= taken;
-                        if power > 0.0 && !spared && !again {
+                        // A block another ray put in `set` is there already.
+                        if power > 0.0 && !spared && !again && cells.first_in_set(pos) {
                             set.put(Key(pos), ());
                         }
                         xp += xd * f64::from(0.3f32);
@@ -685,6 +820,52 @@ impl Game<'_> {
             }
         }
         set.entries().map(|(k, _)| k.0).collect()
+    }
+    /// Whether every ray of the blast stops in the cell its centre is in, having put nothing in
+    /// the set: the step there takes at least what the strongest ray can draw (water and lava
+    /// take 30.09, a TNT's ray has at most 5.2). The rays then only draw their power. Only for a
+    /// cell in the level whose answer no hook gives: `cell_explosion_resistance` then draws
+    /// nothing and writes nothing, so asking it once here instead of once a ray changes only the
+    /// time.
+    fn rays_stop_in_their_first_cell(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        (min_y, max_y): (i32, i32),
+        rules: &BlastRules,
+        explosion: &ExplosionStart<'_>,
+    ) -> bool {
+        use crate::game::api_values::block_state::block_listens;
+        use mod_api::HookId;
+        // Every ray's first step, as `exploded_positions` takes it.
+        let pos = center.map(|c| c.floor() as i32);
+        if pos[1] < min_y
+            || pos[1] >= max_y
+            || !(-30_000_000..30_000_000).contains(&pos[0])
+            || !(-30_000_000..30_000_000).contains(&pos[2])
+        {
+            return false;
+        }
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let above = self.world.block(pos[0], pos[1] + 1, pos[2]);
+        let hooks = [
+            HookId::ExplosionResistance,
+            HookId::CanEntityDestroy,
+            HookId::RailDirection,
+        ];
+        if hooks.into_iter().any(|hook| block_listens(hook, state))
+            || block_listens(HookId::RailDirection, above)
+        {
+            return false;
+        }
+        let (resistance, _) = self.cell_explosion_resistance(pos, rules, explosion, None);
+        let taken = resistance.map_or(0.0, |r| (r + 0.3) * 0.3);
+        // A ray's power is `radius * (0.7 + draw * 0.6)` with a draw below 1, and f32 rounding
+        // keeps the order of sums and products, so no ray starts above this one, nor keeps more
+        // after the step. With a negative radius every ray starts below 0 and none steps.
+        let draw = 1.0f32;
+        let strongest = radius * (0.7 + draw * 0.6);
+        strongest - taken <= 0.0
     }
     /// `ServerExplosion.hurtEntities` for the player: damage scaled by
     /// distance and exposure, through a raised shield (`hurtServer` blocks
@@ -898,7 +1079,7 @@ impl Game<'_> {
         let b = entity.explosion_box();
         let (lo, hi) = (b.min_position(), b.max_position());
         let exposure = if seen {
-            self.seen_percent(center, [lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z])
+            self.seen_percent_memo(center, [lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z])
         } else {
             0.0
         };
@@ -937,6 +1118,10 @@ impl Game<'_> {
             self.explosion_hits_special(center, radius, blocks, damage_type);
         }
         let diameter = f64::from(radius * 2.0);
+        // HORIZON_GPU_TNT: every box in reach traced at once, before the player's turn.
+        let _gpu_exposures = (hurts || knockback != 0.0 || flying_knockback != 0.0)
+            .then(|| self.gpu_exposures(center, diameter))
+            .flatten();
         let damage = |dist: f64, exposure: f32| {
             let pow = (1.0 - dist) * f64::from(exposure);
             ((pow * pow + pow) / 2.0 * 7.0 * diameter + 1.0) as f32
@@ -1083,6 +1268,8 @@ impl Game<'_> {
         // outside the storages (players, frames, paintings, cushions,
         // crystals, the dragon, hooks) answer no handle here: the player walk
         // and their own passes read the list for them.
+        // The walk's exposures, by box: a TNT stack's boxes are traced once.
+        let _exposures = ExposureMemoScope::enter(self, center);
         let mut cursor = self.entity_id_cursor();
         let mut listed_at = 0;
         loop {
@@ -2203,9 +2390,238 @@ fn blast_resistance(base: f32, cap: Option<f32>, kept: bool) -> f32 {
     }
 }
 
+/// What the cells one blast's rays step into answer them (`cell_explosion_resistance`, as the
+/// power a step there takes and whether the block is spared), kept for the rest of the blast's
+/// rays: the centre's cell is asked by each of the 1,352 rays and the cells around it by dozens,
+/// and each answers the same every time where no hook would be asked again (`ray_cell_kept`);
+/// a cell a hook answers for is asked at every ray's step, as before. Also which cells are in
+/// the blast's set already: putting a key a Java `HashSet` holds changes nothing, neither its
+/// order nor its size, so a ray puts a cell only the first time. The cells are kept in a cube
+/// around the centre's cell that every ray of the blast stays in (`around`); a cell outside it
+/// is asked and put at every step. It lives for one blast's ray pass, which writes nothing to
+/// the level: the hooks the pass asks read the level only.
+struct RayCells {
+    /// The cube's lowest cell.
+    origin: [i32; 3],
+    /// The cube's side in cells, 0 for no cube.
+    side: usize,
+    /// By cell, y then z then x: the bits of what a step there takes (an f32) in the low half,
+    /// the flags above. Empty until the first cell is kept.
+    cells: Vec<u64>,
+}
+impl RayCells {
+    /// What a step into the cell takes is known, the same for every ray: the low half's bits.
+    const KNOWN: u64 = 1 << 32;
+    /// The known cell's block is spared (`shouldBlockExplode` is false).
+    const SPARED: u64 = 1 << 33;
+    /// A hook answers for the cell, which every ray's step asks again.
+    const ASKED: u64 = 1 << 34;
+    /// The cell is in the blast's set.
+    const IN_SET: u64 = 1 << 35;
+    /// The widest cube kept, 41 cells a side (551 KB): blasts up to radius 10.8 (a TNT's 4
+    /// keeps 17 a side, 39 KB). A wider blast keeps none.
+    const MOST_HALF: i32 = 20;
+
+    /// No cube: every step is asked, and every step that may put its cell in the set puts it.
+    fn none() -> Self {
+        Self {
+            origin: [0; 3],
+            side: 0,
+            cells: Vec::new(),
+        }
+    }
+    /// The cube around the cell of `center` that every ray of a blast of `radius` stays in: a
+    /// ray's power starts below 1.3 radius and loses at least 0.225 a step of 0.3, so its last
+    /// step is less than 1.3 / 0.225 * 0.3 < 1.75 radius from the centre, and that step's cell
+    /// at most `ceil(1.75 radius)` from the centre's along each axis; one more for rounding.
+    fn around(center: [f64; 3], radius: f32) -> Self {
+        let half = ((f64::from(radius) * 1.75).ceil() as i32).saturating_add(1);
+        if !(0..=Self::MOST_HALF).contains(&half) {
+            return Self::none();
+        }
+        Self {
+            origin: center.map(|c| (c.floor() as i32).saturating_sub(half)),
+            side: (2 * half + 1) as usize,
+            cells: Vec::new(),
+        }
+    }
+    /// Where the cube keeps the cell at `pos`; None outside it.
+    fn slot(&self, pos: [i32; 3]) -> Option<usize> {
+        let side = self.side;
+        let at = |i: usize| pos[i].wrapping_sub(self.origin[i]) as u32 as usize;
+        let (x, y, z) = (at(0), at(1), at(2));
+        if x < side && y < side && z < side {
+            Some((y * side + z) * side + x)
+        } else {
+            None
+        }
+    }
+    /// The bits of the cell at `slot`: none before the cube is made.
+    fn bits(&self, slot: usize) -> u64 {
+        self.cells.get(slot).copied().unwrap_or(0)
+    }
+    /// Adds `bits` to the cell at `slot`, making the cube first if it is not yet.
+    fn mark(&mut self, slot: usize, bits: u64) {
+        if self.cells.is_empty() {
+            self.cells = vec![0; self.side * self.side * self.side];
+        }
+        self.cells[slot] |= bits;
+    }
+    /// Whether a step that may put the cell at `pos` in the blast's set puts it: the first such
+    /// step of the blast into a cell of the cube, every one into a cell outside it.
+    fn first_in_set(&mut self, pos: [i32; 3]) -> bool {
+        let Some(slot) = self.slot(pos) else {
+            return true;
+        };
+        let first = self.bits(slot) & Self::IN_SET == 0;
+        if first {
+            self.mark(slot, Self::IN_SET);
+        }
+        first
+    }
+}
+
+impl Game<'_> {
+    /// What a ray's step into the cell at `pos` takes from its power, `(resistance + 0.3) * 0.3`
+    /// of `cell_explosion_resistance`, and whether the cell's block is spared: asked at the first
+    /// step into the cell and kept in `cells` for the other rays where `ray_cell_kept` allows,
+    /// asked at every ray's step into it otherwise.
+    fn ray_step_cost(
+        &mut self,
+        cells: &mut RayCells,
+        pos: [i32; 3],
+        rules: &BlastRules,
+        explosion: &ExplosionStart<'_>,
+    ) -> (f32, bool) {
+        let slot = cells.slot(pos);
+        let bits = slot.map_or(0, |slot| cells.bits(slot));
+        if bits & RayCells::KNOWN != 0 {
+            return (f32::from_bits(bits as u32), bits & RayCells::SPARED != 0);
+        }
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let (resistance, spared) =
+            self.state_explosion_resistance(pos, state, rules, explosion, None);
+        let taken = resistance.map_or(0.0, |r| (r + 0.3) * 0.3);
+        if let Some(slot) = slot
+            && bits & RayCells::ASKED == 0
+        {
+            let kept = if self.ray_cell_kept(pos, state, rules) {
+                let spared = if spared { RayCells::SPARED } else { 0 };
+                RayCells::KNOWN | spared | u64::from(taken.to_bits())
+            } else {
+                RayCells::ASKED
+            };
+            cells.mark(slot, kept);
+        }
+        (taken, spared)
+    }
+    /// Whether what `cell_explosion_resistance` answers for the cell at `pos`, which holds
+    /// `state`, may be kept for the rest of the blast's rays: no hook there would be asked again.
+    /// The level does not change during the rays, nor do the blast, its calculator and its rules.
+    /// Asked at every ray's step instead, as before, so that a mod sees the same asks: a cell
+    /// whose block has a part answering `explosion_resistance`, even one that declares its answer
+    /// pure (that contract covers batched reads, not one read a cell and blast); under a dangerous
+    /// skull's cap, one whose block has a part answering `can_entity_destroy` (for the skull); in
+    /// a TNT minecart's blast, one whose block or the block above has a part answering
+    /// `rail_direction`.
+    fn ray_cell_kept(&self, pos: [i32; 3], state: BlockStateId, rules: &BlastRules) -> bool {
+        use crate::game::api_values::block_state::block_listens;
+        use mod_api::HookId;
+        let impure = block_listens(HookId::ExplosionResistance, state);
+        let skull = rules.cap.is_some()
+            && rules.direct.is_some()
+            && block_listens(HookId::CanEntityDestroy, state);
+        let above = || self.world.block(pos[0], pos[1] + 1, pos[2]);
+        let rails = rules.rail_proof
+            && (block_listens(HookId::RailDirection, state)
+                || block_listens(HookId::RailDirection, above()));
+        !(impure || skull || rails)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sample points of `getSeenPercent`: 27 on a primed TNT's box, 45 on a player's, 8 on
+    /// an item's, none on a box of negative extent.
+    #[test]
+    fn exposure_starts_count_as_get_seen_percent() {
+        let count = |min: [f64; 3], max: [f64; 3]| {
+            let mut n = 0;
+            let sampled = exposure_starts(min, max, |_| n += 1);
+            (sampled, n)
+        };
+        assert_eq!(count([0.0, 64.0, 0.0], [0.98, 64.98, 0.98]), (true, 27));
+        assert_eq!(count([-0.3, 64.0, -0.3], [0.3, 65.8, 0.3]), (true, 45));
+        assert_eq!(count([0.0; 3], [0.25; 3]), (true, 8));
+        assert_eq!(count([1.0, 0.0, 0.0], [0.0, 1.0, 1.0]), (false, 0));
+        let mut first = None;
+        exposure_starts([2.0, 3.0, 4.0], [2.98, 3.98, 4.98], |p| {
+            first.get_or_insert([p.x, p.y, p.z]);
+        });
+        let xs = 1.0 / ((2.98 - 2.0) * 2.0 + 1.0);
+        let offset = (1.0 - (1.0f64 / xs).floor() * xs) / 2.0;
+        assert_eq!(first, Some([2.0 + offset, 3.0, 4.0 + offset]));
+    }
+
+    /// The exposure memo answers what the rays answer: for a box again, for other boxes, at
+    /// another centre, after a block between the box and the centre was written, and without a
+    /// memo.
+    #[test]
+    #[ignore = "daily"]
+    fn exposure_memo_answers_as_the_rays_do() {
+        use crate::game::native_entity_refs::tests::with_game;
+        use std::sync::Arc;
+        with_game(|game| {
+            game.world
+                .chunks
+                .insert((0, 0), Arc::new(horizon_client::chunk::Chunk::empty(0, 0)));
+            let registry = game.pack.assets.registry;
+            let stone = registry.default_state("minecraft:stone").unwrap();
+            let slab = registry.default_state("minecraft:smooth_stone_slab").unwrap();
+            let glass = registry.default_state("minecraft:glass_pane").unwrap();
+            for (i, [x, y, z]) in [[3, 64, 3], [4, 65, 3], [6, 64, 7], [7, 64, 5], [5, 65, 6]]
+                .into_iter()
+                .enumerate()
+            {
+                let state = [stone, slab, glass][i % 3];
+                game.world.set(x, y, z, state).unwrap();
+            }
+            // Primed TNT boxes (0.98 a side), the same one more than once as in a stack.
+            let tnt = |x: f64, y: f64, z: f64| {
+                ([x - 0.49, y, z - 0.49], [x + 0.49, y + 0.98, z + 0.49])
+            };
+            let boxes = [
+                tnt(2.5, 64.0, 2.5),
+                tnt(8.5, 64.0, 8.5),
+                tnt(2.5, 64.0, 2.5),
+                tnt(5.5, 66.0, 9.2),
+                tnt(2.5, 64.0, 2.5),
+                tnt(8.5, 64.0, 8.5),
+                tnt(5.5, 66.0, 9.2),
+            ];
+            for center in [[5.5, 64.0625, 5.5], [5.5, 64.5625, 4.5], [5.5, 64.0625, 5.5]] {
+                let _memo = ExposureMemoScope::enter(game, center);
+                for (step, &(min, max)) in boxes.iter().enumerate() {
+                    if step == 4 {
+                        let now = game.world.block(4, 64, 4);
+                        let next = if now == stone { glass } else { stone };
+                        game.world.set(4, 64, 4, next).unwrap();
+                    }
+                    let memo = game.seen_percent_memo(center, min, max);
+                    let rays = game.seen_percent(center, min, max);
+                    assert_eq!(memo.to_bits(), rays.to_bits(), "{center:?} {min:?}, step {step}");
+                }
+            }
+            let (min, max) = boxes[0];
+            let center = [5.5, 64.0625, 5.5];
+            assert_eq!(
+                game.seen_percent_memo(center, min, max).to_bits(),
+                game.seen_percent(center, min, max).to_bits()
+            );
+        });
+    }
 
     struct DropProbe {
         edit: bool,
@@ -2541,6 +2957,241 @@ mod tests {
         }
     }
 
+    /// A TNT's blast at `center` as the hooks hear it.
+    fn ray_cells_blast(center: [f64; 3], radius: f32) -> ExplosionStart<'static> {
+        ExplosionStart::from(mod_api::__private::built::ExplosionStart {
+            dimension: "minecraft:overworld",
+            center,
+            radius,
+            fire: false,
+            interaction: mod_api::BlockInteraction::Destroy,
+            damage_type: "minecraft:explosion",
+            source: None,
+            owner: None,
+        })
+    }
+
+    /// Stone, water, a jumble of blocks and air in the loaded chunk at the origin, one above the
+    /// other, and where a primed TNT's blast goes off in each: 0.06125 above its cell's floor
+    /// (`PrimedTnt.explode`: `getY(0.0625)` of a box 0.98 high), its own cell air.
+    fn ray_cell_scenes(game: &mut Game<'_>) -> [(&'static str, [f64; 3]); 4] {
+        let air = game.world.air;
+        let [stone, water, dirt, obsidian, planks, glass, tnt, rail, portal] = [
+            "minecraft:stone",
+            "minecraft:water",
+            "minecraft:dirt",
+            "minecraft:obsidian",
+            "minecraft:oak_planks",
+            "minecraft:glass",
+            "minecraft:tnt",
+            "minecraft:rail",
+            "minecraft:nether_portal",
+        ]
+        .map(|name| game.pack.assets.registry.default_state(name).unwrap());
+        let jumble = [stone, air, water, dirt, obsidian, air, planks, glass, tnt, rail, portal];
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 20..=82 {
+                    let state = match y {
+                        20..=40 => stone,
+                        44..=60 => water,
+                        64..=82 => jumble[((x * 7 + y * 3 + z * 5) as usize) % jumble.len()],
+                        _ => air,
+                    };
+                    game.world.set(x, y, z, state).unwrap();
+                }
+            }
+        }
+        game.world.set(8, 30, 8, air).unwrap();
+        [
+            ("stone", [8.5, 30.06125, 8.5]),
+            ("water", [8.5, 52.06125, 8.5]),
+            ("a jumble", [8.3, 72.6, 7.9]),
+            ("air", [8.5, 120.06125, 8.5]),
+        ]
+    }
+
+    /// Every cell a ray steps into lies in the cube `RayCells::around` keeps for its blast: at
+    /// the strongest power a ray can draw, through air, from centres anywhere in their cells,
+    /// for radii up to the widest cube kept. A wider blast keeps none, and a cell of the cube
+    /// goes into the set once.
+    #[test]
+    fn a_rays_cells_stay_in_its_cube() {
+        // The largest `nextFloat`, (2^24 - 1) / 2^24: the strongest ray.
+        let draw = 1.0 - f32::EPSILON / 2.0;
+        let rays: Vec<[f64; 3]> = (0..16)
+            .flat_map(|x| (0..16).flat_map(move |y| (0..16).map(move |z| [x, y, z])))
+            .filter(|cell: &[i32; 3]| cell.iter().any(|&i| i == 0 || i == 15))
+            .map(|cell| {
+                let d = cell.map(|i| f64::from(i as f32 / 15.0 * 2.0 - 1.0));
+                let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                d.map(|v| v / length)
+            })
+            .collect();
+        assert_eq!(rays.len(), 1352);
+        for radius in [0.5f32, 1.0, 3.0, 4.0, 6.0, 7.0, 10.0, 10.85] {
+            for center in [[0.5, 64.06125, 0.5], [-7.999, 0.0, 15.75], [1.0e6 + 0.3, -60.2, -3.7]] {
+                let cells = RayCells::around(center, radius);
+                for &[xd, yd, zd] in &rays {
+                    let mut power = radius * (0.7 + draw * 0.6);
+                    let [mut xp, mut yp, mut zp] = center;
+                    while power > 0.0 {
+                        let pos = [xp.floor() as i32, yp.floor() as i32, zp.floor() as i32];
+                        assert!(cells.slot(pos).is_some(), "radius {radius}, {center:?}: {pos:?}");
+                        xp += xd * f64::from(0.3f32);
+                        yp += yd * f64::from(0.3f32);
+                        zp += zd * f64::from(0.3f32);
+                        power -= 0.225_000_01;
+                    }
+                }
+            }
+        }
+        // Too wide for a cube, and no cube at all: every step is asked, and puts its cell.
+        assert!(RayCells::around([0.5; 3], 11.0).slot([0; 3]).is_none());
+        let mut none = RayCells::none();
+        assert!(none.slot([0; 3]).is_none());
+        assert!(none.first_in_set([0; 3]) && none.first_in_set([0; 3]));
+        // Nothing is made before a cell is kept; then a cell goes into the set once.
+        let mut cells = RayCells::around([0.5, 64.06125, 0.5], 4.0);
+        assert_eq!(cells.side, 17);
+        assert!(cells.cells.is_empty());
+        assert!(cells.first_in_set([0, 64, 0]) && !cells.first_in_set([0, 64, 0]));
+        assert!(cells.first_in_set([1, 64, 0]));
+        assert!(cells.first_in_set([0, 64 + 9, 0]) && cells.first_in_set([0, 64 + 9, 0]));
+    }
+
+    /// The rays of a blast that keeps what its cells answer (`RayCells`) explode the same
+    /// positions in the same order, and leave the level random as, rays asking at every step:
+    /// in stone, water, a jumble of blocks and air, at radii from 1 to past the widest cube,
+    /// with a block resisting in place of its own, and under each rule of the calculators (a
+    /// dangerous skull's cap, a TNT minecart's rails, a portal-proof TNT, a mod's immune blocks,
+    /// a wind charge's).
+    #[test]
+    #[ignore = "daily"]
+    fn ray_cells_explode_what_each_ray_asked() {
+        use crate::game::explosion_settings::{BlastCalculator, SourceCalculator};
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Rule {
+            Plain,
+            Skull,
+            Rails,
+            PortalProof,
+            Immune,
+            WindCharge,
+        }
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        let [stone, water, jumble, air] = ray_cell_scenes(&mut game).map(|(_, center)| center);
+        let immune: HashSet<String> = ["minecraft:stone", "minecraft:obsidian"]
+            .map(String::from)
+            .into();
+        let cases = [
+            (stone, 4.0, None, Rule::Plain),
+            (stone, 6.0, None, Rule::Plain),
+            (water, 4.0, None, Rule::Plain),
+            (jumble, 4.0, None, Rule::Plain),
+            (jumble, 6.0, None, Rule::Plain),
+            (jumble, 4.0, Some(([8, 72, 8], 1200.0)), Rule::Plain),
+            (jumble, 4.0, None, Rule::Skull),
+            (jumble, 4.0, None, Rule::Rails),
+            (jumble, 4.0, None, Rule::PortalProof),
+            (jumble, 4.0, None, Rule::Immune),
+            (jumble, 4.0, None, Rule::WindCharge),
+            (air, 1.0, None, Rule::Plain),
+            (air, 4.0, None, Rule::Plain),
+            (air, 7.0, None, Rule::Plain),
+            (air, 12.0, None, Rule::Plain),
+        ];
+        let mut exploded = Vec::new();
+        for (center, radius, resists, rule) in cases {
+            game.combat.blast_resistance_cap = (rule == Rule::Skull).then_some(0.8);
+            game.combat.rail_proof_blast = rule == Rule::Rails;
+            game.combat.blast_settings.calculator = (rule == Rule::Immune).then(|| BlastCalculator {
+                explodes_blocks: true,
+                damages_entities: true,
+                knockback: 1.0,
+                immune: Some(immune.clone()),
+            });
+            game.combat.blast_settings.source_calculator = match rule {
+                Rule::WindCharge => SourceCalculator::WindCharge(immune.clone()),
+                _ => SourceCalculator::Default,
+            };
+            let portal_proof = rule == Rule::PortalProof;
+            let start = ray_cells_blast(center, radius);
+            let what = format!("{center:?}, radius {radius}, {resists:?}, {rule:?}");
+            game.world.random.set_seed(7);
+            let every = RayCells::none();
+            let asked =
+                game.exploded_positions_with(center, radius, resists, portal_proof, &start, every);
+            let drawn = game.world.random.next_int();
+            game.world.random.set_seed(7);
+            let kept = game.exploded_positions(center, radius, resists, portal_proof, &start);
+            assert_eq!(kept, asked, "{what}");
+            assert_eq!(game.world.random.next_int(), drawn, "{what}: the level random");
+            if rule == Rule::Plain {
+                game.world.random.set_seed(7);
+                let stepwise = exploded_positions_stepwise(&mut game, center, radius, resists);
+                assert_eq!(stepwise, asked, "{what}: every step looked up");
+            }
+            exploded.push(asked.len());
+        }
+        game.combat.blast_resistance_cap = None;
+        game.combat.rail_proof_blast = false;
+        game.combat.blast_settings.calculator = None;
+        game.combat.blast_settings.source_calculator = SourceCalculator::Default;
+        // Stone holds a TNT's blast to the cells around its own, water stops every ray at its
+        // first step, and in air each ray runs out.
+        assert!((1..100).contains(&exploded[0]), "{exploded:?}");
+        assert_eq!(exploded[2], 0, "{exploded:?}");
+        assert!(exploded[3] > 20 && exploded[12] > 500, "{exploded:?}");
+    }
+
+    /// Times a TNT's rays in each of `ray_cell_scenes`, asking at every step and keeping their
+    /// cells (`RayCells`), and checks both explode as many positions. Run by hand in release:
+    /// `HORIZON_TEST_RESOURCES=... cargo test -p horizon-client --release --lib -- --ignored
+    /// --exact --nocapture game::explosion::tests::ray_cells_timing`; `RAY_BLASTS` sets the
+    /// blasts a scene (300).
+    #[test]
+    #[ignore = "a timing, needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn ray_cells_timing() {
+        let blasts: u32 = std::env::var("RAY_BLASTS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(300);
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        for (name, center) in ray_cell_scenes(&mut game) {
+            let start = ray_cells_blast(center, 4.0);
+            let mut spent = [std::time::Duration::ZERO; 2];
+            let mut exploded = [0; 2];
+            for i in 0..blasts {
+                // Each way first in turn, so that neither always finds the caches warm.
+                for kept in [i % 2 == 0, i % 2 == 1] {
+                    let cells = if kept {
+                        RayCells::around(center, 4.0)
+                    } else {
+                        RayCells::none()
+                    };
+                    game.world.random.set_seed(7);
+                    let started = std::time::Instant::now();
+                    let positions =
+                        game.exploded_positions_with(center, 4.0, None, false, &start, cells);
+                    spent[usize::from(kept)] += started.elapsed();
+                    exploded[usize::from(kept)] = positions.len();
+                }
+            }
+            assert_eq!(exploded[0], exploded[1], "{name}");
+            let micros = |spent: std::time::Duration| spent.as_secs_f64() * 1e6 / f64::from(blasts);
+            eprintln!(
+                "ray cells, {name}: {:.1} us a blast asking at every step, {:.1} us keeping the \
+                 cells; {} positions",
+                micros(spent[0]),
+                micros(spent[1]),
+                exploded[1]
+            );
+        }
+    }
+
     #[test]
     #[ignore = "requires prepared resources; tools/test_explosion_items_parity.py"]
     fn explosion_items_parity_fixture() {
@@ -2566,6 +3217,92 @@ mod tests {
         assert_eq!(blast_resistance(0.3, Some(0.8), false), 0.3, "already low");
         assert_eq!(blast_resistance(4.0, Some(0.8), true), 4.0, "wither immune");
         assert_eq!(blast_resistance(4.0, None, false), 4.0, "another blast");
+    }
+
+    /// `BLAST_RAYS` counts the rays `exploded_positions` casts: the cells on the faces of a cube
+    /// 16 cells a side.
+    #[test]
+    fn a_blast_casts_its_rays() {
+        let faces = (0..16)
+            .flat_map(|x| (0..16).flat_map(move |y| (0..16).map(move |z| [x, y, z])))
+            .filter(|cell: &[i32; 3]| cell.iter().any(|&i| i == 0 || i == 15))
+            .count();
+        assert_eq!(faces, BLAST_RAYS);
+    }
+
+    /// A blast whose centre's cell stops every ray at its first step (water, lava, a cell
+    /// resisting as water, a radius just short of crossing water) explodes nothing and leaves
+    /// the level random as rays looking up every step do; one whose rays get past it (air, stone
+    /// around an air cell, a radius just long enough to cross water) or that starts below the
+    /// level goes through the rays, which explode as before.
+    #[test]
+    #[ignore = "daily"]
+    fn rays_stopped_in_their_first_cell_draw_as_each_ray_did() {
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        let air = game.world.air;
+        let [stone, water, lava] = ["minecraft:stone", "minecraft:water", "minecraft:lava"]
+            .map(|name| game.pack.assets.registry.default_state(name).unwrap());
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 20..=80 {
+                    let state = match y {
+                        20..=40 => stone,
+                        44..=60 => water,
+                        64..=80 => lava,
+                        _ => air,
+                    };
+                    game.world.set(x, y, z, state).unwrap();
+                }
+            }
+        }
+        game.world.set(8, 30, 8, air).unwrap();
+        let (min_y, max_y) = game.with_level(|_, level, _| {
+            use horizon_world::level::LevelAccess;
+            (level.min_y(), level.max_y())
+        });
+        let in_water = [8.5, 52.06125, 8.5];
+        let in_air = [8.5, 120.06125, 8.5];
+        let below = [8.5, f64::from(min_y) - 1.5, 8.5];
+        let cases = [
+            (in_water, 4.0, None, true),
+            (in_water, 23.0, None, true),
+            (in_water, 24.0, None, false),
+            ([8.5, 72.06125, 8.5], 4.0, None, true),
+            (in_air, 4.0, Some(([8, 120, 8], 100.0)), true),
+            (in_air, 4.0, None, false),
+            ([8.5, 30.06125, 8.5], 4.0, None, false),
+            (below, 4.0, None, false),
+        ];
+        for (center, radius, resists, stops) in cases {
+            let start = ExplosionStart::from(mod_api::__private::built::ExplosionStart {
+                dimension: "minecraft:overworld",
+                center,
+                radius,
+                fire: false,
+                interaction: mod_api::BlockInteraction::Destroy,
+                damage_type: "minecraft:explosion",
+                source: None,
+                owner: None,
+            });
+            let what = format!("{center:?}, radius {radius}, {resists:?}");
+            let rules = game.blast_rules(resists, false);
+            let bounds = (min_y, max_y);
+            assert_eq!(
+                game.rays_stop_in_their_first_cell(center, radius, bounds, &rules, &start),
+                stops,
+                "{what}"
+            );
+            game.world.random.set_seed(7);
+            let expected = exploded_positions_stepwise(&mut game, center, radius, resists);
+            let drawn = game.world.random.next_int();
+            game.world.random.set_seed(7);
+            let got = game.exploded_positions(center, radius, resists, false, &start);
+            assert_eq!(got, expected, "{what}");
+            assert_eq!(game.world.random.next_int(), drawn, "{what}: the level random");
+            let outside = center[1] < f64::from(min_y);
+            assert_eq!(got.is_empty(), stops || outside, "{what}");
+        }
     }
 
     /// A dropped item survives a mob's blast untouched while `mobGriefing` is

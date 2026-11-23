@@ -22,7 +22,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock, TryLockError,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -74,6 +74,16 @@ struct RingWork {
     found: Vec<OnceLock<ChunkPos>>,
     left: Mutex<usize>,
     finished: Condvar,
+    /// Every search's square from one batch of the generator's (`StartContext::noise_biome_lists`:
+    /// the GPU's, with HORIZON_GPU_LOCATE), by search, once the thread that asked for it has it;
+    /// dropped when the rings are done.
+    squares: Mutex<Option<Arc<Vec<Vec<BiomeId>>>>>,
+    /// Whether a thread asked for that batch: one asks, the others go on searching meanwhile.
+    batch_asked: AtomicBool,
+    /// The searches that read their square from the batch, and when the first thread began: the
+    /// log line at the end.
+    from_batch: AtomicUsize,
+    started: OnceLock<std::time::Instant>,
 }
 impl RingWork {
     fn new(sets: Vec<(usize, Vec<RingSearch>)>) -> Self {
@@ -90,21 +100,57 @@ impl RingWork {
             left: Mutex::new(searches.len()),
             finished: Condvar::new(),
             searches,
+            squares: Mutex::new(None),
+            batch_asked: AtomicBool::new(false),
+            from_batch: AtomicUsize::new(0),
+            started: OnceLock::new(),
         }
     }
-    /// Run searches until none are left to take, then wait for the rest.
+    /// Asks `lists` for every search's square at once (each list as one `noise_biomes` call
+    /// answers it), unless a thread asked already or no search is left to take. This thread
+    /// waits for the answer; the others search meanwhile, then read their squares from it once
+    /// it is in (`help`), so none waits for a batch. An answer without one list per square, each
+    /// as long as its square, is no answer.
+    fn batch_squares(&self, lists: impl FnOnce(&[Vec<[i32; 3]>]) -> Option<Vec<Vec<BiomeId>>>) {
+        if self.fixed
+            || self.next.load(Ordering::Relaxed) >= self.searches.len()
+            || self.batch_asked.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let squares: Vec<Vec<[i32; 3]>> = (self.searches.iter())
+            .map(|(_, search)| search.square())
+            .collect();
+        let answer = lists(&squares).filter(|answer| {
+            answer.len() == squares.len()
+                && (answer.iter().zip(&squares)).all(|(found, square)| found.len() == square.len())
+        });
+        *self.squares.lock().unwrap() = answer.map(Arc::new);
+    }
+    /// Run searches until none are left to take, then wait for the rest. `from_source`: `biomes`
+    /// answers from the generator's biome source (`StartContext::biomes_from_source`), so that
+    /// a search may read its square from the batch instead: the same biomes.
     fn help<'a>(
         &self,
         preferred: impl Fn(usize) -> &'a BTreeSet<BiomeId>,
         biomes: &mut dyn FnMut(&[[i32; 3]]) -> Vec<BiomeId>,
+        from_source: bool,
     ) {
         loop {
             let i = self.next.fetch_add(1, Ordering::Relaxed);
             let Some((set, search)) = self.searches.get(i) else {
                 break;
             };
+            let batch = if from_source {
+                self.squares.lock().unwrap().clone()
+            } else {
+                None
+            };
             let found = if self.fixed {
                 search.find_fixed(preferred(*set), biomes)
+            } else if let Some(square) = batch.as_ref().and_then(|lists| lists.get(i)) {
+                self.from_batch.fetch_add(1, Ordering::Relaxed);
+                search.find(preferred(*set), &mut |_: &[[i32; 3]]| square.clone())
             } else {
                 search.find(preferred(*set), biomes)
             };
@@ -411,11 +457,34 @@ impl StructureState {
         }
         let work = self.ring_work(context);
         let registry = &self.registry;
-        work.help(|set| registry.ring_biomes(set), &mut |quarts| {
-            context.noise_biomes(quarts)
+        let _ = work.started.get_or_init(std::time::Instant::now);
+        // One batch for every square when the context has one (the GPU's, HORIZON_GPU_LOCATE),
+        // asked for by the first thread that can, while the others start on the CPU.
+        let from_source = context.biomes_from_source();
+        if from_source {
+            work.batch_squares(|lists| context.noise_biome_lists(lists));
+        }
+        work.help(
+            |set| registry.ring_biomes(set),
+            &mut |quarts| context.noise_biomes(quarts),
+            from_source,
+        );
+        let rings = self.rings.get_or_init(|| {
+            if let Some(started) = work.started.get()
+                && !work.searches.is_empty()
+            {
+                log::info!(
+                    "Ring positions: {} searches in {:.1} ms, {} of them on squares from one batch",
+                    work.searches.len(),
+                    started.elapsed().as_secs_f64() * 1e3,
+                    work.from_batch.load(Ordering::Relaxed)
+                );
+            }
+            work.rings(|set| registry.sets[set].name.clone())
         });
-        self.rings
-            .get_or_init(|| work.rings(|set| registry.sets[set].name.clone()))
+        // Every search is done: the batch's squares are read no more.
+        work.squares.lock().unwrap().take();
+        rings
     }
     /// The rings a chunk's starts are decided with. Before they are known,
     /// a chunk no ring search can end near (with the exclusion zones' reach)
@@ -2205,7 +2274,7 @@ mod tests {
             let sets = [&preferred, &none, &preferred];
             std::thread::scope(|scope| {
                 for _ in 0..4 {
-                    scope.spawn(|| work.help(|set| sets[set], &mut { biomes }));
+                    scope.spawn(|| work.help(|set| sets[set], &mut { biomes }, false));
                 }
             });
             let rings = work.rings(|set| format!("set{set}"));
@@ -2218,6 +2287,96 @@ mod tests {
                 rings["set2"],
                 serial(seed.wrapping_add(1), 20, 5, 40, &preferred)
             );
+        }
+    }
+
+    /// A batch of every square (`StartContext::noise_biome_lists`) gives the serial positions:
+    /// it is asked for once, read by the threads whose biomes it stands for, and ignored by the
+    /// others and when it is no answer (none, too few lists, lists too short).
+    #[test]
+    fn ring_work_reads_its_squares_from_one_batch() {
+        let preferred: BTreeSet<BiomeId> = (0..20).map(|b| BiomeId(b * 3)).collect();
+        let biomes = |quarts: &[[i32; 3]]| -> Vec<BiomeId> {
+            quarts
+                .iter()
+                .map(|q| {
+                    BiomeId((q[0].wrapping_mul(31) ^ q[2].wrapping_mul(17)).rem_euclid(64) as u32)
+                })
+                .collect()
+        };
+        // The batch as the generator answers it, and one whose biomes are all wrong.
+        let right = |lists: &[Vec<[i32; 3]>]| -> Option<Vec<Vec<BiomeId>>> {
+            Some(lists.iter().map(|list| biomes(list)).collect())
+        };
+        let wrong = |lists: &[Vec<[i32; 3]>]| -> Option<Vec<Vec<BiomeId>>> {
+            Some(
+                lists
+                    .iter()
+                    .map(|list| vec![BiomeId(0); list.len()])
+                    .collect(),
+            )
+        };
+        let new_work = |seed: i64| {
+            RingWork::new(vec![
+                (0, ring_searches(seed, 32, 3, 128)),
+                (1, ring_searches(seed.wrapping_add(1), 20, 5, 40)),
+            ])
+        };
+        let positions = |work: &RingWork| {
+            let rings = work.rings(|set| format!("set{set}"));
+            (rings["set0"].clone(), rings["set1"].clone())
+        };
+        let sets = [&preferred, &preferred];
+        for seed in [0, 1234, -77, i64::MAX] {
+            let serial = |s: i64, distance, spread, count| {
+                ring_positions(s, distance, spread, count, &preferred, &mut { biomes })
+            };
+            let expected = (
+                serial(seed, 32, 3, 128),
+                serial(seed.wrapping_add(1), 20, 5, 40),
+            );
+            // One thread: the batch, then every square from it.
+            let work = new_work(seed);
+            work.batch_squares(right);
+            work.help(|set| sets[set], &mut { biomes }, true);
+            assert_eq!(positions(&work), expected);
+            assert_eq!(work.from_batch.load(Ordering::Relaxed), 168);
+            // A thread whose biomes the batch does not stand for does not read it: these
+            // wrong biomes would move the positions.
+            let work = new_work(seed);
+            work.batch_squares(wrong);
+            work.help(|set| sets[set], &mut { biomes }, false);
+            assert_eq!(positions(&work), expected);
+            assert_eq!(work.from_batch.load(Ordering::Relaxed), 0);
+            // No answer, or lists that do not fit the squares: the thread's own biomes.
+            let answers: [Option<Vec<Vec<BiomeId>>>; 3] =
+                [None, Some(Vec::new()), Some(vec![Vec::new(); 168])];
+            for answer in answers {
+                let work = new_work(seed);
+                work.batch_squares(|_| answer);
+                work.help(|set| sets[set], &mut { biomes }, true);
+                assert_eq!(positions(&work), expected);
+                assert_eq!(work.from_batch.load(Ordering::Relaxed), 0);
+            }
+            // Four threads, two of them reading from the source: one batch at most.
+            let work = new_work(seed);
+            let asked = AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for from_source in [true, false, true, false] {
+                    let (work, asked) = (&work, &asked);
+                    scope.spawn(move || {
+                        if from_source {
+                            work.batch_squares(|lists| {
+                                asked.fetch_add(1, Ordering::Relaxed);
+                                right(lists)
+                            });
+                        }
+                        work.help(|set| sets[set], &mut { biomes }, from_source);
+                    });
+                }
+            });
+            assert_eq!(positions(&work), expected);
+            assert!(asked.load(Ordering::Relaxed) <= 1);
         }
     }
 }
