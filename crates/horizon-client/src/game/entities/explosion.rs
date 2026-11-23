@@ -154,6 +154,10 @@ impl JavaKey for Key {
     }
 }
 
+/// The rays `ServerExplosion.calculateExplodedPositions` casts, one through each cell on the
+/// faces of a cube 16 cells a side: 16³ - 14³.
+const BLAST_RAYS: usize = 1352;
+
 /// `Explosion.BlockInteraction` for the explosions Horizon produces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BlockInteraction {
@@ -755,6 +759,14 @@ impl Game<'_> {
             (level.min_y(), level.max_y())
         });
         let rules = self.blast_rules(resists, portal_proof);
+        // A blast in water: every ray stops in the centre's cell having put nothing in the
+        // set, and only draws its power.
+        if self.rays_stop_in_their_first_cell(center, radius, (min_y, max_y), &rules, explosion) {
+            for _ in 0..BLAST_RAYS {
+                self.world.random.next_float();
+            }
+            return Vec::new();
+        }
         let mut set: JavaHashMap<Key, ()> = JavaHashMap::default();
         for xx in 0..16 {
             for yy in 0..16 {
@@ -808,6 +820,52 @@ impl Game<'_> {
             }
         }
         set.entries().map(|(k, _)| k.0).collect()
+    }
+    /// Whether every ray of the blast stops in the cell its centre is in, having put nothing in
+    /// the set: the step there takes at least what the strongest ray can draw (water and lava
+    /// take 30.09, a TNT's ray has at most 5.2). The rays then only draw their power. Only for a
+    /// cell in the level whose answer no hook gives: `cell_explosion_resistance` then draws
+    /// nothing and writes nothing, so asking it once here instead of once a ray changes only the
+    /// time.
+    fn rays_stop_in_their_first_cell(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        (min_y, max_y): (i32, i32),
+        rules: &BlastRules,
+        explosion: &ExplosionStart<'_>,
+    ) -> bool {
+        use crate::game::api_values::block_state::block_listens;
+        use mod_api::HookId;
+        // Every ray's first step, as `exploded_positions` takes it.
+        let pos = center.map(|c| c.floor() as i32);
+        if pos[1] < min_y
+            || pos[1] >= max_y
+            || !(-30_000_000..30_000_000).contains(&pos[0])
+            || !(-30_000_000..30_000_000).contains(&pos[2])
+        {
+            return false;
+        }
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let above = self.world.block(pos[0], pos[1] + 1, pos[2]);
+        let hooks = [
+            HookId::ExplosionResistance,
+            HookId::CanEntityDestroy,
+            HookId::RailDirection,
+        ];
+        if hooks.into_iter().any(|hook| block_listens(hook, state))
+            || block_listens(HookId::RailDirection, above)
+        {
+            return false;
+        }
+        let (resistance, _) = self.cell_explosion_resistance(pos, rules, explosion, None);
+        let taken = resistance.map_or(0.0, |r| (r + 0.3) * 0.3);
+        // A ray's power is `radius * (0.7 + draw * 0.6)` with a draw below 1, and f32 rounding
+        // keeps the order of sums and products, so no ray starts above this one, nor keeps more
+        // after the step. With a negative radius every ray starts below 0 and none steps.
+        let draw = 1.0f32;
+        let strongest = radius * (0.7 + draw * 0.6);
+        strongest - taken <= 0.0
     }
     /// `ServerExplosion.hurtEntities` for the player: damage scaled by
     /// distance and exposure, through a raised shield (`hurtServer` blocks
@@ -3159,6 +3217,92 @@ mod tests {
         assert_eq!(blast_resistance(0.3, Some(0.8), false), 0.3, "already low");
         assert_eq!(blast_resistance(4.0, Some(0.8), true), 4.0, "wither immune");
         assert_eq!(blast_resistance(4.0, None, false), 4.0, "another blast");
+    }
+
+    /// `BLAST_RAYS` counts the rays `exploded_positions` casts: the cells on the faces of a cube
+    /// 16 cells a side.
+    #[test]
+    fn a_blast_casts_its_rays() {
+        let faces = (0..16)
+            .flat_map(|x| (0..16).flat_map(move |y| (0..16).map(move |z| [x, y, z])))
+            .filter(|cell: &[i32; 3]| cell.iter().any(|&i| i == 0 || i == 15))
+            .count();
+        assert_eq!(faces, BLAST_RAYS);
+    }
+
+    /// A blast whose centre's cell stops every ray at its first step (water, lava, a cell
+    /// resisting as water, a radius just short of crossing water) explodes nothing and leaves
+    /// the level random as rays looking up every step do; one whose rays get past it (air, stone
+    /// around an air cell, a radius just long enough to cross water) or that starts below the
+    /// level goes through the rays, which explode as before.
+    #[test]
+    #[ignore = "daily"]
+    fn rays_stopped_in_their_first_cell_draw_as_each_ray_did() {
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        let air = game.world.air;
+        let [stone, water, lava] = ["minecraft:stone", "minecraft:water", "minecraft:lava"]
+            .map(|name| game.pack.assets.registry.default_state(name).unwrap());
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 20..=80 {
+                    let state = match y {
+                        20..=40 => stone,
+                        44..=60 => water,
+                        64..=80 => lava,
+                        _ => air,
+                    };
+                    game.world.set(x, y, z, state).unwrap();
+                }
+            }
+        }
+        game.world.set(8, 30, 8, air).unwrap();
+        let (min_y, max_y) = game.with_level(|_, level, _| {
+            use horizon_world::level::LevelAccess;
+            (level.min_y(), level.max_y())
+        });
+        let in_water = [8.5, 52.06125, 8.5];
+        let in_air = [8.5, 120.06125, 8.5];
+        let below = [8.5, f64::from(min_y) - 1.5, 8.5];
+        let cases = [
+            (in_water, 4.0, None, true),
+            (in_water, 23.0, None, true),
+            (in_water, 24.0, None, false),
+            ([8.5, 72.06125, 8.5], 4.0, None, true),
+            (in_air, 4.0, Some(([8, 120, 8], 100.0)), true),
+            (in_air, 4.0, None, false),
+            ([8.5, 30.06125, 8.5], 4.0, None, false),
+            (below, 4.0, None, false),
+        ];
+        for (center, radius, resists, stops) in cases {
+            let start = ExplosionStart::from(mod_api::__private::built::ExplosionStart {
+                dimension: "minecraft:overworld",
+                center,
+                radius,
+                fire: false,
+                interaction: mod_api::BlockInteraction::Destroy,
+                damage_type: "minecraft:explosion",
+                source: None,
+                owner: None,
+            });
+            let what = format!("{center:?}, radius {radius}, {resists:?}");
+            let rules = game.blast_rules(resists, false);
+            let bounds = (min_y, max_y);
+            assert_eq!(
+                game.rays_stop_in_their_first_cell(center, radius, bounds, &rules, &start),
+                stops,
+                "{what}"
+            );
+            game.world.random.set_seed(7);
+            let expected = exploded_positions_stepwise(&mut game, center, radius, resists);
+            let drawn = game.world.random.next_int();
+            game.world.random.set_seed(7);
+            let got = game.exploded_positions(center, radius, resists, false, &start);
+            assert_eq!(got, expected, "{what}");
+            assert_eq!(game.world.random.next_int(), drawn, "{what}: the level random");
+            let outside = center[1] < f64::from(min_y);
+            assert_eq!(got.is_empty(), stops || outside, "{what}");
+        }
     }
 
     /// A dropped item survives a mob's blast untouched while `mobGriefing` is
