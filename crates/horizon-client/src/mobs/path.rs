@@ -17,6 +17,15 @@ pub const PATH_TYPES: usize = PathType::COUNT;
 
 impl MobWorld<'_> {
     pub fn path_type_from_state(&self, x: i32, y: i32, z: i32) -> PathType {
+        // Both turn orders must classify the same state. A stale direct-mapped entry
+        // can otherwise survive in one order and be evicted in the other.
+        #[cfg(feature = "upstream-parallel-mob-islands")]
+        if crate::parallel::may_depart_from_vanilla()
+            && self.mob_hooks.is_none()
+            && mod_api::__private::mods().is_empty()
+        {
+            return self.data.path_type(self.world.block(x, y, z));
+        }
         self.world.cached_path_type(BlockPos::new(x, y, z), || {
             let state = self.world.block(x, y, z);
             self.mob_hooks
