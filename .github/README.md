@@ -9,8 +9,10 @@ Minecraft: Java Edition 26.3 (client, server and launcher) that is checked again
 adds two things, under the same rule as upstream: **nothing may differ from vanilla**.
 
 1. **World generation on the GPU.** Density, aquifers, the beardifier, surface rules, ores, caves, light,
-   sections and biomes run on an NVIDIA GPU (CUDA), in the Overworld, the Nether and the End. Every chunk comes
-   out identical, block for block, to the CPU path, which is itself identical to vanilla.
+   sections and biomes run on an NVIDIA GPU (CUDA) in the Overworld. The Nether and the End have no aquifers;
+   there the GPU runs the density and the caves, and in the Nether also the surface rules and the biomes; the
+   End's biomes and the Nether's compact sections stay on the CPU (`crates/horizon-gpu/NETHER_END.md`). Every
+   chunk comes out identical, block for block, to the CPU path, which is itself identical to vanilla.
 2. **A faster dedicated server tick with 100 players.** Each optimization keeps the tick bit-identical to the
    code before it, which a tick-by-tick harness checks on a fixed scene (see below).
 
@@ -49,16 +51,19 @@ taken in A B B A order. The first row includes upstream's own progress since, wh
   chunks across 27 biomes and 74 structure sites: 0 differences, on the GPU and on the CPU), and a probe compares
   the CPU and the GPU paths in the three dimensions. One seed is compared with vanilla; the GPU stages also
   have test modes that compare each result with the CPU's.
-- **Server tick:** a tick-digest harness runs a fixed scene, 600 ticks with 100 simulated players, and hashes,
-  every tick, the level random's state, the block writes, the scheduled ticks, the entities (id, type, position,
-  velocity, rotation), the players (position), the packets each player is sent and the loaded chunks (and every
-  50 ticks the blocks and light of every section). Two builds must give the same lines, serially and with the
-  parallel tick (`HORIZON_PARALLEL_TICK=exact`).
+- **Server tick:** a tick-digest harness runs two fixed scenes for 600 ticks with 100 simulated players: the
+  default one (creative players flying in the Overworld by day) and a survival one (night, hard difficulty, an
+  arena of spawners and hazards, mobs fighting the players, players in the Nether and the End). Every tick it
+  hashes the level random and its gaussian, the block writes, the scheduled ticks, every entity's motion and its
+  fields read in place (health, absorption, hurt and death times, fire, freeze, air, effects, target and the
+  player it is bound to, yaws, swing...), every entity's own random, the counters, the ticking block entities'
+  NBT, each player's saved data, every packet each player is sent, every level that ticks and the loaded chunks
+  (and every 50 ticks the blocks and light of every section). Two builds must give the same lines, serially and
+  with the parallel tick (`HORIZON_PARALLEL_TICK=exact`).
 
-  This shows that an optimization changes nothing against the build before it, on that scene; it is not a
-  comparison with vanilla. The scene's players are in creative mode and fly in the Overworld, in daytime; the
-  entities' health, AI and inventories and the block entities are not hashed, and the packets only since
-  22/11/2026. Widening the harness is being studied.
+  This shows that an optimization changes nothing against the build before it, on those scenes; it is not a
+  comparison with vanilla. The harness is part of every server build but runs only with `HORIZON_TICK_DIGEST`
+  set (`tools/tick_digest.py` sets it).
 - **Mob islands:** `HORIZON_PARALLEL_TICK=verify` ticks the mobs both in groups and serially, and compares them.
 
 ## What was optimized
