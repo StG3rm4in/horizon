@@ -896,6 +896,9 @@ struct TickScratch {
     boat_cells: Vec<BlockPos>,
     /// The cells of the boxes of the mobs and the other entities.
     touched: Vec<block_ticks::CellBox>,
+    /// Each sweeping entity's id and box, in the order the entity lists hold them, from the walk
+    /// of their feet for the walk of their boxes; `None` where that walk takes no box.
+    entity_boxes: Vec<(u32, Option<Aabb>)>,
     sensing: Vec<BlockPos>,
     later: Vec<BlockPos>,
     /// What the palettes of the sections those cells reach may hold.
