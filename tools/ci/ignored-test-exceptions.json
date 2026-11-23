@@ -178,6 +178,14 @@
   {
     "package": "horizon-client",
     "target": "lib",
+    "test": "game::explosion::tests::ray_cells_timing",
+    "path": "crates/horizon-client/src/game/entities/explosion.rs",
+    "reason": "a timing, needs prepared resources in HORIZON_TEST_RESOURCES",
+    "rationale": "Manual wall-clock measurement, not a daily correctness check: prints the time of a TNT's block rays asking every cell at every step and keeping the cells' answers (RayCells), in stone, water, a jumble of blocks and air, asserting both explode as many positions (the daily ray_cells_explode_what_each_ray_asked checks them exactly). Run by hand on an idle machine with the optimized profile and HORIZON_TEST_RESOURCES, exact-selecting the full test path with --ignored --exact --nocapture; RAY_BLASTS optionally sets the blasts a scene (300)."
+  },
+  {
+    "package": "horizon-client",
+    "target": "lib",
     "test": "game::fishing::tests::breeze_hook_parity_fixture",
     "path": "crates/horizon-client/src/game/items/fishing.rs",
     "reason": "run by tools/test_breeze_hook_parity.py",

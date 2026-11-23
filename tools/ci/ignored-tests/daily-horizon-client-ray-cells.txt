@@ -1,0 +1,5 @@
+# The ray-cell memo's daily tests (explosion.rs, explosion_part_tests.rs): #[ignore = "daily"] in their
+# source, run once a day in the daily run, where they must pass (README.md). Rows: PACKAGE TEST TARGET daily
+# REASON, sorted.
+horizon-client game::explosion::explosion_part_tests::ray_cells_ask_impure_parts_at_each_ray lib daily resources
+horizon-client game::explosion::tests::ray_cells_explode_what_each_ray_asked lib daily resources

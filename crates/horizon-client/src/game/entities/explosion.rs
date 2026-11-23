@@ -632,6 +632,19 @@ impl Game<'_> {
         answers: Option<&mut PartAnswers>,
     ) -> (Option<f32>, bool) {
         let state = self.world.block(pos[0], pos[1], pos[2]);
+        self.state_explosion_resistance(pos, state, rules, explosion, answers)
+    }
+    /// `cell_explosion_resistance` for the cell at `pos`, which holds `state`. The rays keep
+    /// its answer for the rest of a blast (`RayCells`): a hook asked here, or a read of the
+    /// level that may change during the rays, must be one `ray_cell_kept` knows.
+    fn state_explosion_resistance(
+        &mut self,
+        pos: [i32; 3],
+        state: BlockStateId,
+        rules: &BlastRules,
+        explosion: &ExplosionStart<'_>,
+        answers: Option<&mut PartAnswers>,
+    ) -> (Option<f32>, bool) {
         let f = self.res.facts().get(state);
         if let Some(step) = self.blast_calculator_step(&f.name) {
             return step;
@@ -713,6 +726,8 @@ impl Game<'_> {
     }
     /// `ServerExplosion.calculateExplodedPositions`; `resists` overrides one
     /// block's resistance (`ExplosionDamageCalculator.getBlockExplosionResistance`).
+    /// What a cell answers the rays is kept for the rest of the blast where no
+    /// hook would be asked again (`RayCells`).
     fn exploded_positions(
         &mut self,
         center: [f64; 3],
@@ -720,6 +735,20 @@ impl Game<'_> {
         resists: Option<([i32; 3], f32)>,
         portal_proof: bool,
         explosion: &ExplosionStart<'_>,
+    ) -> Vec<[i32; 3]> {
+        let cells = RayCells::around(center, radius);
+        self.exploded_positions_with(center, radius, resists, portal_proof, explosion, cells)
+    }
+    /// `exploded_positions` keeping what the rays' cells answer in `cells`:
+    /// with `RayCells::none()`, every ray's step into a cell asks it, as before.
+    fn exploded_positions_with(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        resists: Option<([i32; 3], f32)>,
+        portal_proof: bool,
+        explosion: &ExplosionStart<'_>,
+        mut cells: RayCells,
     ) -> Vec<[i32; 3]> {
         let (min_y, max_y) = self.with_level(|_, level, _| {
             use horizon_world::level::LevelAccess;
@@ -759,15 +788,15 @@ impl Game<'_> {
                         let (taken, spared, again) = match last {
                             Some((at, taken, spared)) if at == pos => (taken, spared, true),
                             _ => {
-                                let (resistance, spared) =
-                                    self.cell_explosion_resistance(pos, &rules, explosion, None);
-                                let taken = resistance.map_or(0.0, |r| (r + 0.3) * 0.3);
+                                let (taken, spared) =
+                                    self.ray_step_cost(&mut cells, pos, &rules, explosion);
                                 last = Some((pos, taken, spared));
                                 (taken, spared, false)
                             }
                         };
                         power -= taken;
-                        if power > 0.0 && !spared && !again {
+                        // A block another ray put in `set` is there already.
+                        if power > 0.0 && !spared && !again && cells.first_in_set(pos) {
                             set.put(Key(pos), ());
                         }
                         xp += xd * f64::from(0.3f32);
@@ -2303,6 +2332,155 @@ fn blast_resistance(base: f32, cap: Option<f32>, kept: bool) -> f32 {
     }
 }
 
+/// What the cells one blast's rays step into answer them (`cell_explosion_resistance`, as the
+/// power a step there takes and whether the block is spared), kept for the rest of the blast's
+/// rays: the centre's cell is asked by each of the 1,352 rays and the cells around it by dozens,
+/// and each answers the same every time where no hook would be asked again (`ray_cell_kept`);
+/// a cell a hook answers for is asked at every ray's step, as before. Also which cells are in
+/// the blast's set already: putting a key a Java `HashSet` holds changes nothing, neither its
+/// order nor its size, so a ray puts a cell only the first time. The cells are kept in a cube
+/// around the centre's cell that every ray of the blast stays in (`around`); a cell outside it
+/// is asked and put at every step. It lives for one blast's ray pass, which writes nothing to
+/// the level: the hooks the pass asks read the level only.
+struct RayCells {
+    /// The cube's lowest cell.
+    origin: [i32; 3],
+    /// The cube's side in cells, 0 for no cube.
+    side: usize,
+    /// By cell, y then z then x: the bits of what a step there takes (an f32) in the low half,
+    /// the flags above. Empty until the first cell is kept.
+    cells: Vec<u64>,
+}
+impl RayCells {
+    /// What a step into the cell takes is known, the same for every ray: the low half's bits.
+    const KNOWN: u64 = 1 << 32;
+    /// The known cell's block is spared (`shouldBlockExplode` is false).
+    const SPARED: u64 = 1 << 33;
+    /// A hook answers for the cell, which every ray's step asks again.
+    const ASKED: u64 = 1 << 34;
+    /// The cell is in the blast's set.
+    const IN_SET: u64 = 1 << 35;
+    /// The widest cube kept, 41 cells a side (551 KB): blasts up to radius 10.8 (a TNT's 4
+    /// keeps 17 a side, 39 KB). A wider blast keeps none.
+    const MOST_HALF: i32 = 20;
+
+    /// No cube: every step is asked, and every step that may put its cell in the set puts it.
+    fn none() -> Self {
+        Self {
+            origin: [0; 3],
+            side: 0,
+            cells: Vec::new(),
+        }
+    }
+    /// The cube around the cell of `center` that every ray of a blast of `radius` stays in: a
+    /// ray's power starts below 1.3 radius and loses at least 0.225 a step of 0.3, so its last
+    /// step is less than 1.3 / 0.225 * 0.3 < 1.75 radius from the centre, and that step's cell
+    /// at most `ceil(1.75 radius)` from the centre's along each axis; one more for rounding.
+    fn around(center: [f64; 3], radius: f32) -> Self {
+        let half = ((f64::from(radius) * 1.75).ceil() as i32).saturating_add(1);
+        if !(0..=Self::MOST_HALF).contains(&half) {
+            return Self::none();
+        }
+        Self {
+            origin: center.map(|c| (c.floor() as i32).saturating_sub(half)),
+            side: (2 * half + 1) as usize,
+            cells: Vec::new(),
+        }
+    }
+    /// Where the cube keeps the cell at `pos`; None outside it.
+    fn slot(&self, pos: [i32; 3]) -> Option<usize> {
+        let side = self.side;
+        let at = |i: usize| pos[i].wrapping_sub(self.origin[i]) as u32 as usize;
+        let (x, y, z) = (at(0), at(1), at(2));
+        if x < side && y < side && z < side {
+            Some((y * side + z) * side + x)
+        } else {
+            None
+        }
+    }
+    /// The bits of the cell at `slot`: none before the cube is made.
+    fn bits(&self, slot: usize) -> u64 {
+        self.cells.get(slot).copied().unwrap_or(0)
+    }
+    /// Adds `bits` to the cell at `slot`, making the cube first if it is not yet.
+    fn mark(&mut self, slot: usize, bits: u64) {
+        if self.cells.is_empty() {
+            self.cells = vec![0; self.side * self.side * self.side];
+        }
+        self.cells[slot] |= bits;
+    }
+    /// Whether a step that may put the cell at `pos` in the blast's set puts it: the first such
+    /// step of the blast into a cell of the cube, every one into a cell outside it.
+    fn first_in_set(&mut self, pos: [i32; 3]) -> bool {
+        let Some(slot) = self.slot(pos) else {
+            return true;
+        };
+        let first = self.bits(slot) & Self::IN_SET == 0;
+        if first {
+            self.mark(slot, Self::IN_SET);
+        }
+        first
+    }
+}
+
+impl Game<'_> {
+    /// What a ray's step into the cell at `pos` takes from its power, `(resistance + 0.3) * 0.3`
+    /// of `cell_explosion_resistance`, and whether the cell's block is spared: asked at the first
+    /// step into the cell and kept in `cells` for the other rays where `ray_cell_kept` allows,
+    /// asked at every ray's step into it otherwise.
+    fn ray_step_cost(
+        &mut self,
+        cells: &mut RayCells,
+        pos: [i32; 3],
+        rules: &BlastRules,
+        explosion: &ExplosionStart<'_>,
+    ) -> (f32, bool) {
+        let slot = cells.slot(pos);
+        let bits = slot.map_or(0, |slot| cells.bits(slot));
+        if bits & RayCells::KNOWN != 0 {
+            return (f32::from_bits(bits as u32), bits & RayCells::SPARED != 0);
+        }
+        let state = self.world.block(pos[0], pos[1], pos[2]);
+        let (resistance, spared) =
+            self.state_explosion_resistance(pos, state, rules, explosion, None);
+        let taken = resistance.map_or(0.0, |r| (r + 0.3) * 0.3);
+        if let Some(slot) = slot
+            && bits & RayCells::ASKED == 0
+        {
+            let kept = if self.ray_cell_kept(pos, state, rules) {
+                let spared = if spared { RayCells::SPARED } else { 0 };
+                RayCells::KNOWN | spared | u64::from(taken.to_bits())
+            } else {
+                RayCells::ASKED
+            };
+            cells.mark(slot, kept);
+        }
+        (taken, spared)
+    }
+    /// Whether what `cell_explosion_resistance` answers for the cell at `pos`, which holds
+    /// `state`, may be kept for the rest of the blast's rays: no hook there would be asked again.
+    /// The level does not change during the rays, nor do the blast, its calculator and its rules.
+    /// Asked at every ray's step instead, as before, so that a mod sees the same asks: a cell
+    /// whose block has a part answering `explosion_resistance`, even one that declares its answer
+    /// pure (that contract covers batched reads, not one read a cell and blast); under a dangerous
+    /// skull's cap, one whose block has a part answering `can_entity_destroy` (for the skull); in
+    /// a TNT minecart's blast, one whose block or the block above has a part answering
+    /// `rail_direction`.
+    fn ray_cell_kept(&self, pos: [i32; 3], state: BlockStateId, rules: &BlastRules) -> bool {
+        use crate::game::api_values::block_state::block_listens;
+        use mod_api::HookId;
+        let impure = block_listens(HookId::ExplosionResistance, state);
+        let skull = rules.cap.is_some()
+            && rules.direct.is_some()
+            && block_listens(HookId::CanEntityDestroy, state);
+        let above = || self.world.block(pos[0], pos[1] + 1, pos[2]);
+        let rails = rules.rail_proof
+            && (block_listens(HookId::RailDirection, state)
+                || block_listens(HookId::RailDirection, above()));
+        !(impure || skull || rails)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2718,6 +2896,241 @@ mod tests {
             let got = game.exploded_positions(center, radius, resists, false, &start);
             assert!(expected.len() > 20, "{radius}: {}", expected.len());
             assert_eq!(got, expected, "radius {radius}, {resists:?}");
+        }
+    }
+
+    /// A TNT's blast at `center` as the hooks hear it.
+    fn ray_cells_blast(center: [f64; 3], radius: f32) -> ExplosionStart<'static> {
+        ExplosionStart::from(mod_api::__private::built::ExplosionStart {
+            dimension: "minecraft:overworld",
+            center,
+            radius,
+            fire: false,
+            interaction: mod_api::BlockInteraction::Destroy,
+            damage_type: "minecraft:explosion",
+            source: None,
+            owner: None,
+        })
+    }
+
+    /// Stone, water, a jumble of blocks and air in the loaded chunk at the origin, one above the
+    /// other, and where a primed TNT's blast goes off in each: 0.06125 above its cell's floor
+    /// (`PrimedTnt.explode`: `getY(0.0625)` of a box 0.98 high), its own cell air.
+    fn ray_cell_scenes(game: &mut Game<'_>) -> [(&'static str, [f64; 3]); 4] {
+        let air = game.world.air;
+        let [stone, water, dirt, obsidian, planks, glass, tnt, rail, portal] = [
+            "minecraft:stone",
+            "minecraft:water",
+            "minecraft:dirt",
+            "minecraft:obsidian",
+            "minecraft:oak_planks",
+            "minecraft:glass",
+            "minecraft:tnt",
+            "minecraft:rail",
+            "minecraft:nether_portal",
+        ]
+        .map(|name| game.pack.assets.registry.default_state(name).unwrap());
+        let jumble = [stone, air, water, dirt, obsidian, air, planks, glass, tnt, rail, portal];
+        for x in 0..16 {
+            for z in 0..16 {
+                for y in 20..=82 {
+                    let state = match y {
+                        20..=40 => stone,
+                        44..=60 => water,
+                        64..=82 => jumble[((x * 7 + y * 3 + z * 5) as usize) % jumble.len()],
+                        _ => air,
+                    };
+                    game.world.set(x, y, z, state).unwrap();
+                }
+            }
+        }
+        game.world.set(8, 30, 8, air).unwrap();
+        [
+            ("stone", [8.5, 30.06125, 8.5]),
+            ("water", [8.5, 52.06125, 8.5]),
+            ("a jumble", [8.3, 72.6, 7.9]),
+            ("air", [8.5, 120.06125, 8.5]),
+        ]
+    }
+
+    /// Every cell a ray steps into lies in the cube `RayCells::around` keeps for its blast: at
+    /// the strongest power a ray can draw, through air, from centres anywhere in their cells,
+    /// for radii up to the widest cube kept. A wider blast keeps none, and a cell of the cube
+    /// goes into the set once.
+    #[test]
+    fn a_rays_cells_stay_in_its_cube() {
+        // The largest `nextFloat`, (2^24 - 1) / 2^24: the strongest ray.
+        let draw = 1.0 - f32::EPSILON / 2.0;
+        let rays: Vec<[f64; 3]> = (0..16)
+            .flat_map(|x| (0..16).flat_map(move |y| (0..16).map(move |z| [x, y, z])))
+            .filter(|cell: &[i32; 3]| cell.iter().any(|&i| i == 0 || i == 15))
+            .map(|cell| {
+                let d = cell.map(|i| f64::from(i as f32 / 15.0 * 2.0 - 1.0));
+                let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                d.map(|v| v / length)
+            })
+            .collect();
+        assert_eq!(rays.len(), 1352);
+        for radius in [0.5f32, 1.0, 3.0, 4.0, 6.0, 7.0, 10.0, 10.85] {
+            for center in [[0.5, 64.06125, 0.5], [-7.999, 0.0, 15.75], [1.0e6 + 0.3, -60.2, -3.7]] {
+                let cells = RayCells::around(center, radius);
+                for &[xd, yd, zd] in &rays {
+                    let mut power = radius * (0.7 + draw * 0.6);
+                    let [mut xp, mut yp, mut zp] = center;
+                    while power > 0.0 {
+                        let pos = [xp.floor() as i32, yp.floor() as i32, zp.floor() as i32];
+                        assert!(cells.slot(pos).is_some(), "radius {radius}, {center:?}: {pos:?}");
+                        xp += xd * f64::from(0.3f32);
+                        yp += yd * f64::from(0.3f32);
+                        zp += zd * f64::from(0.3f32);
+                        power -= 0.225_000_01;
+                    }
+                }
+            }
+        }
+        // Too wide for a cube, and no cube at all: every step is asked, and puts its cell.
+        assert!(RayCells::around([0.5; 3], 11.0).slot([0; 3]).is_none());
+        let mut none = RayCells::none();
+        assert!(none.slot([0; 3]).is_none());
+        assert!(none.first_in_set([0; 3]) && none.first_in_set([0; 3]));
+        // Nothing is made before a cell is kept; then a cell goes into the set once.
+        let mut cells = RayCells::around([0.5, 64.06125, 0.5], 4.0);
+        assert_eq!(cells.side, 17);
+        assert!(cells.cells.is_empty());
+        assert!(cells.first_in_set([0, 64, 0]) && !cells.first_in_set([0, 64, 0]));
+        assert!(cells.first_in_set([1, 64, 0]));
+        assert!(cells.first_in_set([0, 64 + 9, 0]) && cells.first_in_set([0, 64 + 9, 0]));
+    }
+
+    /// The rays of a blast that keeps what its cells answer (`RayCells`) explode the same
+    /// positions in the same order, and leave the level random as, rays asking at every step:
+    /// in stone, water, a jumble of blocks and air, at radii from 1 to past the widest cube,
+    /// with a block resisting in place of its own, and under each rule of the calculators (a
+    /// dangerous skull's cap, a TNT minecart's rails, a portal-proof TNT, a mod's immune blocks,
+    /// a wind charge's).
+    #[test]
+    #[ignore = "daily"]
+    fn ray_cells_explode_what_each_ray_asked() {
+        use crate::game::explosion_settings::{BlastCalculator, SourceCalculator};
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Rule {
+            Plain,
+            Skull,
+            Rails,
+            PortalProof,
+            Immune,
+            WindCharge,
+        }
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        let [stone, water, jumble, air] = ray_cell_scenes(&mut game).map(|(_, center)| center);
+        let immune: HashSet<String> = ["minecraft:stone", "minecraft:obsidian"]
+            .map(String::from)
+            .into();
+        let cases = [
+            (stone, 4.0, None, Rule::Plain),
+            (stone, 6.0, None, Rule::Plain),
+            (water, 4.0, None, Rule::Plain),
+            (jumble, 4.0, None, Rule::Plain),
+            (jumble, 6.0, None, Rule::Plain),
+            (jumble, 4.0, Some(([8, 72, 8], 1200.0)), Rule::Plain),
+            (jumble, 4.0, None, Rule::Skull),
+            (jumble, 4.0, None, Rule::Rails),
+            (jumble, 4.0, None, Rule::PortalProof),
+            (jumble, 4.0, None, Rule::Immune),
+            (jumble, 4.0, None, Rule::WindCharge),
+            (air, 1.0, None, Rule::Plain),
+            (air, 4.0, None, Rule::Plain),
+            (air, 7.0, None, Rule::Plain),
+            (air, 12.0, None, Rule::Plain),
+        ];
+        let mut exploded = Vec::new();
+        for (center, radius, resists, rule) in cases {
+            game.combat.blast_resistance_cap = (rule == Rule::Skull).then_some(0.8);
+            game.combat.rail_proof_blast = rule == Rule::Rails;
+            game.combat.blast_settings.calculator = (rule == Rule::Immune).then(|| BlastCalculator {
+                explodes_blocks: true,
+                damages_entities: true,
+                knockback: 1.0,
+                immune: Some(immune.clone()),
+            });
+            game.combat.blast_settings.source_calculator = match rule {
+                Rule::WindCharge => SourceCalculator::WindCharge(immune.clone()),
+                _ => SourceCalculator::Default,
+            };
+            let portal_proof = rule == Rule::PortalProof;
+            let start = ray_cells_blast(center, radius);
+            let what = format!("{center:?}, radius {radius}, {resists:?}, {rule:?}");
+            game.world.random.set_seed(7);
+            let every = RayCells::none();
+            let asked =
+                game.exploded_positions_with(center, radius, resists, portal_proof, &start, every);
+            let drawn = game.world.random.next_int();
+            game.world.random.set_seed(7);
+            let kept = game.exploded_positions(center, radius, resists, portal_proof, &start);
+            assert_eq!(kept, asked, "{what}");
+            assert_eq!(game.world.random.next_int(), drawn, "{what}: the level random");
+            if rule == Rule::Plain {
+                game.world.random.set_seed(7);
+                let stepwise = exploded_positions_stepwise(&mut game, center, radius, resists);
+                assert_eq!(stepwise, asked, "{what}: every step looked up");
+            }
+            exploded.push(asked.len());
+        }
+        game.combat.blast_resistance_cap = None;
+        game.combat.rail_proof_blast = false;
+        game.combat.blast_settings.calculator = None;
+        game.combat.blast_settings.source_calculator = SourceCalculator::Default;
+        // Stone holds a TNT's blast to the cells around its own, water stops every ray at its
+        // first step, and in air each ray runs out.
+        assert!((1..100).contains(&exploded[0]), "{exploded:?}");
+        assert_eq!(exploded[2], 0, "{exploded:?}");
+        assert!(exploded[3] > 20 && exploded[12] > 500, "{exploded:?}");
+    }
+
+    /// Times a TNT's rays in each of `ray_cell_scenes`, asking at every step and keeping their
+    /// cells (`RayCells`), and checks both explode as many positions. Run by hand in release:
+    /// `HORIZON_TEST_RESOURCES=... cargo test -p horizon-client --release --lib -- --ignored
+    /// --exact --nocapture game::explosion::tests::ray_cells_timing`; `RAY_BLASTS` sets the
+    /// blasts a scene (300).
+    #[test]
+    #[ignore = "a timing, needs prepared resources in HORIZON_TEST_RESOURCES"]
+    fn ray_cells_timing() {
+        let blasts: u32 = std::env::var("RAY_BLASTS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(300);
+        let mut resources = None;
+        let mut game = crate::game::game_tests::tests::server_game(&mut resources);
+        for (name, center) in ray_cell_scenes(&mut game) {
+            let start = ray_cells_blast(center, 4.0);
+            let mut spent = [std::time::Duration::ZERO; 2];
+            let mut exploded = [0; 2];
+            for i in 0..blasts {
+                // Each way first in turn, so that neither always finds the caches warm.
+                for kept in [i % 2 == 0, i % 2 == 1] {
+                    let cells = if kept {
+                        RayCells::around(center, 4.0)
+                    } else {
+                        RayCells::none()
+                    };
+                    game.world.random.set_seed(7);
+                    let started = std::time::Instant::now();
+                    let positions =
+                        game.exploded_positions_with(center, 4.0, None, false, &start, cells);
+                    spent[usize::from(kept)] += started.elapsed();
+                    exploded[usize::from(kept)] = positions.len();
+                }
+            }
+            assert_eq!(exploded[0], exploded[1], "{name}");
+            let micros = |spent: std::time::Duration| spent.as_secs_f64() * 1e6 / f64::from(blasts);
+            eprintln!(
+                "ray cells, {name}: {:.1} us a blast asking at every step, {:.1} us keeping the \
+                 cells; {} positions",
+                micros(spent[0]),
+                micros(spent[1]),
+                exploded[1]
+            );
         }
     }
 
