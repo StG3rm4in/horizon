@@ -1,14 +1,17 @@
 //! The exactness harness of the server tick (`tools/tick_digest.py`): a digest of every tick, and a
 //! fixture mode that takes worker timing out of the tick.
 //!
-//! The digest (`HORIZON_TICK_DIGEST=FILE`): one line per server tick with hashes of the level in place
-//! once the tick ends (the Overworld while it is the only level ticking): its random, the block writes
-//! of the tick, its scheduled ticks, its entities, the players, the loaded chunks and, every
-//! `HORIZON_TICK_DIGEST_FULL` ticks (default 20, 0 for never), the blocks and light of every loaded
-//! section. Two runs of one fixture must write the same lines: the first line that differs names the
-//! tick and the part. `HORIZON_TICK_DIGEST_DETAIL=FROM-TO` also writes the rows behind the hashes of
-//! those ticks to `FILE.detail`, to find what differs (on full ticks, a row per section with the hash
-//! of its blocks and of its light).
+//! The digest (`HORIZON_TICK_DIGEST=FILE`): one line per server tick with hashes of the state once
+//! the tick ends (`tick_digest/parts.rs`; docs/tick-digest.md lists the parts): the level in place's
+//! (the Overworld while it ticks) under plain names, the server's own (the id and join counters, the
+//! players and their files, what the fixture's players were sent, the chunk results applied), then
+//! each other level's that ticked, under its name. A level's: its random, its block writes, scheduled
+//! ticks, entities with their fields and own randoms, ticking block entities' NBT, its chunks and,
+//! every `HORIZON_TICK_DIGEST_FULL` ticks (default 20, 0 for never), the blocks and light of every
+//! section and every block entity's NBT. Two runs of one fixture must write the same lines: the first
+//! line that differs names the tick and the part. `HORIZON_TICK_DIGEST_DETAIL=FROM-TO` also writes
+//! the rows behind the hashes of those ticks to `FILE.detail`, to find what differs (on full ticks, a
+//! row per section with the hash of its blocks and of its light).
 //!
 //! The fixture (`HORIZON_TICK_FIXTURE_TICKS=N`): the server runs N ticks back to back, then stops.
 //! Before each tick it runs the console commands of `HORIZON_TICK_FIXTURE_COMMANDS` (lines
@@ -17,11 +20,12 @@
 //! The tick itself is unchanged.
 
 use super::super::Game;
-use super::super::entity::{Entity as _, entity_lists_of, for_each_entity};
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     io::{BufWriter, Write},
 };
+
+mod scene;
 
 /// The VarInt at `at` in a packet body, and where the next field starts.
 fn varint(body: &[u8], at: usize) -> (u32, usize) {
@@ -71,6 +75,9 @@ fn skipped_packets() -> Vec<u32> {
         .filter_map(|id| u32::from_str_radix(id.trim().trim_start_matches("0x"), 16).ok())
         .collect()
 }
+
+#[path = "tick_digest/parts.rs"]
+mod parts;
 
 /// A count and a hash of what was added: `DefaultHasher::new` is SipHash with fixed keys, the same in
 /// every run of one toolchain.
@@ -128,6 +135,8 @@ impl TickDigest {
             Ok(every) => every.trim().parse()?,
             Err(_) => 20,
         };
+        let range = detail.as_ref().map(|(from, to, _)| (*from, *to));
+        parts::start(full_every, range);
         Ok(Some(Self {
             out,
             detail,
@@ -157,6 +166,9 @@ pub(super) struct Fixture {
     player_count: usize,
     join_every: u64,
     players: Vec<Phantom>,
+    /// The entity types the phantoms out of creative mode take for monsters (`scene::HOSTILE`),
+    /// looked up once.
+    hostile: Vec<i32>,
 }
 
 /// One simulated player of a fixture, as `horizon-bots --behaviour mixed` plays: it enters through the
@@ -164,10 +176,14 @@ pub(super) struct Fixture {
 /// tick that takes them, and answers what the server waits for from the server's own state (the
 /// teleport to accept, the chunk batches to acknowledge). Three of five wander within 48 blocks of
 /// their spawn, one flies away at 22 blocks a second, one stands; all 24 blocks above their spawn,
-/// moving only while the server has sent the chunk they are in. What it is sent is drained unread.
+/// moving only while the server has sent the chunk they are in. What it is sent is read once a tick
+/// (`parts::receive`): in creative mode it makes nothing of it, out of it its play does (`observe`).
 struct Phantom {
     conn: u32,
     rx: std::sync::mpsc::Receiver<horizon_client::lan::Out>,
+    /// Its sender's budget of bytes not read yet (`MAX_PENDING`), which `parts::receive` gives back:
+    /// a test channel has no writer to do it, and past the budget nothing more is sent.
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// splitmix64 state, from the player's index.
     random: u64,
     /// 0 wander, 1 explore, 2 stand.
@@ -179,6 +195,8 @@ struct Phantom {
     target: [f64; 3],
     cruise: f64,
     heading: f64,
+    /// Its play out of creative mode: the survival scene (`scene.rs`).
+    survivor: scene::Survivor,
 }
 
 impl Phantom {
@@ -220,6 +238,13 @@ impl Phantom {
         }
         self.position = Some(pos);
     }
+
+    /// What a client learns from one body it was sent (`Out::Packet`: VarInt id and payload),
+    /// kept for its play out of creative mode (`scene::Survivor::observe`); the body is left as it
+    /// is. Called on every body taken from `rx`, in order, before the phantom's next turn.
+    fn observe(&mut self, body: &[u8]) {
+        self.survivor.observe(body);
+    }
 }
 
 impl Fixture {
@@ -257,6 +282,7 @@ impl Fixture {
             player_count: number("HORIZON_TICK_FIXTURE_PLAYERS", 0)? as usize,
             join_every: number("HORIZON_TICK_FIXTURE_JOIN_EVERY", 10)?.max(1),
             players: Vec::new(),
+            hostile: Vec::new(),
         }))
     }
 
@@ -293,6 +319,7 @@ impl Game<'_> {
                 break;
             };
             let (tx, rx) = std::sync::mpsc::channel();
+            let pending = std::sync::Arc::<std::sync::atomic::AtomicUsize>::default();
             let joined = horizon_client::lan::Joined {
                 conn,
                 uuid: horizon_protocol::crypto::offline_uuid(&name),
@@ -300,7 +327,7 @@ impl Game<'_> {
                 properties: Vec::new(),
                 info: horizon_protocol::packets::configuration::ClientInformation::new(10),
                 brand: "fixture".into(),
-                sender: horizon_client::lan::PlayerSender::new(tx, std::sync::Arc::default()),
+                sender: horizon_client::lan::PlayerSender::new(tx, pending.clone()),
                 latency: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
                 address: ([127, 0, 0, 1], 0).into(),
                 expected: false,
@@ -316,6 +343,7 @@ impl Game<'_> {
             let mut phantom = Phantom {
                 conn,
                 rx,
+                pending,
                 random: 0x5EED_0000 ^ index as u64,
                 behaviour: match index % 5 {
                     0 | 2 | 4 => 0,
@@ -329,15 +357,43 @@ impl Game<'_> {
                 target: [0.0; 3],
                 cruise: 0.0,
                 heading: 0.0,
+                survivor: scene::Survivor::new(index),
             };
             phantom.heading = phantom.unit() * std::f64::consts::TAU;
             fixture.players.push(phantom);
         }
+        // The monsters' entity types, once, for the phantoms out of creative mode (`scene.rs`).
+        if fixture.hostile.is_empty() {
+            let sync = shared.sync();
+            fixture.hostile = scene::HOSTILE
+                .iter()
+                .filter_map(|kind| sync.id("minecraft:entity_type", kind))
+                .collect();
+        }
+        // What a phantom sends this tick, for the tick's `Hub::poll` to take.
+        let post = |conn: u32, packets: Vec<S>| {
+            for packet in packets {
+                let _ = shared.events.send(horizon_client::lan::NetEvent::Packet(
+                    conn,
+                    Box::new(packet),
+                    16,
+                ));
+            }
+        };
         for phantom in &mut fixture.players {
             let Some(guest) = host.hub.guests.iter().find(|g| g.conn == phantom.conn) else {
                 continue;
             };
-            while phantom.rx.try_recv().is_ok() {}
+            // Out of creative mode a phantom plays the survival scene, from what it reads of what
+            // it is sent (`Phantom::observe`); in creative mode it reads nothing.
+            phantom.survivor.watching = !guest.creative();
+            parts::receive(phantom);
+            if !guest.creative() {
+                let mut packets = Vec::new();
+                phantom.survivor.play(guest, &fixture.hostile, &mut packets);
+                post(phantom.conn, packets);
+                continue;
+            }
             let mut packets = Vec::new();
             if !phantom.loaded_sent {
                 packets.push(S::PlayerLoaded(Empty));
@@ -381,13 +437,7 @@ impl Game<'_> {
                 }));
                 packets.push(S::ClientTickEnd(Empty));
             }
-            for packet in packets {
-                let _ = shared.events.send(horizon_client::lan::NetEvent::Packet(
-                    phantom.conn,
-                    Box::new(packet),
-                    16,
-                ));
-            }
+            post(phantom.conn, packets);
         }
     }
 
@@ -438,6 +488,7 @@ impl Game<'_> {
             .detail
             .as_ref()
             .is_some_and(|(from, to, _)| (*from..=*to).contains(&tick));
+        let full = parts::full_tick(digest.full_every, tick);
         let mut rows: Vec<String> = Vec::new();
         let mut line = format!(
             "{tick} time={} dim={:?} random={:016x} rtv={}",
@@ -446,193 +497,12 @@ impl Game<'_> {
             self.world.random.state(),
             self.block_ticks.random_tick_value,
         );
-
-        let writes = self
-            .world
-            .digest_writes
-            .replace(Vec::new())
-            .unwrap_or_default();
-        let mut part = Part::new();
-        for (pos, state) in &writes {
-            part.add((pos, state));
-            if detailed {
-                rows.push(format!("w {} {} {} {state}", pos.0, pos.1, pos.2));
-            }
-        }
-        line += &format!(" writes={}", part.show());
-
-        let mut part = Part::new();
-        for (fluid, ticks) in [
-            (false, &self.block_ticks.blocks),
-            (true, &self.block_ticks.fluids),
-        ] {
-            for row in ticks.digest_rows() {
-                part.add((fluid, row));
-                if detailed {
-                    rows.push(format!("s {fluid} {row:?}"));
-                }
-            }
-        }
-        line += &format!(" scheduled={}", part.show());
-
-        let mut part = Part::new();
-        for_each_entity!(entity_lists_of!(self), entity => {
-            let (p, v, r) = (entity.position(), entity.velocity(), entity.rotation());
-            part.add((
-                entity.id(),
-                entity.native_type(),
-                [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()],
-                [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()],
-                [r[0].to_bits(), r[1].to_bits()],
-            ));
-            if detailed {
-                rows.push(format!(
-                    "e {} {} {:?} {:?} {:?}",
-                    entity.id(),
-                    entity.native_type(),
-                    [p.x, p.y, p.z],
-                    [v.x, v.y, v.z],
-                    r,
-                ));
-            }
-        });
-        line += &format!(" entities={}", part.show());
-
-        let mut part = Part::new();
-        if let Some(host) = &self.lan {
-            for guest in &host.hub.guests {
-                let p = guest.position;
-                part.add((
-                    guest.uuid,
-                    guest.entity_id,
-                    [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()],
-                ));
-                if detailed {
-                    rows.push(format!("p {} {:032x} {p:?}", guest.entity_id, guest.uuid));
-                }
-            }
-        }
-        line += &format!(" players={}", part.show());
-
-        // What the fixture's players were sent during the tick, as `PlayerSender` queued it: each
-        // player's bodies in its order of sending, the players in the order they joined. The other
-        // parts see no packet, neither its body nor its order. Drained here, so that the next tick's
-        // `fixture_players` only finds what came after this line.
-        if let Some(fixture) = fixture {
-            let skip = skipped_packets();
-            let mut part = Part::new();
-            for phantom in &mut fixture.players {
-                while let Ok(out) = phantom.rx.try_recv() {
-                    let bodies = match out {
-                        horizon_client::lan::Out::Packet(body) => vec![body],
-                        horizon_client::lan::Out::Packets(bodies) => bodies,
-                        horizon_client::lan::Out::Disconnect(_) => {
-                            part.add((phantom.conn, "disconnect"));
-                            continue;
-                        }
-                    };
-                    for body in &bodies {
-                        let Some(body) = canonical(body) else {
-                            continue;
-                        };
-                        let id = packet_id(&body);
-                        if skip.contains(&id) {
-                            continue;
-                        }
-                        part.add((phantom.conn, &*body));
-                        if detailed {
-                            let mut h = DefaultHasher::new();
-                            body.hash(&mut h);
-                            rows.push(format!(
-                                "k {} {id:#04x} {} {:016x}",
-                                phantom.conn,
-                                body.len(),
-                                h.finish()
-                            ));
-                        }
-                    }
-                }
-            }
-            line += &format!(" packets={}", part.show());
-        }
-
-        // The chunks that random tick (their count is the random tick draws of a tick) and the ones
-        // whose entities are not loaded yet (they don't block tick).
-        let mut ticking = Vec::new();
-        self.random_tick_chunks(&mut ticking);
-        let mut part = Part::new();
-        for key in &ticking {
-            part.add(key);
-            if detailed {
-                rows.push(format!("c {} {}", key.0, key.1));
-            }
-        }
-        line += &format!(" ticking={}", part.show());
-        let mut pending: Vec<(i32, i32)> = self.world.entities_pending.iter().copied().collect();
-        pending.sort_unstable();
-        let mut part = Part::new();
-        for key in &pending {
-            part.add(key);
-        }
-        line += &format!(" pending={}", part.show());
-
-        // The chunk results applied since the last line, in order (fixture mode).
-        let mut part = Part::new();
-        for row in horizon_client::streaming::take_applied() {
-            part.add(row);
-            if detailed {
-                rows.push(format!("a {row:?}"));
-            }
-        }
-        line += &format!(" applied={}", part.show());
-
-        // The order the chunk map walks its chunks in (passes such as postprocess_chunks walk it):
-        // it follows the history of the insertions, not only which chunks there are.
-        let mut part = Part::new();
-        for key in self.world.chunks.keys() {
-            part.add(key);
-            if detailed {
-                rows.push(format!("m {} {}", key.0, key.1));
-            }
-        }
-        line += &format!(" order={}", part.show());
-        let mut keys: Vec<(i32, i32)> = self.world.chunks.keys().copied().collect();
-        keys.sort_unstable();
-        let mut part = Part::new();
-        for key in &keys {
-            part.add(key);
-        }
-        line += &format!(" chunks={}", part.show());
-
-        if digest.full_every > 0 && tick % digest.full_every == 0 {
-            let mut part = Part::new();
-            let mut blocks = Box::new([0u32; 4096]);
-            let mut light = vec![0u8; 4096];
-            for key in &keys {
-                let chunk = &self.world.chunks[key];
-                for (s, section) in chunk.sections.iter().enumerate() {
-                    section.unpack(&mut blocks);
-                    for (i, l) in light.iter_mut().enumerate() {
-                        *l = section.light.get(i);
-                    }
-                    part.add((key, s, &blocks[..], &light[..]));
-                    if detailed {
-                        let (mut b, mut l) = (DefaultHasher::new(), DefaultHasher::new());
-                        blocks[..].hash(&mut b);
-                        light[..].hash(&mut l);
-                        rows.push(format!(
-                            "f {} {} {s} {:016x} {:016x}",
-                            key.0,
-                            key.1,
-                            b.finish(),
-                            l.finish()
-                        ));
-                    }
-                }
-                part.add(chunk.block_entities.len());
-            }
-            line += &format!(" full={}", part.show());
-        }
+        // The level in place (the Overworld while it ticks) under plain names, then the server's
+        // own parts (`tick_digest/parts.rs`).
+        line += &self.level_parts("", "", full, detailed, &mut rows);
+        line += &self.server_parts(fixture, detailed, &mut rows);
+        // Then each other level that ticked, under its name (`tick_digest_level`).
+        line += &parts::other_levels(tick, &mut rows);
 
         writeln!(digest.out, "{line}")?;
         digest.out.flush()?;
