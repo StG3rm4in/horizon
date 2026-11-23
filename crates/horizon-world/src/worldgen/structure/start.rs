@@ -295,6 +295,23 @@ impl AvoidBiomes {
     }
 }
 
+/// OceanMonumentStructure's surroundings: the quarts of BiomeSource.getBiomesWithin(x, sea
+/// level, z, 29) around the chunk's (9, 9) block, in the order the check always asked them (z,
+/// then x, then y): 15 x 15 x 16 at sea level 63.
+pub(crate) fn monument_box(chunk: ChunkPos, sea_level: i32) -> Vec<[i32; 3]> {
+    let (x, z) = (chunk.x * 16 + 9, chunk.z * 16 + 9);
+    let (y, r) = (sea_level, 29);
+    let mut quarts = Vec::new();
+    for qz in (z - r) >> 2..=(z + r) >> 2 {
+        for qx in (x - r) >> 2..=(x + r) >> 2 {
+            for qy in (y - r) >> 2..=(y + r) >> 2 {
+                quarts.push([qx, qy, qz]);
+            }
+        }
+    }
+    quarts
+}
+
 fn heightmap(name: &str) -> Option<HeightmapType> {
     HeightmapType::ALL.into_iter().find(|k| k.name() == name)
 }
@@ -1006,6 +1023,13 @@ pub trait StartContext: JigsawContext {
     fn generation(&self) -> WorldGenerationContext;
     /// Noise biome at a quart position (caching resolver, no zoom).
     fn noise_biome(&mut self, quart: [i32; 3]) -> BiomeId;
+    /// Whether `allowed` accepts `noise_biome` at every one of `quarts`, asked in order up to
+    /// the first it refuses (BiomeSource.getBiomesWithin, then a test of each biome: an ocean
+    /// monument's surroundings). A context may answer by other means when the answer is the
+    /// same: the generator's GPU batches (HORIZON_GPU_LOCATE).
+    fn all_noise_biomes(&mut self, quarts: &[[i32; 3]], allowed: &dyn Fn(BiomeId) -> bool) -> bool {
+        quarts.iter().all(|&quart| allowed(self.noise_biome(quart)))
+    }
     /// Noise biomes of `quarts` in order through one resolver, as
     /// BiomeSource.findBiomeHorizontal samples: each climate lookup starts
     /// from the previous result, which a tie keeps.
@@ -1326,16 +1350,9 @@ fn generate(
             (stub, vec![Piece::Legacy(piece)])
         }
         StructureKind::Monument(surrounding) => {
-            let (x, z) = (chunk.x * 16 + 9, chunk.z * 16 + 9);
-            let (y, r) = (context.sea_level(), 29);
-            for qz in (z - r) >> 2..=(z + r) >> 2 {
-                for qx in (x - r) >> 2..=(x + r) >> 2 {
-                    for qy in (y - r) >> 2..=(y + r) >> 2 {
-                        if !surrounding.contains(&context.noise_biome([qx, qy, qz])) {
-                            return None;
-                        }
-                    }
-                }
+            let quarts = monument_box(chunk, context.sea_level());
+            if !context.all_noise_biomes(&quarts, &|biome| surrounding.contains(&biome)) {
+                return None;
             }
             let stub = top_of_chunk_center(context, chunk, HeightmapType::OceanFloorWg)?;
             let direction = super::legacy::random_horizontal(&mut random);
