@@ -654,7 +654,8 @@ where
             default("minecraft:air")?,
         );
         let mut surface_gpu = None;
-        let surface_test = std::env::var_os("HORIZON_GPU_SURFACE_TEST").is_some();
+        // `1`, as the other stages' switches: `=0` used to turn the test on.
+        let surface_test = std::env::var("HORIZON_GPU_SURFACE_TEST").is_ok_and(|v| v == "1");
         let surface_inline =
             !surface_test && std::env::var("HORIZON_GPU_SURFACE").is_ok_and(|v| v == "1");
         if (surface_test || surface_inline) && gpu.is_some() {

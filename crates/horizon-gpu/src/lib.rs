@@ -129,7 +129,15 @@ fn context() -> Result<Arc<CudaContext>, String> {
             _ => Some(CU_CTX_SCHED_BLOCKING_SYNC),
         };
         if let Some(f) = wait {
-            ctx.set_flags(f).ctx("wait mode")?;
+            // cuCtxSetFlags came with the CUDA 12.1 driver: an older driver keeps CUDA's own wait.
+            if driver_at_least(12010) {
+                ctx.set_flags(f).ctx("wait mode")?;
+            } else {
+                log::warn!(
+                    "GPU: the driver is older than CUDA 12.1, CUDA's own wait mode (HORIZON_GPU_SYNC \
+                     is not applied)"
+                );
+            }
         }
         // Synchronization handled here: each computation and each copy waits for the end of its
         // stream.
@@ -486,10 +494,40 @@ struct Cache {
     last_shrink: Option<Instant>,
 }
 
-/// GPU memory promised to the region caches started so far (one per dimension), which the next one
-/// leaves aside: a cache fills its budget only as it computes regions, so the memory free at a start
-/// does not show yet what the caches started before it will take.
+/// GPU memory promised to the region caches alive (one per dimension), which the next one leaves
+/// aside: a cache fills its budget only as it computes regions, so the memory free at a start does
+/// not show yet what the caches started before it will take. Each cache gives its share back as it
+/// goes ([`Promise`]): a client that opens world after world keeps its budget.
 static PROMISED: AtomicUsize = AtomicUsize::new(0);
+
+/// A region cache's share of [`PROMISED`], for as long as the cache lives; also given back by a start
+/// that fails after taking it.
+struct Promise(usize);
+impl Promise {
+    fn new(bytes: usize) -> Self {
+        PROMISED.fetch_add(bytes, Relaxed);
+        Self(bytes)
+    }
+}
+impl Drop for Promise {
+    fn drop(&mut self) {
+        PROMISED.fetch_sub(self.0, Relaxed);
+    }
+}
+
+/// Whether the CUDA driver is at least `version` (12010 for CUDA 12.1). cudarc loads the driver's
+/// functions as they are first called and panics on one the driver lacks, rather than failing.
+#[cfg(feature = "cuda")]
+fn driver_at_least(version: i32) -> bool {
+    let mut v = 0;
+    // SAFETY: cuDriverGetVersion writes one int, and every driver has it.
+    let r = unsafe { cuda::driver::sys::cuDriverGetVersion(&mut v) };
+    r == cuda::driver::sys::CUresult::CUDA_SUCCESS && v >= version
+}
+#[cfg(not(feature = "cuda"))]
+fn driver_at_least(_version: i32) -> bool {
+    false
+}
 
 /// Stream and buffers of a worker for copying a chunk, returned to the pool after use.
 struct Resources {
@@ -559,6 +597,8 @@ struct Engine {
     pool: Mutex<Vec<Resources>>,
     stats: Stats,
     broken: AtomicBool,
+    /// Its share of `PROMISED`, given back with it.
+    _promise: Promise,
 }
 
 fn config(n: usize) -> LaunchConfig {
@@ -697,7 +737,7 @@ impl Engine {
             }),
         };
         let capacity = capacity.min((budget / region_bytes.max(1)).max(1));
-        PROMISED.fetch_add(capacity.saturating_mul(region_bytes), Relaxed);
+        let promise = Promise::new(capacity.saturating_mul(region_bytes));
         log::info!(
             "GPU final_density: up to {capacity} regions of {:.0} MB in GPU memory (budget {} MB)",
             region_bytes as f64 / 1e6,
@@ -768,6 +808,7 @@ impl Engine {
             pool: Mutex::new(Vec::new()),
             stats: Stats::default(),
             broken: AtomicBool::new(false),
+            _promise: promise,
         })
     }
 
@@ -889,6 +930,9 @@ impl Engine {
         }
         if !self.broken.swap(true, Relaxed) {
             log::error!("GPU final_density disabled, back to the CPU: {e}");
+            // Its regions go back to the GPU's memory, for the stages still on it; a worker that
+            // still reads one keeps it until it is done.
+            self.cache.lock().unwrap().lookup.clear();
         }
     }
 
@@ -2919,5 +2963,119 @@ mod nvrtc_tests {
             super::codegen::generate(&DensityCompiler::new(graph), root, 0, [16, 384, 16])
                 .expect("codegen writes the graph's CUDA");
         compile("final_density", &program.src);
+    }
+
+    /// What codegen writes for the other stages compiles too, for the same small graph: the
+    /// aquifers (with roots, and the stub without), the biomes, the point roots, the surface's S2
+    /// milestone and a surface of one rule (its kernel, vein volumes and preliminary level). So
+    /// aquifer.cu, biomes.cu, random.cu and surface.cu go through NVRTC.
+    #[test]
+    fn the_generated_stages_compile_with_nvrtc() {
+        use horizon_core::noise::{NoiseStack, PerlinNoise, SimplexNoise};
+        use horizon_core::random::LegacyRandom;
+        use std::sync::Arc;
+        if super::nvrtc_version().is_none() {
+            assert!(
+                std::env::var_os("HORIZON_REQUIRE_NVRTC").is_none(),
+                "HORIZON_REQUIRE_NVRTC is set, but no NVRTC library was found"
+            );
+            eprintln!("no NVRTC library: the generated stages' compilation is not checked");
+            return;
+        }
+        let mut graph = DensityGraph::default();
+        let gradient = graph
+            .insert(GraphNode::Gradient {
+                axis: Axis::Y,
+                tiling: TilingMode::ClampToEdge,
+                from: -64,
+                to: 320,
+                low: 1.0,
+                high: -1.0,
+            })
+            .unwrap();
+        let factor = graph.insert(GraphNode::Constant(0.25)).unwrap();
+        let root = graph
+            .insert(GraphNode::Binary {
+                kind: GraphBinary::Multiply,
+                left: gradient,
+                right: factor,
+            })
+            .unwrap();
+        let compiler = DensityCompiler::new(graph);
+        fn codegen<E: std::fmt::Display>(what: &str, src: Result<String, E>) {
+            match src {
+                Ok(src) => compile(what, &src),
+                Err(e) => panic!("codegen does not write {what}: {e}"),
+            }
+        }
+        codegen(
+            "the aquifers",
+            super::codegen::generate_aquifer(&compiler, Some([root; 6]), 0),
+        );
+        codegen(
+            "the aquifers' stub",
+            super::codegen::generate_aquifer(&compiler, None, 0),
+        );
+        codegen(
+            "the biomes",
+            super::codegen::generate_biomes(&compiler, [root; 6], 0),
+        );
+        codegen(
+            "the point roots",
+            super::codegen::generate_points(&compiler, &[root], 0),
+        );
+        // The temperature noises as vanilla seeds them (Biome's TEMPERATURE_NOISE, the three
+        // octaves of FROZEN_TEMPERATURE_NOISE, BIOME_INFO_NOISE), simplex noises alike.
+        let height = SimplexNoise::new(&mut LegacyRandom::new(1234));
+        let info = SimplexNoise::new(&mut LegacyRandom::new(2345));
+        let mut freeze = NoiseStack::builder();
+        for k in 0..3 {
+            let layer = SimplexNoise::new(&mut LegacyRandom::new(3234 + k));
+            freeze.add(Arc::new(layer), 0.5 * f64::from(1 << k), 1.0);
+        }
+        let freeze = freeze.build().expect("the freeze noise's layers");
+        codegen(
+            "the surface's S2 milestone",
+            super::codegen::generate_surface_s2(&compiler, &height, &freeze, &info),
+        );
+        // The surface's noises in point mode: Perlin noises and stacks of them, as the game's.
+        let mut surface_noise = NoiseStack::builder();
+        surface_noise.add(
+            Arc::new(PerlinNoise::new(&mut LegacyRandom::new(7))),
+            1.0,
+            1.0,
+        );
+        let surface_noise = surface_noise.build().expect("the surface noise");
+        let setup = super::SurfaceSetup {
+            rules: vec![super::SurfaceRule::Block(1)],
+            conditions: Vec::new(),
+            root: 0,
+            noises: Vec::new(),
+            surface_noise: &surface_noise,
+            secondary_noise: &surface_noise,
+            clay_noise: &surface_noise,
+            bands: [0; 192],
+            root_positional: super::Positional::Xoroshiro(1, 2),
+            ore_positional: (3, 4),
+            surface_level: root,
+            temperatures: vec![(0.5, false)],
+            temperature_noises: (&height, &freeze, &info),
+            zoom_seed: 0,
+            sea_level: 63,
+            min_y: -64,
+            height: 384,
+            biome_min_y: -64,
+            biome_height: 384,
+            extensions: None,
+            fill_states: [1, 0, 2, 3],
+            fluid_states: Vec::new(),
+        };
+        let surface = super::codegen::generate_surface(&compiler, &setup, 0)
+            .unwrap_or_else(|e| panic!("codegen does not write the surface: {e}"));
+        compile("the surface", &surface.src);
+        compile("the surface's level", &surface.level.src);
+        for (k, volume) in surface.volumes.iter().enumerate() {
+            compile(&format!("the surface's vein volume {k}"), &volume.src);
+        }
     }
 }
