@@ -41,6 +41,18 @@ pub trait BlockCollisionWorld {
         position: BlockPos,
         context: &CollisionContext<'_>,
     ) -> Result<VoxelShape, Self::Error>;
+    /// [`Self::context_shape`], lent where the world holds the shape itself (a block's fixed
+    /// shape): the scan only reads it, and a clone it drops a few lines later counts four
+    /// references up and down. The default owns the shape `context_shape` gives.
+    fn context_shape_ref(
+        &mut self,
+        block: CollisionBlock,
+        position: BlockPos,
+        context: &CollisionContext<'_>,
+    ) -> Result<std::borrow::Cow<'_, VoxelShape>, Self::Error> {
+        self.context_shape(block, position, context)
+            .map(std::borrow::Cow::Owned)
+    }
     /// Whether a block of the chunk's section `section_y` (block y >> 4) may
     /// have a large collision shape or be a moving piston: the only blocks
     /// the scan keeps outside the box's own cells. False lets the scan pass
@@ -548,9 +560,10 @@ impl<'w, 'c, W: BlockCollisionWorld> BlockCollisionScan<'w, 'c, W> {
             if block.empty_shape {
                 continue;
             }
+            // Lent when the world holds it: below, the shape is only read.
             let shape = self
                 .world
-                .context_shape(block, p, &self.context)
+                .context_shape_ref(block, p, &self.context)
                 .map_err(CollisionScanError::World)?;
             let offset = Vec3::new(f64::from(p.x), f64::from(p.y), f64::from(p.z));
             let moved = if shape.is_block() {

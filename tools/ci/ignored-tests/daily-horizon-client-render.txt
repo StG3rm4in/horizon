@@ -5,6 +5,7 @@ horizon-client-render block_edit::tests::tracked_states_are_reported lib daily s
 horizon-client-render chunk::tests::cloning_during_a_height_refresh_keeps_the_new_height lib daily slow
 horizon-client-render chunk::tests::motion_blocking_follows_writes lib daily slow
 horizon-client-render chunk::tests::world_surface_follows_writes lib daily slow
+horizon-client-render collisions::lent_shape_tests::lent_shapes_are_the_shapes_the_scene_gives lib daily resources
 horizon-client-render core_shader::glsl_fixups::tests::thousands_of_calls_are_left_as_they_were lib daily slow
 horizon-client-render gfx::inter_stage_tests::no_pipeline_exceeds_the_weakest_gpus_inter_stage_limit lib daily slow
 horizon-client-render gfx::occlusion::tests::same_sections_as_vanilla lib daily slow

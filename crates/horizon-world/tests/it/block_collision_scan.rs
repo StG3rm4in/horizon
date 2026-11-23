@@ -522,6 +522,156 @@ fn boolean_collision_scan_matches_first_hit_and_queries() {
     }
 }
 
+/// Blocks by `(x + 2y + 3z) mod 5`: air, a full block, a bottom slab, a post reaching into the
+/// cell above (a fence's) and a thin plate. Their shapes are cloned from a table
+/// (`context_shape`), and with `lend` lent from it (`context_shape_ref`).
+struct Table {
+    shapes: Vec<VoxelShape>,
+    lend: bool,
+}
+impl Table {
+    fn new(lend: bool) -> Self {
+        let part = |lo: [f64; 3], hi: [f64; 3]| {
+            VoxelShape::from_box(Aabb::new(
+                Vec3::new(lo[0], lo[1], lo[2]),
+                Vec3::new(hi[0], hi[1], hi[2]),
+            ))
+            .unwrap()
+        };
+        Self {
+            shapes: vec![
+                VoxelShape::empty(),
+                VoxelShape::block(),
+                part([0.0; 3], [1.0, 0.5, 1.0]),
+                part([0.375, 0.0, 0.375], [0.625, 1.5, 0.625]),
+                part([0.0; 3], [1.0, 0.0625, 1.0]),
+            ],
+            lend,
+        }
+    }
+}
+impl BlockCollisionWorld for Table {
+    type Error = io::Error;
+    type Chunk = ();
+    fn collision_chunk(&mut self, _: ChunkPos) -> io::Result<Option<()>> {
+        Ok(Some(()))
+    }
+    fn collision_block(&mut self, _: (), p: BlockPos) -> io::Result<CollisionBlock> {
+        let kind = (p.x + 2 * p.y + 3 * p.z).rem_euclid(5) as u32;
+        Ok(CollisionBlock {
+            state: BlockStateId(kind),
+            large_collision_shape: kind == 3,
+            moving_piston: false,
+            empty_shape: kind == 0,
+        })
+    }
+    fn is_suffocating(&mut self, _: (), block: CollisionBlock, _: BlockPos) -> io::Result<bool> {
+        Ok(block.state.0 == 1)
+    }
+    fn context_shape(
+        &mut self,
+        block: CollisionBlock,
+        _: BlockPos,
+        _: &CollisionContext<'_>,
+    ) -> io::Result<VoxelShape> {
+        Ok(self.shapes[block.state.0 as usize].clone())
+    }
+    fn context_shape_ref(
+        &mut self,
+        block: CollisionBlock,
+        p: BlockPos,
+        context: &CollisionContext<'_>,
+    ) -> io::Result<std::borrow::Cow<'_, VoxelShape>> {
+        if !self.lend {
+            return self
+                .context_shape(block, p, context)
+                .map(std::borrow::Cow::Owned);
+        }
+        Ok(std::borrow::Cow::Borrowed(
+            &self.shapes[block.state.0 as usize],
+        ))
+    }
+}
+
+/// A hit as [`table_scan`] compares it: its position, whether its shape is the unit cube, and
+/// the bits of its boxes' corners.
+type TableHit = (BlockPos, bool, Vec<[u64; 6]>);
+
+/// What a scan of `bounds` over a [`Table`] gives: each hit, then the error that ended it, if any.
+fn table_scan(
+    lend: bool,
+    bounds: Aabb,
+    suffocating: bool,
+    budget: usize,
+) -> Vec<Result<TableHit, String>> {
+    let mut world = Table::new(lend);
+    BlockCollisionScan::new(
+        &mut world,
+        CollisionContext::empty(false),
+        bounds,
+        suffocating,
+        budget,
+    )
+    .unwrap()
+    .map(|hit| {
+        hit.map(|h| {
+            let boxes = h
+                .shape
+                .boxes()
+                .iter()
+                .map(|b| {
+                    let (lo, hi) = (b.min_position(), b.max_position());
+                    [lo.x, lo.y, lo.z, hi.x, hi.y, hi.z].map(f64::to_bits)
+                })
+                .collect();
+            (h.position, h.shape.is_block(), boxes)
+        })
+        .map_err(|e| e.to_string())
+    })
+    .collect()
+}
+
+/// Shapes the world lends the scan give the hits, shapes and errors the shapes it clones give, and
+/// the boolean scan the same answer: boxes standing on faces, across slabs, posts reaching up and
+/// plates, a long sweep, a box with no width, and budgets that end the scan partway.
+#[test]
+fn lent_shapes_give_the_scan_what_cloned_shapes_give() {
+    let boxes = [
+        Aabb::new(Vec3::new(0.3, 0.0, 0.3), Vec3::new(0.9, 1.8, 0.9)),
+        Aabb::new(Vec3::new(-2.4, 3.1, 1.2), Vec3::new(4.7, 6.9, 5.5)),
+        Aabb::new(Vec3::new(10.0, -1.0, -3.0), Vec3::new(11.0, 0.0, -2.0)),
+        Aabb::new(Vec3::new(-20.3, 1.2, -0.4), Vec3::new(20.6, 2.9, 0.8)),
+        Aabb::new(Vec3::new(0.5, 0.5, 0.5), Vec3::new(0.5, 2.5, 0.5)),
+        Aabb::new(Vec3::new(3.25, 7.5, -6.0), Vec3::new(3.75, 9.0, -5.5)),
+    ];
+    let mut hits = 0;
+    for bounds in boxes {
+        for suffocating in [false, true] {
+            for budget in [7, 64, 1_000_000] {
+                let lent = table_scan(true, bounds, suffocating, budget);
+                assert_eq!(
+                    lent,
+                    table_scan(false, bounds, suffocating, budget),
+                    "{bounds:?}, suffocating={suffocating}, budget={budget}"
+                );
+                hits += lent.iter().filter(|hit| hit.is_ok()).count();
+                let any = |lend| {
+                    BlockCollisionScan::any_collision(
+                        &mut Table::new(lend),
+                        CollisionContext::empty(false),
+                        bounds,
+                        suffocating,
+                        budget,
+                    )
+                    .map_err(|e| e.to_string())
+                };
+                assert_eq!(any(true), any(false), "{bounds:?}, budget={budget}");
+            }
+        }
+    }
+    assert!(hits > 100, "{hits} hits");
+}
+
 /// The sweep of a far move is mostly sky and chunks that are not loaded: the scan asks about a
 /// row segment of them once, not about each cell.
 #[test]
