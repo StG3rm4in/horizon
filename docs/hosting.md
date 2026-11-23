@@ -923,10 +923,15 @@ and caps but not the random draws of one vanilla level, so a world does not spaw
 It stays on one thread while a native mod listens to spawns, with fewer than 512 chunks to try (about two players' worth) and
 on a machine with one core ([how it works](parallel-natural-spawning.md)).
 
-One thing differs from the serial tick while it is on: the rolls a mob makes on the level's random (a fish
-leaving its school, a parrot imitating, a brain's durations) come from a random of the mob's own, so that mobs
-on different threads do not wait for each other. The odds are vanilla's; the values are not the ones the level's
-random would have given ([mob-islands.md](mob-islands.md#every-turn-draws-its-own-random)).
+On `parallel-mobs`, helper threads prepare random-tick section masks when there is enough
+work. The server thread checks the live chunks in order and refreshes masks when blocks change.
+Precipitation chances and random-tick positions use the level's streams in every mode.
+With `upstream-parallel-mob-islands` and an active parallel tick outside `exact`, mobs can draw
+their level-random rolls from per-mob streams, including on the serial mob loop. Those rolls
+have vanilla's odds and can give different values. `HORIZON_PARALLEL_TICK=exact` also keeps
+mob turns and natural spawning on the level's streams.
+
+See [how mobs draw their own random values](mob-islands.md#every-turn-draws-its-own-random).
 
 ### Mob AI far from players: `[entities] dab`
 

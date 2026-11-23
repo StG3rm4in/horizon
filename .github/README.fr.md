@@ -40,8 +40,14 @@ Ce qui limite maintenant, ce sont les 6 cœurs du CPU : le GPU travaille environ
 | Mode exact, build natif, 22/11/2026 | 55,0 |
 | **Mode exact, build PGO** | **44,2** |
 | **Mode exact, PGO, thread du tick épinglé sur un cœur** | **42,1** |
-| Îlots de mobs (option, non exact), PGO | 34,7 |
-| Îlots de mobs, PGO, épinglé | 33,5 |
+| `parallel-mobs`, tick parallèle hors mode `exact`, PGO | 34,7 |
+| `parallel-mobs`, mêmes réglages, PGO, épinglé | 33,5 |
+
+Ces mesures ont été faites avec une version antérieure de `parallel-mobs`, avec l'apparition
+naturelle sur des threads d'aide et les îlots de mobs. Sur une scène à `7ff2d15b`, avec deux
+passages par build, déplacer uniquement l'apparition naturelle sur les threads d'aide a
+économisé 10,8 ms par tick par rapport aux passages en série de 68,5 et 69,2 ms. Le regroupement
+des tours de mobs lui-même a économisé environ 3 ms par tick.
 
 Le banc, ce sont 100 bots qui volent dans un même monde, chacun chargeant sa propre zone ; chaque chiffre est la
 moyenne de passages faits dans l'ordre A B B A. La première ligne inclut aussi les progrès de l'amont depuis,
@@ -82,8 +88,14 @@ que le fork intègre régulièrement.
   partagés entre les tours, moins de recherches et d'allocations dans les chemins chauds.
 - Le build : l'optimisation guidée par un profil (PGO, environ −20 % en mode exact) et l'épinglage optionnel du
   thread du tick sur un CPU (`HORIZON_TICK_CPU`).
-- Les îlots de mobs (branche `parallel-mobs`) : les mobs qui ne peuvent pas s'influencer sont tickés en groupes
-  sur des threads d'aide, et le résultat est vérifié égal à celui de la boucle en série.
+- Sur `parallel-mobs`, les threads d'aide préparent les masques de section pour les ticks
+  aléatoires s'il y a assez de travail. Le thread du serveur traite les chunks dans l'ordre,
+  en lisant les blocs dans leur état courant et en utilisant les flux aléatoires et de
+  positions du niveau. Avec `upstream-parallel-mob-islands`, les groupes indépendants peuvent
+  tourner sur des threads d'aide. Quand le tick parallèle est actif hors mode `exact`, les
+  mobs et l'apparition naturelle peuvent utiliser leurs propres flux. Le tick parallèle
+  s'active avec `parallel_tick = true` dans `server.toml`, `HORIZON_PARALLEL_TICK=1` ou le
+  réglage Parallel Tick sur On ou Auto quand Auto l'active en solo.
 
 ## Branches
 

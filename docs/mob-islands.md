@@ -250,7 +250,15 @@ cargo test -p horizon-client --lib game::creatures::mob_islands:: -- --include-i
 ```
 
 Set `HORIZON_TEST_RESOURCES` to prepared resources and isolate game homes as `CLAUDE.md`
-requires. Do not set `HORIZON_TEST_SEEDS` when proving grouped execution: it forces fallback.
+requires. Leave `HORIZON_TEST_SEEDS` unset when checking grouped execution.
+
+Use `tools/tick_digest.py check --parallel on` to compare builds with the non-exact tick enabled.
+Two runs of the same build and fixture should produce identical digest lines. Random ticks
+use the level streams in every mode. In ordinary non-exact play, mob turns and natural
+spawning can use their own streams. The digest sets `HORIZON_TEST_SEEDS=1`, which routes mob
+islands (`RepeatingSeeds`) and natural spawning through their serial loops. Mob turns can
+still use separate streams there. Check grouped turns with `HORIZON_PARALLEL_TICK=verify`
+in a scene that forms multiple groups, and with the ignored tests that call `grouped_as_serial`.
 
 ## Other ways a turn moves a mob
 

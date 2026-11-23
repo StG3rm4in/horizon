@@ -1,0 +1,51 @@
+name: parallel-mobs
+
+# These checks run on the fork's GitHub runners without prepared game files or a GPU.
+on:
+  push:
+    branches: [parallel-mobs]
+  pull_request:
+    branches: [parallel-mobs]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parallel-mobs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    if: github.repository != 'horizon-rust/horizon'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Room for the build
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy, client library and tests with mob islands
+        run: >-
+          cargo clippy --locked -p horizon-client --lib --tests
+          --features upstream-parallel-mob-islands -- -D warnings
+      - name: random-tick sections and parallel tick helpers
+        # These module filters leave out the unrelated menu and GPU tests.
+        run: |
+          cargo test --locked -p horizon-client-lib --lib random_tick_sections::
+          cargo test --locked -p horizon-client-lib --lib parallel::tests::
+      - name: mob island planning
+        # The ignored tests use prepared game resources.
+        run: >-
+          cargo test --locked -p horizon-client --lib
+          --features upstream-parallel-mob-islands mob_islands::tests::
+      - name: horizon-world tests with sendable attributes
+        # Tests that need the game's files skip when those files are absent.
+        run: cargo test --locked -p horizon-world --features send-attributes

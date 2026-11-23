@@ -39,8 +39,13 @@ What limits it now is the 6 CPU cores: the GPU is busy about two thirds of the t
 | Exact mode, native build, 22/11/2026 | 55.0 |
 | **Exact mode, PGO build** | **44.2** |
 | **Exact mode, PGO, tick thread pinned to one core** | **42.1** |
-| Mob islands (opt-in, not exact), PGO | 34.7 |
-| Mob islands, PGO, pinned | 33.5 |
+| `parallel-mobs`, parallel tick outside `exact`, PGO | 34.7 |
+| `parallel-mobs`, same settings, PGO, pinned | 33.5 |
+
+These historical measurements used an earlier `parallel-mobs` build with natural spawning on
+helper threads and mob islands. In one scene at `7ff2d15b` with two runs per build, moving
+natural spawning alone to helper threads saved 10.8 ms per tick against serial runs of 68.5
+and 69.2 ms. Grouping the mob turns itself saved about 3 ms per tick.
 
 The bench is 100 bots flying around one world, each loading its own area; every figure is the mean of runs
 taken in A B B A order. The first row includes upstream's own progress since, which the fork merges regularly.
@@ -76,8 +81,13 @@ taken in A B B A order. The first row includes upstream's own progress since, wh
   and per-pass work, players' bodies shared between turns, fewer lookups and allocations in hot paths.
 - The build: profile-guided optimization (PGO, about −20 % in exact mode) and an optional pinning of the tick
   thread to one CPU (`HORIZON_TICK_CPU`).
-- Mob islands (branch `parallel-mobs`): mobs that cannot affect each other are ticked in groups on helper
-  threads, and the result is checked to equal the serial loop's.
+- On `parallel-mobs`, helper threads prepare random-tick section masks when there is enough
+  work. The server thread ticks live chunks in order using the level's random and position
+  streams. With `upstream-parallel-mob-islands`, independent groups can tick on helper threads.
+  In active parallel mode outside `exact`, mob turns can use per-mob streams and natural
+  spawning can use per-chunk streams. Enable the parallel tick with `parallel_tick = true`
+  in `server.toml`, `HORIZON_PARALLEL_TICK=1`, or Parallel Tick On or active Auto in single
+  player.
 
 ## Branches
 

@@ -376,8 +376,11 @@ def main():
     sub.choices["run"].add_argument("--out", required=True)
     for name in ("check", "run"):
         sub.choices[name].add_argument(
-            "--parallel", choices=("serial", "exact", "inherit"), default="inherit",
-            help="HORIZON_PARALLEL_TICK for the game: 0, exact, or the caller's (the default)")
+            "--parallel", choices=("serial", "exact", "on", "inherit"), default="inherit",
+            help=("HORIZON_PARALLEL_TICK for the game: 0, exact, 1, or the caller's value "
+                  "(default). All modes use the level streams for random ticks. The harness "
+                  "sets HORIZON_TEST_SEEDS=1, so mob islands and natural spawning use their "
+                  "serial loops. On can still exercise separate mob streams."))
     p = sub.add_parser("compare")
     p.add_argument("a")
     p.add_argument("b")
@@ -389,7 +392,9 @@ def main():
         sys.exit(diff is not None)
 
     if args.parallel != "inherit":
-        os.environ["HORIZON_PARALLEL_TICK"] = {"serial": "0", "exact": "exact"}[args.parallel]
+        os.environ["HORIZON_PARALLEL_TICK"] = {"serial": "0", "exact": "exact", "on": "1"}[
+            args.parallel
+        ]
 
     if args.scene == "survival":
         SCENE_PROPERTIES.update(SURVIVAL_PROPERTIES)
