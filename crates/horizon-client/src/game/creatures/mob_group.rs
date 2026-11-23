@@ -464,6 +464,8 @@ impl Group {
                 Some(own) => level.reborrow_with_random(own),
                 None => level.reborrow(),
             };
+            use horizon_client::mobs::ai::TickProgress;
+
             match horizon_client::mobs::riders::tick_until_consumption(
                 &mut self.mobs,
                 i,
@@ -471,12 +473,18 @@ impl Group {
                 &mut level,
                 &mut self.events,
             ) {
-                horizon_client::mobs::ai::TickProgress::Complete(kept) => kept,
-                // A meal pauses the turn for the game to serve it, which a group can't call, so a
-                // tick with a fox about to eat stays serial (`fox::may_eat_next_tick`). One that
-                // came to it all the same (an earlier turn woke it, or its target went) goes on
-                // without the meal, and eats next tick.
-                horizon_client::mobs::ai::TickProgress::Consumption { was_on_fire, .. } => {
+                TickProgress::Complete(kept) => kept,
+                progress @ TickProgress::Consumption { was_on_fire, .. } => {
+                    // The game serves meals in the borrowed loop. Finish this turn with the
+                    // meal deferred if the scheduling check missed it.
+                    static LOG_MISSED_MEAL: std::sync::Once = std::sync::Once::new();
+                    LOG_MISSED_MEAL.call_once(|| {
+                        log::error!("Fox {id} reached consumption in a grouped turn");
+                    });
+                    debug_assert!(
+                        !matches!(progress, TickProgress::Consumption { .. }),
+                        "fox {id} reached consumption after passing the island meal check"
+                    );
                     horizon_client::mobs::riders::resume_after_consumption(
                         &mut self.mobs,
                         i,

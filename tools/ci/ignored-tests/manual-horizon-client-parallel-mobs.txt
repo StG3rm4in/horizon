@@ -1,6 +1,7 @@
 # Tests compiled only with horizon-client's `upstream-parallel-mobs` feature, which no daily shard builds.
 # Run them by hand: cargo test -p horizon-client --lib --features upstream-parallel-mobs -- --ignored creatures::
 horizon-client game::creatures::mob_islands::tests::a_fast_mob_joins_only_the_herds_its_bound_reaches by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
+horizon-client game::creatures::mob_islands::tests::a_fox_about_to_eat_keeps_the_tick_serial by-hand manual # upstream-parallel-mob-islands + prepared resources
 horizon-client game::creatures::mob_islands::tests::a_fox_eating_chorus_fruit_joins_the_herd_below by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
 horizon-client game::creatures::mob_islands::tests::a_pet_teleports_to_its_owner_while_a_far_herd_ticks_apart by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
 horizon-client game::creatures::mob_islands::tests::a_raid_shares_one_group_beside_a_herd by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources

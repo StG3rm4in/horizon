@@ -52,7 +52,7 @@ impl Game<'_> {
                 meal: state
                     .mobs
                     .iter()
-                    .any(|m| horizon_client::mobs::fox::may_eat_next_tick(m, &base)),
+                    .any(|m| horizon_client::mobs::fox::may_reach_meal(m, &base)),
             };
             let islands = Islands {
                 uuid: self

@@ -215,7 +215,7 @@ pub(super) struct HostSerial {
     pub off_level: bool,
     /// Pushes kept from an aborted pass, which its mobs take at their turns.
     pub pending_pushes: bool,
-    /// A fox may stop for a meal (`fox::may_eat_next_tick`): its turn pauses for the game to serve
+    /// A fox may stop for a meal (`fox::may_reach_meal`): its turn pauses for the game to serve
     /// it (`TickProgress::Consumption`).
     pub meal: bool,
 }
@@ -3156,8 +3156,36 @@ mod tests {
             hungry,
             "the fox holds what it eats and has not eaten for 600 ticks"
         );
+        // A creative player target can drop in the fox's turn before the meal check.
+        assert!(game.run_command("gamemode creative @s"));
+        let hungry_fox = game.mobs[0].clone();
+        game.mobs[0].ai.target = Some(Who::Player);
+        assert!(!horizon_client::mobs::fox::may_eat_next_tick(
+            &game.mobs[0],
+            &game.mob_world_base(&[]),
+        ));
+        let groups = grouped_as_serial(&mut game, 1, "fox with a target", |_| {});
+        assert_eq!(groups, 0, "a fox that may reach its meal keeps the tick serial");
+
+        game.mobs[0] = hungry_fox.clone();
         let groups = grouped_as_serial(&mut game, 1, "hungry fox", |_| {});
         assert_eq!(groups, 0, "a fox that may eat keeps the tick serial");
+
+        game.mobs[0] = hungry_fox.clone();
+        game.mobs[0].extra.ints[0] |= horizon_client::mobs::fox::SLEEPING;
+        let groups = grouped_as_serial(&mut game, 1, "sleeping fox holding food", |_| {});
+        assert_eq!(groups > 0, lanes_here(3) > 1);
+
+        for (item, label) in [
+            (None, "hungry fox with an empty mouth"),
+            (Some("minecraft:feather".into()), "hungry fox holding a feather"),
+        ] {
+            game.mobs[0] = hungry_fox.clone();
+            game.mobs[0].extra.set_main_hand(item);
+            let groups = grouped_as_serial(&mut game, 1, label, |_| {});
+            assert_eq!(groups > 0, lanes_here(3) > 1, "{label}: use available helpers");
+        }
+        game.mobs[0] = hungry_fox;
         // Fed, the same fox ticks in the island of the herd its fruit could take it to.
         game.mobs[0].extra.ints[1] = 0;
         let groups = grouped_as_serial(&mut game, 1, "fed fox", |_| {});
