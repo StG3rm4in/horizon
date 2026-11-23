@@ -1119,7 +1119,16 @@ mod tick_parity {
         speed: i32,
         /// Counts the block changes, as `World::revision` does (for `ChunkTicking`).
         revision: u64,
+        activation: Option<Activation>,
     }
+
+    #[derive(Clone)]
+    struct Activation {
+        first: BlockPos,
+        targets: [BlockPos; 2],
+        seen: Vec<BlockPos>,
+    }
+
     impl horizon_world::level::BlockEntityNeighbors for Level {}
     impl LevelAccess for Level {
         fn block_state(&self, pos: BlockPos) -> BlockStateId {
@@ -1151,8 +1160,105 @@ mod tick_parity {
                 ..Default::default()
             }
         }
+        fn before_random_tick(
+            &mut self,
+            _: &mut Ticks,
+            pos: BlockPos,
+            state: &mut BlockStateId,
+            handled: &mut bool,
+        ) {
+            if let Some(activation) = &mut self.activation {
+                activation.seen.push(pos);
+                if pos == activation.first {
+                    for target in activation.targets {
+                        let _ = self.set_raw(target, *state);
+                    }
+                }
+                *handled = true;
+            }
+        }
         fn emit(&mut self, event: LevelEvent) {
             self.events.push(event);
+        }
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn live_masks_see_newly_activated_blocks_and_sections() {
+        let root = std::env::var_os("HORIZON_RESOURCES")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client")
+                    .join(horizon_core::VANILLA_VERSION)
+            });
+        let registry = data::load_registry(&root).unwrap();
+        let (facts, behaviours) = BlockFacts::load_pair(&root, &registry).unwrap();
+        let grass = registry.default_state("minecraft:grass_block").unwrap();
+        let candidate = |id| behaviours.random_tick_candidate(BlockStateId(id));
+
+        for (x, z) in [(-2, 3), (4, -1)] {
+            let (min_x, min_z) = (x * 16, z * 16);
+            let key = (x, z);
+            let mut random = LegacyRandom::new(0);
+            let mut positions = Ticks::new(17);
+            // Two precipitation rolls consume one position before the section draws.
+            assert_eq!(random.next_int_bound(48), Ok(0));
+            assert_eq!(random.next_int_bound(48), Ok(28));
+            positions.block_random_pos(min_x, 0, min_z, 15);
+            let first = positions.block_random_pos(min_x, MIN_Y, min_z, 15);
+            let next = positions.block_random_pos(min_x, MIN_Y, min_z, 15);
+            let upper = positions.block_random_pos(min_x, MIN_Y + 16, min_z, 15);
+            positions.block_random_pos(min_x, MIN_Y + 16, min_z, 15);
+            assert_ne!(first, next);
+
+            let mut chunk = Chunk::empty(x, z);
+            chunk.lit = true;
+            chunk.set(first.x, first.y, first.z, grass.0);
+            let original = Level {
+                chunks: [(key, Arc::new(chunk))].into_iter().collect(),
+                random: LegacyRandom::new(0),
+                reads: RefCell::default(),
+                events: Vec::new(),
+                time: 0,
+                speed: 2,
+                revision: 0,
+                activation: Some(Activation {
+                    first,
+                    targets: [next, upper],
+                    seen: Vec::new(),
+                }),
+            };
+            let expected_random = random.next_long();
+            for prepare in [false, true] {
+                let mut level = original.clone();
+                let mut ticks = Ticks::new(17);
+                let mut cache = RandomTickSections::default();
+                if prepare {
+                    cache.prepare_masks(&[key], |key| level.chunks.get(&key), &facts, &candidate);
+                }
+                let mut sections = ChunkTicking::default();
+                sections.start(key);
+                behaviours.tick_chunk_random_masked(
+                    &mut level,
+                    &mut ticks,
+                    ChunkPos::new(x, z),
+                    |level, from| {
+                        sections.next(
+                            &mut cache,
+                            || level.chunks.get(&key),
+                            &facts,
+                            candidate,
+                            from,
+                            (level.revision, 0),
+                        )
+                    },
+                );
+                assert_eq!(level.activation.unwrap().seen, [first, next, upper]);
+                assert_eq!(level.revision, 2);
+                assert_eq!(level.random.next_long(), expected_random);
+                assert_eq!(ticks.random_tick_value, positions.random_tick_value);
+            }
         }
     }
 
@@ -1209,6 +1315,7 @@ mod tick_parity {
             time: 0,
             speed: 3,
             revision: 0,
+            activation: None,
         };
         // More than 128 ticking sections: prepare_masks must exercise its
         // helper path when HORIZON_PARALLEL_TICK is enabled, not just defer work.

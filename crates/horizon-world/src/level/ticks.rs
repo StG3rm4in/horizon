@@ -303,6 +303,33 @@ impl Ticks {
 }
 
 #[cfg(test)]
+mod random_position_tests {
+    use super::*;
+
+    #[test]
+    fn the_level_position_stream_wraps_and_uses_the_coordinate_bits() {
+        for (x, z, seed) in [(-32, 48, i32::MAX), (64, -16, i32::MIN)] {
+            let mut ticks = Ticks::new(seed);
+            let mut value = seed;
+            for (y, mask) in [(-64, 15), (0, 0), (16, 7), (304, 15)] {
+                for _ in 0..128 {
+                    value = value.wrapping_mul(3).wrapping_add(1_013_904_223);
+                    assert_eq!(
+                        ticks.block_random_pos(x, y, z, mask),
+                        BlockPos::new(
+                            x + ((value >> 2) & 15),
+                            y + ((value >> 18) & mask),
+                            z + ((value >> 10) & 15),
+                        ),
+                    );
+                }
+            }
+            assert_eq!(ticks.random_tick_value, value);
+        }
+    }
+}
+
+#[cfg(test)]
 mod block_event_queue_tests {
     use super::Ticks;
     use crate::level::{pistons::BlockEventData, states::BlockId};

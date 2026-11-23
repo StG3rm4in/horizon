@@ -450,6 +450,7 @@ horizon-client-lib net::tests::a_server_that_stops_answering_times_out lib daily
 horizon-client-lib net::tests::direct_login_preserves_hostname_and_negotiates_brand lib daily network
 horizon-client-lib net::tests::lan_login_continues_after_authentication_failure lib daily slow
 horizon-client-lib pregen::tests::sweeps_every_chunk_of_the_area_once lib daily slow
+horizon-client-lib random_tick_sections::tick_parity::live_masks_see_newly_activated_blocks_and_sections lib daily resources
 horizon-client-lib realms::client::tests::a_configuration_update_posts_the_vanilla_dto lib daily network
 horizon-client-lib realms::client::tests::a_distance_update_puts_its_value_into_the_path lib daily network
 horizon-client-lib realms::client::tests::a_minigame_switch_puts_the_template_in_the_path lib daily network
