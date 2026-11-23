@@ -33,6 +33,10 @@
 //! server build with `--no-default-features`, unless it adds `--features cuda`), `cuda_off.rs`
 //! stands in for cudarc and every stage reports CUDA as absent.
 //!
+//! `exposure` traces the exposure rays of explosions (`HORIZON_GPU_TNT`) for the tick
+//! thread, outside chunk generation: the game sends a blast's cells and rays (`explosion_gpu.rs`
+//! in horizon-client).
+//!
 //! Checking and measuring: `tools/gpu_worldgen.py` (probe, verify, pregen, compare-worlds), see
 //! BENCHMARKS.md in this crate.
 //!
@@ -47,6 +51,7 @@
 mod biomes;
 mod caves;
 mod codegen;
+mod exposure;
 mod light;
 mod locate;
 
@@ -59,6 +64,7 @@ mod cuda_off;
 use cuda_off as cuda;
 
 pub use biomes::{BiomeGpu, BiomeTree};
+pub use exposure::{ExposureGpu, RAY_HIT, RAY_MISS, RAY_OUTSIDE, RayCube, RayShapes};
 pub use light::{LightGpu, LightInput, LightJob, LightSection};
 pub use locate::{LOCATE_BATCH, LocateGpu, LocateSamples};
 

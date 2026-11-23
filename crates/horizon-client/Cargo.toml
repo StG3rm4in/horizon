@@ -39,6 +39,9 @@ horizon-optifine = { path = "../horizon-optifine" }
 horizon-threads = { path = "../horizon-threads" }
 horizon-perf-format = { path = "../horizon-perf-format" }
 horizon-world = { path = "../horizon-world", default-features = false }
+# The explosion exposure rays on the GPU (HORIZON_GPU_TNT); CUDA comes with the `cuda` feature,
+# through horizon-world's.
+horizon-gpu = { path = "../horizon-gpu" }
 horizon-protocol = { path = "../horizon-protocol" }
 # server.properties, eula.txt and the user lists, shared with horizon-server.
 horizon-server-files = { path = "../horizon-server-files" }

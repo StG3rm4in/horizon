@@ -1241,6 +1241,8 @@ impl Game<'_> {
         let lists = Arc::new(Mutex::new(lists));
         self.server_lists = Some(lists.clone());
         log("INFO", &format!("Preparing level \"{level_name}\""));
+        // HORIZON_GPU_TNT: the exposure rays' kernel and buffers readied on their own thread.
+        crate::game::explosion_gpu::start();
         let folder = world_dir.to_string_lossy().into_owned();
         // The mods' common and server configs, read before the server starts.
         self.native_configs_server_start(&world_dir, true);

@@ -313,6 +313,49 @@ thread_local! {
     /// Client-side randomness (explosion sound pitch), separate from the level random.
     static CLIENT_RANDOM: std::cell::RefCell<LegacyRandom> = std::cell::RefCell::new(LegacyRandom::new(0x5eed));
 }
+/// The sample points of `ServerExplosion.getSeenPercent` on an entity box, in its order, each
+/// given to `visit`; false, and no point, when the box has a negative extent, which the blast
+/// then does not see (0). The CPU's rays and the GPU's (`explosion_gpu.rs`) start here.
+pub(super) fn exposure_starts(min: [f64; 3], max: [f64; 3], mut visit: impl FnMut(Vec3)) -> bool {
+    let xs = 1.0 / ((max[0] - min[0]) * 2.0 + 1.0);
+    let ys = 1.0 / ((max[1] - min[1]) * 2.0 + 1.0);
+    let zs = 1.0 / ((max[2] - min[2]) * 2.0 + 1.0);
+    let x_offset = (1.0 - (1.0 / xs).floor() * xs) / 2.0;
+    let z_offset = (1.0 - (1.0 / zs).floor() * zs) / 2.0;
+    if xs < 0.0 || ys < 0.0 || zs < 0.0 {
+        return false;
+    }
+    let mut xx = 0.0;
+    while xx <= 1.0 {
+        let mut yy = 0.0;
+        while yy <= 1.0 {
+            let mut zz = 0.0;
+            while zz <= 1.0 {
+                let x = min[0] + (max[0] - min[0]) * xx;
+                let y = min[1] + (max[1] - min[1]) * yy;
+                let z = min[2] + (max[2] - min[2]) * zz;
+                visit(Vec3::new(x + x_offset, y, z + z_offset));
+                zz += zs;
+            }
+            yy += ys;
+        }
+        xx += xs;
+    }
+    true
+}
+/// `ClipContext(..., entity)` of `getSeenPercent`: the entity standing at the box's bottom `y`.
+pub(super) fn exposure_context(y: f64) -> CollisionContext<'static> {
+    CollisionContext::for_entity(
+        CollisionEntity {
+            identity: EntityIdentity(0),
+            kind: horizon_world::collision_context::EntityContextKind::None,
+            y,
+            descending: false,
+            main_hand: Some(CollisionItem::EMPTY),
+        },
+        false,
+    )
+}
 pub(super) fn client_float() -> f32 {
     CLIENT_RANDOM.with(|r| r.borrow_mut().next_float())
 }
@@ -535,15 +578,14 @@ impl Game<'_> {
         min: [f64; 3],
         max: [f64; 3],
     ) -> f32 {
-        let xs = 1.0 / ((max[0] - min[0]) * 2.0 + 1.0);
-        let ys = 1.0 / ((max[1] - min[1]) * 2.0 + 1.0);
-        let zs = 1.0 / ((max[2] - min[2]) * 2.0 + 1.0);
-        let x_offset = (1.0 - (1.0 / xs).floor() * xs) / 2.0;
-        let z_offset = (1.0 - (1.0 / zs).floor() * zs) / 2.0;
-        if xs < 0.0 || ys < 0.0 || zs < 0.0 {
-            return 0.0;
+        // HORIZON_GPU_TNT: the blast's boxes traced on the GPU at once, while what they read holds.
+        if let Some(seen) = super::explosion_gpu::gpu_seen_percent(self, center, min, max) {
+            return seen;
         }
-        // ClipContext(..., entity): the entity standing at the box's bottom.
+        self.seen_percent_cpu(center, min, max)
+    }
+    /// `seen_percent` on the CPU: a ray from each sample point of the box to the centre.
+    pub(super) fn seen_percent_cpu(&self, center: [f64; 3], min: [f64; 3], max: [f64; 3]) -> f32 {
         let mut rays = ColliderRays {
             clip_data: None,
             scene: SceneCollisions {
@@ -551,47 +593,27 @@ impl Game<'_> {
                 binding: self.collision,
                 subject: None,
             },
-            context: CollisionContext::for_entity(
-                CollisionEntity {
-                    identity: EntityIdentity(0),
-                    kind: horizon_world::collision_context::EntityContextKind::None,
-                    y: min[1],
-                    descending: false,
-                    main_hand: Some(CollisionItem::EMPTY),
-                },
-                false,
-            ),
+            context: exposure_context(min[1]),
         };
+        let to = Vec3::new(center[0], center[1], center[2]);
         let (mut hits, mut count) = (0, 0);
-        let mut xx = 0.0;
-        while xx <= 1.0 {
-            let mut yy = 0.0;
-            while yy <= 1.0 {
-                let mut zz = 0.0;
-                while zz <= 1.0 {
-                    let x = min[0] + (max[0] - min[0]) * xx;
-                    let y = min[1] + (max[1] - min[1]) * yy;
-                    let z = min[2] + (max[2] - min[2]) * zz;
-                    let from = Vec3::new(x + x_offset, y, z + z_offset);
-                    let to = Vec3::new(center[0], center[1], center[2]);
-                    let missed = clip_world(
-                        &mut rays,
-                        from,
-                        to,
-                        RayBlockMode::Collider,
-                        RayFluidMode::None,
-                        4096,
-                    )
-                    .is_ok_and(|r| r.miss);
-                    if missed {
-                        hits += 1;
-                    }
-                    count += 1;
-                    zz += zs;
-                }
-                yy += ys;
+        let sampled = exposure_starts(min, max, |from| {
+            let missed = clip_world(
+                &mut rays,
+                from,
+                to,
+                RayBlockMode::Collider,
+                RayFluidMode::None,
+                4096,
+            )
+            .is_ok_and(|r| r.miss);
+            if missed {
+                hits += 1;
             }
-            xx += xs;
+            count += 1;
+        });
+        if !sampled {
+            return 0.0;
         }
         hits as f32 / count as f32
     }
@@ -1009,6 +1031,10 @@ impl Game<'_> {
             self.explosion_hits_special(center, radius, blocks, damage_type);
         }
         let diameter = f64::from(radius * 2.0);
+        // HORIZON_GPU_TNT: every box in reach traced at once, before the player's turn.
+        let _gpu_exposures = (hurts || knockback != 0.0 || flying_knockback != 0.0)
+            .then(|| self.gpu_exposures(center, diameter))
+            .flatten();
         let damage = |dist: f64, exposure: f32| {
             let pow = (1.0 - dist) * f64::from(exposure);
             ((pow * pow + pow) / 2.0 * 7.0 * diameter + 1.0) as f32
@@ -2280,6 +2306,28 @@ fn blast_resistance(base: f32, cap: Option<f32>, kept: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sample points of `getSeenPercent`: 27 on a primed TNT's box, 45 on a player's, 8 on
+    /// an item's, none on a box of negative extent.
+    #[test]
+    fn exposure_starts_count_as_get_seen_percent() {
+        let count = |min: [f64; 3], max: [f64; 3]| {
+            let mut n = 0;
+            let sampled = exposure_starts(min, max, |_| n += 1);
+            (sampled, n)
+        };
+        assert_eq!(count([0.0, 64.0, 0.0], [0.98, 64.98, 0.98]), (true, 27));
+        assert_eq!(count([-0.3, 64.0, -0.3], [0.3, 65.8, 0.3]), (true, 45));
+        assert_eq!(count([0.0; 3], [0.25; 3]), (true, 8));
+        assert_eq!(count([1.0, 0.0, 0.0], [0.0, 1.0, 1.0]), (false, 0));
+        let mut first = None;
+        exposure_starts([2.0, 3.0, 4.0], [2.98, 3.98, 4.98], |p| {
+            first.get_or_insert([p.x, p.y, p.z]);
+        });
+        let xs = 1.0 / ((2.98 - 2.0) * 2.0 + 1.0);
+        let offset = (1.0 - (1.0f64 / xs).floor() * xs) / 2.0;
+        assert_eq!(first, Some([2.0 + offset, 3.0, 4.0 + offset]));
+    }
 
     /// The exposure memo answers what the rays answer: for a box again, for other boxes, at
     /// another centre, after a block between the box and the centre was written, and without a
