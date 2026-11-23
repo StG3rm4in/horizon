@@ -317,6 +317,78 @@ pub(super) fn client_float() -> f32 {
     CLIENT_RANDOM.with(|r| r.borrow_mut().next_float())
 }
 
+/// The exposures (`seen_percent`) the entity walk of the blast going off now has measured, by
+/// box: the TNT of a stack share one box, so a cannon's blast traces it once instead of once per
+/// TNT. Each answer is kept with the `RegionStamp` of the blocks its rays may cross (the write
+/// counts of their sections and the columns missing) and taken again only while that stamp is
+/// the same; it holds for this blast's centre only, and for as long as its walk.
+struct ExposureMemo {
+    center: [u64; 3],
+    seen: std::collections::HashMap<[u64; 6], (horizon_client::world::RegionStamp, f32)>,
+}
+thread_local! {
+    static EXPOSURE_MEMO: std::cell::RefCell<Option<ExposureMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// Keeps a blast's exposure memo for as long as it lives, then puts back the memo of the blast
+/// around it, if any (a hook may set off a blast inside a walk).
+pub(super) struct ExposureMemoScope(Option<ExposureMemo>);
+impl ExposureMemoScope {
+    /// No memo where a collision shape can change between two asks without a block write: a
+    /// level with moving pistons or shulker boxes (as `stand_rest_key` refuses them).
+    pub(super) fn enter(game: &Game<'_>, center: [f64; 3]) -> Self {
+        let memo = (game.world.moving_pistons.is_empty() && game.world.shulkers.is_empty())
+            .then(|| ExposureMemo {
+                center: center.map(f64::to_bits),
+                seen: Default::default(),
+            });
+        Self(EXPOSURE_MEMO.with(|m| m.replace(memo)))
+    }
+}
+impl Drop for ExposureMemoScope {
+    fn drop(&mut self) {
+        let outer = self.0.take();
+        EXPOSURE_MEMO.with(|m| *m.borrow_mut() = outer);
+    }
+}
+
+impl Game<'_> {
+    /// `seen_percent`, from the memo of the blast going off at `center` when it has this box
+    /// measured and none of the blocks the rays may cross was written since; the answer of the
+    /// rays otherwise, which the memo then keeps.
+    pub(super) fn seen_percent_memo(&self, center: [f64; 3], min: [f64; 3], max: [f64; 3]) -> f32 {
+        let at = center.map(f64::to_bits);
+        let active = EXPOSURE_MEMO.with(|m| m.borrow().as_ref().is_some_and(|m| m.center == at));
+        if !active {
+            return self.seen_percent(center, min, max);
+        }
+        // Every cell a ray from the box (its sample points lie up to half a step past its
+        // corner) to the centre visits, with a block to spare for the traversal's ends.
+        let lo = std::array::from_fn(|i| (min[i].min(center[i]).floor() as i32).saturating_sub(1));
+        let hi = std::array::from_fn(|i| (max[i].max(center[i]).floor() as i32).saturating_add(1));
+        let Some(stamp) = self.world.region_stamp(lo, hi) else {
+            return self.seen_percent(center, min, max);
+        };
+        let key: [u64; 6] =
+            std::array::from_fn(|i| (if i < 3 { min[i] } else { max[i - 3] }).to_bits());
+        let known = EXPOSURE_MEMO.with(|m| {
+            let m = m.borrow();
+            let (seen_at, seen) = *m.as_ref()?.seen.get(&key)?;
+            (seen_at == stamp).then_some(seen)
+        });
+        if let Some(seen) = known {
+            return seen;
+        }
+        let seen = self.seen_percent(center, min, max);
+        EXPOSURE_MEMO.with(|m| {
+            if let Some(memo) = m.borrow_mut().as_mut().filter(|m| m.center == at) {
+                memo.seen.insert(key, (stamp, seen));
+            }
+        });
+        seen
+    }
+}
+
 impl Game<'_> {
     pub(super) fn explosion_entity_name(&self, id: u32, kind: &str) -> Text {
         self.persist_raw(id)
@@ -898,7 +970,7 @@ impl Game<'_> {
         let b = entity.explosion_box();
         let (lo, hi) = (b.min_position(), b.max_position());
         let exposure = if seen {
-            self.seen_percent(center, [lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z])
+            self.seen_percent_memo(center, [lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z])
         } else {
             0.0
         };
@@ -1083,6 +1155,8 @@ impl Game<'_> {
         // outside the storages (players, frames, paintings, cushions,
         // crystals, the dragon, hooks) answer no handle here: the player walk
         // and their own passes read the list for them.
+        // The walk's exposures, by box: a TNT stack's boxes are traced once.
+        let _exposures = ExposureMemoScope::enter(self, center);
         let mut cursor = self.entity_id_cursor();
         let mut listed_at = 0;
         loop {
@@ -2206,6 +2280,64 @@ fn blast_resistance(base: f32, cap: Option<f32>, kept: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exposure memo answers what the rays answer: for a box again, for other boxes, at
+    /// another centre, after a block between the box and the centre was written, and without a
+    /// memo.
+    #[test]
+    #[ignore = "daily"]
+    fn exposure_memo_answers_as_the_rays_do() {
+        use crate::game::native_entity_refs::tests::with_game;
+        use std::sync::Arc;
+        with_game(|game| {
+            game.world
+                .chunks
+                .insert((0, 0), Arc::new(horizon_client::chunk::Chunk::empty(0, 0)));
+            let registry = game.pack.assets.registry;
+            let stone = registry.default_state("minecraft:stone").unwrap();
+            let slab = registry.default_state("minecraft:smooth_stone_slab").unwrap();
+            let glass = registry.default_state("minecraft:glass_pane").unwrap();
+            for (i, [x, y, z]) in [[3, 64, 3], [4, 65, 3], [6, 64, 7], [7, 64, 5], [5, 65, 6]]
+                .into_iter()
+                .enumerate()
+            {
+                let state = [stone, slab, glass][i % 3];
+                game.world.set(x, y, z, state).unwrap();
+            }
+            // Primed TNT boxes (0.98 a side), the same one more than once as in a stack.
+            let tnt = |x: f64, y: f64, z: f64| {
+                ([x - 0.49, y, z - 0.49], [x + 0.49, y + 0.98, z + 0.49])
+            };
+            let boxes = [
+                tnt(2.5, 64.0, 2.5),
+                tnt(8.5, 64.0, 8.5),
+                tnt(2.5, 64.0, 2.5),
+                tnt(5.5, 66.0, 9.2),
+                tnt(2.5, 64.0, 2.5),
+                tnt(8.5, 64.0, 8.5),
+                tnt(5.5, 66.0, 9.2),
+            ];
+            for center in [[5.5, 64.0625, 5.5], [5.5, 64.5625, 4.5], [5.5, 64.0625, 5.5]] {
+                let _memo = ExposureMemoScope::enter(game, center);
+                for (step, &(min, max)) in boxes.iter().enumerate() {
+                    if step == 4 {
+                        let now = game.world.block(4, 64, 4);
+                        let next = if now == stone { glass } else { stone };
+                        game.world.set(4, 64, 4, next).unwrap();
+                    }
+                    let memo = game.seen_percent_memo(center, min, max);
+                    let rays = game.seen_percent(center, min, max);
+                    assert_eq!(memo.to_bits(), rays.to_bits(), "{center:?} {min:?}, step {step}");
+                }
+            }
+            let (min, max) = boxes[0];
+            let center = [5.5, 64.0625, 5.5];
+            assert_eq!(
+                game.seen_percent_memo(center, min, max).to_bits(),
+                game.seen_percent(center, min, max).to_bits()
+            );
+        });
+    }
 
     struct DropProbe {
         edit: bool,
