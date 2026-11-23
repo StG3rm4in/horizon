@@ -1190,5 +1190,37 @@
     "path": "crates/horizon-world/tests/it/world_io.rs",
     "reason": "microbenchmark; run with --ignored --nocapture",
     "rationale": "Existing explicit manual runner by-hand in tools/ci/ignored-tests/manual-horizon-world.txt: microbenchmark; run with --ignored --nocapture. Not selected by daily shards."
+  },
+  {
+    "package": "horizon-client",
+    "target": "lib",
+    "test": "game::creatures::mob_group::tests::a_group_prepared_on_its_lane_is_the_group_made_whole",
+    "path": "crates/horizon-client/src/game/creatures/mob_group.rs",
+    "reason": "needs the upstream-parallel-mobs feature and prepared resources",
+    "rationale": "Compiled only with the `upstream-parallel-mob-islands` feature, which the daily shards never build, and needs HORIZON_TEST_RESOURCES. Run by hand: cargo test -p horizon-client --lib --features upstream-parallel-mob-islands -- --ignored --exact game::creatures::mob_group::tests::a_group_prepared_on_its_lane_is_the_group_made_whole (parallel-mobs' checks run it with the islands' tests). Not selected by daily shards."
+  },
+  {
+    "package": "horizon-client",
+    "target": "lib",
+    "test": "game::creatures::mob_islands::tests::zombies_read_the_villages_by_night_only",
+    "path": "crates/horizon-client/src/game/creatures/mob_islands.rs",
+    "reason": "needs the upstream-parallel-mobs feature and prepared resources",
+    "rationale": "Compiled only with the `upstream-parallel-mob-islands` feature, which the daily shards never build, and needs HORIZON_TEST_RESOURCES. Run by hand: cargo test -p horizon-client --lib --features upstream-parallel-mob-islands -- --ignored --exact game::creatures::mob_islands::tests::zombies_read_the_villages_by_night_only (parallel-mobs' checks run it with the islands' tests). Not selected by daily shards."
+  },
+  {
+    "package": "horizon-client",
+    "target": "lib",
+    "test": "game::creatures::mob_islands::tests::a_fox_about_to_eat_keeps_the_tick_serial",
+    "path": "crates/horizon-client/src/game/creatures/mob_islands.rs",
+    "reason": "needs the upstream-parallel-mobs feature and prepared resources",
+    "rationale": "Compiled only with the `upstream-parallel-mob-islands` feature, which the daily shards never build, and needs HORIZON_TEST_RESOURCES. Run by hand: cargo test -p horizon-client --lib --features upstream-parallel-mob-islands -- --ignored --exact game::creatures::mob_islands::tests::a_fox_about_to_eat_keeps_the_tick_serial (parallel-mobs' checks run it with the islands' tests). Not selected by daily shards."
+  },
+  {
+    "package": "horizon-client",
+    "target": "lib",
+    "test": "game::creatures::prep::tests::the_nearest_player_is_asked_again_after_a_move",
+    "path": "crates/horizon-client/src/game/creatures/prep.rs",
+    "reason": "needs the upstream-parallel-mobs feature and prepared resources",
+    "rationale": "Compiled only with the `upstream-parallel-mobs` feature, which the daily shards never build, and needs HORIZON_TEST_RESOURCES. Run by hand: cargo test -p horizon-client --lib --features upstream-parallel-mob-islands -- --ignored --exact game::creatures::prep::tests::the_nearest_player_is_asked_again_after_a_move (parallel-mobs' checks run it with the islands' tests). Not selected by daily shards."
   }
 ]
