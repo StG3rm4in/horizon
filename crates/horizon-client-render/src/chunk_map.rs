@@ -563,6 +563,23 @@ impl ChunkMap {
                 .collect()
         }
     }
+    /// [`Self::fresh_keys_ordered`] with only the keys whose chunk `keep` accepts, the
+    /// columns walked for their order only when two or more are kept: one key needs none.
+    /// Spawning asks at every update for the fresh chunks lit since, and finds none or one of
+    /// those waiting for their light far more often than two.
+    pub fn fresh_keys_ordered_where(&self, mut keep: impl FnMut(&Chunk) -> bool) -> Vec<Key> {
+        let mut kept: Vec<Key> = self
+            .fresh
+            .iter()
+            .copied()
+            .filter(|key| self.get_chunk(key.0, key.1).is_some_and(&mut keep))
+            .collect();
+        if kept.len() > 1 {
+            let wanted: FxHashSet<Key> = kept.drain(..).collect();
+            kept.extend(self.columns.keys().filter(|k| wanted.contains(k)).copied());
+        }
+        kept
+    }
     pub fn remove_fresh(&mut self, key: &Key) {
         self.fresh.remove(key);
     }
@@ -1033,6 +1050,50 @@ mod tests {
             .collect();
         assert_eq!(ordered, expected);
         assert_eq!(ordered.len(), 3);
+    }
+
+    /// The fresh keys kept are those `fresh_keys_ordered` gives that pass, in its order, with
+    /// none, one or many kept, as chunks come, go, turn lit and stop being fresh.
+    #[test]
+    fn fresh_keys_kept_are_the_ordered_ones_that_pass() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let keep = |c: &Chunk| c.fresh && c.lit;
+        let mut map = ChunkMap::default();
+        let mut seen = [0; 3];
+        for step in 0..6000 {
+            // Spread out, so that the grid does not hold them all.
+            let key = (
+                (next() % 8) as i32 * 37 - 100,
+                (next() % 8) as i32 * 29 - 50,
+            );
+            // Phases where few, some or many of the chunks are lit.
+            let lit_one_in = [100, 20, 3][step / 400 % 3];
+            match next() % 5 {
+                0 => drop(map.remove(&key)),
+                1 => map.remove_fresh(&key),
+                _ => {
+                    let mut chunk = Chunk::empty(key.0, key.1);
+                    chunk.fresh = next() % 3 != 0;
+                    chunk.lit = next() % lit_one_in == 0;
+                    map.insert(key, Arc::new(chunk));
+                }
+            }
+            let expected: Vec<Key> = map
+                .fresh_keys_ordered()
+                .into_iter()
+                .filter(|k| map.get_chunk(k.0, k.1).is_some_and(keep))
+                .collect();
+            let kept = map.fresh_keys_ordered_where(keep);
+            assert_eq!(kept, expected, "step {step}");
+            seen[kept.len().min(2)] += 1;
+        }
+        assert!(seen.iter().all(|&n| n > 300), "{seen:?}");
     }
 
     #[test]

@@ -1195,13 +1195,12 @@ impl Game<'_> {
         if !self.world.chunks.has_fresh() {
             return;
         }
+        // The fresh chunks lit, in the chunk map's order, which their packs' draws follow: the
+        // map is walked for it only when two or more are lit.
         let fresh: Vec<(i32, i32)> = self
             .world
             .chunks
-            .fresh_keys_ordered()
-            .into_iter()
-            .filter(|k| self.world.chunks.get(k).is_some_and(|c| c.fresh && c.lit))
-            .collect();
+            .fresh_keys_ordered_where(|c| c.fresh && c.lit);
         for key in fresh {
             if let Some(c) = self.world.chunks.get_mut(&key) {
                 Arc::make_mut(c).fresh = false;
