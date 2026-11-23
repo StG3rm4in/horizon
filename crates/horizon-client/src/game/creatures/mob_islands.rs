@@ -16,9 +16,10 @@
 //! id of a mob in another group (a remembered mob far away) reads it as the serial loop would show
 //! it: as it was before the tick when it comes later in the list, else once its turn is over.
 //!
-//! `HORIZON_PARALLEL_TICK=1` turns it on (off by default), `verify` also runs the serial loop on
-//! copies and logs a tick whose result differs. The loop stays serial under `HORIZON_TEST_SEEDS`,
-//! with few ticking mobs, when one island holds most of them, and while a native mod may hook a
+//! `HORIZON_PARALLEL_TICK=1` turns it on (off by default). In `verify`, one group runs on copies
+//! as the reference for partitioning and merging.
+//! The loop stays serial under `HORIZON_TEST_SEEDS`, with few ticking mobs,
+//! when one island holds most of them, and while a native mod may hook a
 //! mob's turn, as the build finds it (`horizon_mod_api_gen::mob_turn`), whenever a turn would
 //! call back into the game ([`HostSerial`]), and while a fox may stop for a meal, which the game
 //! serves between two turns.
@@ -80,6 +81,47 @@ thread_local! {
 }
 
 #[cfg(test)]
+pub(super) type PassCapture = [(&'static str, String); 6];
+
+#[cfg(test)]
+thread_local! {
+    static PASS_CAPTURES: std::cell::RefCell<Option<Vec<PassCapture>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn capture_pass(output: impl FnOnce() -> PassCapture) {
+    PASS_CAPTURES.with(|captures| {
+        if let Some(passes) = captures.borrow_mut().as_mut() {
+            passes.push(output());
+        }
+    });
+}
+
+#[cfg(test)]
+struct CapturePasses;
+
+#[cfg(test)]
+impl CapturePasses {
+    fn begin() -> Self {
+        PASS_CAPTURES.with(|captures| *captures.borrow_mut() = Some(Vec::new()));
+        Self
+    }
+
+    fn finish(self) -> Vec<PassCapture> {
+        PASS_CAPTURES.with(|captures| captures.borrow_mut().take().unwrap())
+    }
+}
+
+#[cfg(test)]
+impl Drop for CapturePasses {
+    fn drop(&mut self) {
+        PASS_CAPTURES.with(|captures| *captures.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FailAt {
     Spawn,
@@ -115,9 +157,8 @@ fn capped_lanes(requested: usize, hardware: Option<usize>) -> usize {
     requested.clamp(1, 8).min(hardware.unwrap_or(1).max(1))
 }
 
-/// Whether the loop may run in groups at all: more than one lane (the parallel tick is on, not
-/// under `HORIZON_PARALLEL_TICK=exact`: `verify` checks the groups against the serial loop with
-/// the mobs' own streams only).
+/// Whether more than one lane is available to the grouped loop. `verify` uses one group as its
+/// runtime reference. The `grouped_as_serial` tests exercise the game's borrowed loop.
 pub(super) fn may_group() -> bool {
     lanes() > 1
 }
@@ -1563,7 +1604,7 @@ impl WhoLookup for LoopLookup {
 /// both take from: only their order among the mobs that compare them counts, and those share a
 /// group (`section_seq`: the mobs of one section, `aquatic.rs`; a raider's `hurt_seq`: its raid,
 /// `raids.rs`).
-fn without_counters(m: &Mob) -> Mob {
+pub(super) fn without_counters(m: &Mob) -> Mob {
     let mut m = m.clone();
     m.extra.section_seq = 0;
     if let Some(r) = m.extra.raider.as_deref_mut() {
@@ -1662,8 +1703,7 @@ fn difference(serial: &Group, grouped: &Group, grouped_mobs: &[Mob]) -> Option<S
     .map(|d| format!("{} differ", d.1))
 }
 
-/// `HORIZON_PARALLEL_TICK=verify`: log a grouped loop that differs from the serial one, and how
-/// many were checked, every 100.
+/// `HORIZON_PARALLEL_TICK=verify`: log differences from a single group and report the count.
 fn report_check(difference: Option<String>, groups: usize) {
     #[cfg(test)]
     CHECK.with(|c| {
@@ -2854,12 +2894,10 @@ mod tests {
         if lanes > 1 { islands.min(lanes) } else { 0 }
     }
 
-    /// Ticks `game`'s mobs `ticks` times serially and then on three lanes from the same start,
-    /// once plain and once under verify. Each grouped run leaves the mobs, the level random and
-    /// the death marks as its serial run does and creates the same RNGs, and verify finds no
-    /// difference. Each grouped run replays its own serial run's seeds: the process-wide counter
-    /// moves on between runs. `each` runs before every tick, as a goal would. Returns the groups
-    /// the first grouped tick ran in; `game` is left as the last run left it.
+    /// Ticks `game`'s mobs through the borrowed loop and on three lanes from the same start.
+    /// Compare the output of each pass before callbacks consume it, once plain and once under
+    /// verify. Replay the borrowed loop's RNG seeds in the grouped run. `each` runs before
+    /// every tick, as a goal would. Return the first grouped tick's lane count.
     fn grouped_as_serial(
         game: &mut Game<'static>,
         ticks: usize,
@@ -2879,6 +2917,7 @@ mod tests {
             game.world.random.clone(),
             game.died.clone(),
         );
+        let path_writes = game.world.path_writes.clone();
         let mut first = None;
         for verify in [false, true] {
             let mut expected = None;
@@ -2886,10 +2925,12 @@ mod tests {
             for requested in [1, 3] {
                 (game.mobs, game.world.random, game.died) =
                     (mobs.clone(), random.clone(), died.clone());
+                game.world.path_writes = path_writes.clone();
                 LANES.with(|l| l.set(Some(requested)));
                 VERIFY.with(|v| v.set(verify && requested > 1));
                 CHECK.with(|c| c.set((0, 0)));
                 let mut ran = Vec::new();
+                let capture = CapturePasses::begin();
                 let tick = || {
                     for _ in 0..ticks {
                         each(game);
@@ -2920,7 +2961,7 @@ mod tests {
                     .collect();
                 let mut died: Vec<u32> = game.died.iter().copied().collect();
                 died.sort_unstable();
-                let result = (left, format!("{:?}", game.world.random), died);
+                let result = (left, format!("{:?}", game.world.random), died, capture.finish());
                 match &expected {
                     Some(expected) => assert_eq!(&result, expected, "{what}: grouped as serial"),
                     None => expected = Some(result),

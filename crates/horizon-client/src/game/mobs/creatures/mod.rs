@@ -1398,6 +1398,38 @@ impl Game<'_> {
             }
         }
         lent.give_back(&mut self.world);
+        #[cfg(all(test, feature = "upstream-parallel-mob-islands"))]
+        mob_islands::capture_pass(|| {
+            use horizon_core::random::RandomSource;
+
+            let mob_rows = |rows: &[Mob]| {
+                rows.iter().map(mob_islands::without_counters).collect::<Vec<_>>()
+            };
+            let mut bindings: Vec<_> = bindings.iter().collect();
+            bindings.sort_unstable();
+            let mut died: Vec<_> = died.iter().collect();
+            died.sort_unstable();
+            let mut ticked: Vec<_> = ticked.iter().collect();
+            ticked.sort_unstable();
+            let mut snapshot = snapshot.clone();
+            for row in &mut snapshot {
+                row.section.1 = 0;
+            }
+            let mut random = self.world.random.clone();
+            let stream = (
+                random.state(),
+                random.next_gaussian().to_bits(),
+                random.next_long(),
+            );
+            [
+                ("mobs after retention and pushes", format!("{:?}", mob_rows(&mobs[..]))),
+                ("snapshot", format!("{snapshot:?}")),
+                ("events", format!("{events:?} {guest_events:?}")),
+                ("deaths", format!("{:?} {:?} {gone:?}", mob_rows(&dead), mob_rows(&corpses))),
+                ("sets and bindings", format!("{died:?} {ticked:?} {bindings:?}")),
+                ("level random", format!("{stream:?}")),
+            ]
+        });
         self.last_hurt_by_player = player_credit;
         if let Some(host) = self.lan.as_mut()
             && !guests.is_empty()
