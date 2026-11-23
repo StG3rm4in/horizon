@@ -186,6 +186,8 @@ impl LegacyRandom {
         }
     }
 
+    /// Inlined with the draws that make it (see `next_int_bound`).
+    #[inline]
     fn bits(&mut self, count: u32) -> i32 {
         self.sync();
         self.state = self.state.wrapping_mul(Self::MULTIPLIER).wrapping_add(11) & Self::MASK;
@@ -213,6 +215,10 @@ impl RandomSource for LegacyRandom {
         self.bits(32)
     }
 
+    /// Inlined where it is called, in every crate: most callers pass a constant bound (each
+    /// natural spawn attempt steps with four `next_int_bound(6)`), whose remainder then compiles
+    /// to a multiplication rather than a division, and whose power of two keeps its shift alone.
+    #[inline]
     fn next_int_bound(&mut self, bound: i32) -> Result<i32, InvalidBound> {
         if bound <= 0 {
             return Err(InvalidBound);
@@ -408,6 +414,40 @@ mod tests {
     fn invalid_inputs_preserve_both_streams() {
         invalid_bounds_do_not_consume_state(LegacyRandom::new(0));
         invalid_bounds_do_not_consume_state(XoroshiroRandom::new(0));
+    }
+
+    /// `nextInt(bound)` with a bound the call site knows (folded once the draw is inlined) draws
+    /// what it draws with the same bound known only at run time, in both of its branches (a
+    /// power of two, and the rejection loop up to the largest bound).
+    #[test]
+    fn constant_and_run_time_bounds_draw_alike() {
+        let (mut folded, mut run_time) = (LegacyRandom::new(-7), LegacyRandom::new(-7));
+        let at_run_time = |bound: i32| std::hint::black_box(bound);
+        for _ in 0..20_000 {
+            assert_eq!(
+                folded.next_int_bound(6),
+                run_time.next_int_bound(at_run_time(6))
+            );
+            assert_eq!(
+                folded.next_int_bound(16),
+                run_time.next_int_bound(at_run_time(16))
+            );
+            assert_eq!(
+                folded.next_int_bound(1),
+                run_time.next_int_bound(at_run_time(1))
+            );
+            let big = i32::MAX;
+            assert_eq!(
+                folded.next_int_bound(big),
+                run_time.next_int_bound(at_run_time(big))
+            );
+            let odd = (1 << 30) + 1;
+            assert_eq!(
+                folded.next_int_bound(odd),
+                run_time.next_int_bound(at_run_time(odd))
+            );
+        }
+        assert_eq!(folded.state(), run_time.state());
     }
 
     #[test]
