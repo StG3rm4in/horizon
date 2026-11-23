@@ -3664,6 +3664,11 @@ trait SeededPipeline: Send + Sync {
     ) -> Result<(), String>;
     fn forget_structure_starts(&self);
     fn ring_positions(&self, worker: &mut WorkerState, set: &str) -> Option<Vec<ChunkPos>>;
+    /// Whether biome searches over many quarts come from the GPU's batches (HORIZON_GPU_LOCATE):
+    /// the stronghold rings' squares are then one batch.
+    fn biome_batches(&self) -> bool {
+        false
+    }
     /// The structures whose random-spread set may start in `chunk`, each with whether a
     /// search's start check lets it start there.
     #[cfg(test)]
@@ -4114,6 +4119,9 @@ where
             },
             set,
         )
+    }
+    fn biome_batches(&self) -> bool {
+        self.locate_gpu.is_some()
     }
     fn region_random(&self, center: ChunkPos) -> Box<dyn super::structure::legacy::PieceRandom> {
         Box::new(self.region_random_at(center))
@@ -4956,6 +4964,11 @@ impl OverworldGenerator {
     /// NoiseSpawnFinder.findSpawnPosition: the column `origin` is the chunk of.
     pub fn spawn_position(&self) -> Result<[i32; 2], GeneratorError> {
         self.pipeline.spawn_position()
+    }
+    /// Whether biome searches over many quarts come from the GPU's batches (HORIZON_GPU_LOCATE):
+    /// the stronghold rings then take some tens of milliseconds, not a second of CPU.
+    pub fn biome_batches(&self) -> bool {
+        self.pipeline.biome_batches()
     }
     /// A new `WorldGenRegion` random centred on the chunk: what its generation
     /// steps draw from (`level.getRandom()`).
