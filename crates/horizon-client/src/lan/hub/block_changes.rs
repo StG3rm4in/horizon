@@ -332,6 +332,13 @@ impl Hub {
             let metadata_positions = if has_views { &candidates } else { &positions };
             for &pos @ (x, y, z) in metadata_positions {
                 let state = world.block(x, y, z).0;
+                // `ChunkHolder.broadcastBlockEntityIfNeeded` asks `BlockState.hasBlockEntity`
+                // first. A state without a block entity type, and without one a mod declares,
+                // sends nothing below (it has no `kind`) and changes nothing on the way: its
+                // block entity, if any, and the chunk's saved pot tag need not be looked up.
+                if !self.encoder.may_have_entity(state) {
+                    continue;
+                }
                 let entity = world.block_entities.get(&pos);
                 if !self.encoder.entity_matches(state, entity) {
                     continue;

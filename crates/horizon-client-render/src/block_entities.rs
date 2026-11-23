@@ -26,6 +26,7 @@
 use crate::chunk::block_entity::{BlockEntity, ModContainer, ModEnergyBuffer, ModFluidTanks};
 use crate::fast_hash::{FxHashMap, FxHashSet};
 use horizon_mod_runtime::attachments::{Attachments, observer::AttachmentObserver};
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::{
     Arc,
@@ -76,7 +77,11 @@ pub enum Ticking {
 
 #[derive(Default)]
 pub struct BlockEntities {
-    map: HashMap<Pos, BlockEntity>,
+    /// Fx-hashed, as the maps by position below: every read of a block entity (the ticking ones,
+    /// twice each a tick, the chunks the LAN sends, each changed block it broadcasts) hashed its
+    /// position with SipHash. Its order of iteration means nothing, as with the default hasher,
+    /// which is seeded at random in every process.
+    map: FxHashMap<Pos, BlockEntity>,
     generations: FxHashMap<Pos, u64>,
     on_load: std::collections::VecDeque<(Pos, u64)>,
     on_load_enabled: bool,
@@ -295,7 +300,7 @@ fn forget_mod(mods: &mut FxHashMap<(i32, i32), FxHashSet<Pos>>, pos: Pos) {
 }
 
 impl std::ops::Deref for BlockEntities {
-    type Target = HashMap<Pos, BlockEntity>;
+    type Target = FxHashMap<Pos, BlockEntity>;
     fn deref(&self) -> &Self::Target {
         &self.map
     }

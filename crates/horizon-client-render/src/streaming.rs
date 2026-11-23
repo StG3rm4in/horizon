@@ -673,6 +673,10 @@ pub struct Streaming {
     /// the proto is checked out, replaced or removed.
     light_views: FxHashMap<(i32, i32), Arc<Chunk>>,
     decorated: FxHashSet<(i32, i32)>,
+    /// The chunk map's membership revision when `decorated` last held only columns resident,
+    /// proto chunks or finishing (`complete_commit`): 0 before the first look, and once
+    /// `abort_generation` emptied `finishing`, so that the next look walks it all.
+    decorated_basis: u64,
     decorating: usize,
     /// The final chunks a running decoration writes into: another one that
     /// reaches them waits, as vanilla's features run one after the other and
@@ -966,8 +970,12 @@ impl GenerationScan {
                     x1 = x1.max(next_x1);
                 }
                 for x in x0..=x1 {
-                    if !input.ranges.requested(x, z, input.decorates)
-                        || input.world.chunks.contains_key(&(x, z))
+                    // Resident first: most columns of the areas are, and the chunk map's grid
+                    // slot of the next column of a row is next to the last one, where
+                    // `requested` asks the areas again. The tests only read, so their order
+                    // changes no answer.
+                    if input.world.chunks.contains_key(&(x, z))
+                        || !input.ranges.requested(x, z, input.decorates)
                         || input.generating.contains(&(x, z))
                         || input.protos.contains_key(&(x, z))
                         || input.finishing.contains(&(x, z))
@@ -1483,6 +1491,7 @@ impl Streaming {
             protos: Default::default(),
             light_views: Default::default(),
             decorated: Default::default(),
+            decorated_basis: 0,
             dropped_new: Default::default(),
             decorating: 0,
             decorating_finals: HashSet::new(),
@@ -2366,9 +2375,27 @@ impl Streaming {
             let (protos, finishing) = (&self.protos, &self.finishing);
             // The final columns first: every loaded column stays in the set, so they are most
             // of it. The three tests only read, so their order changes nothing but the lookups.
-            self.decorated.retain(|k| {
+            let kept = |k: &(i32, i32)| {
                 world.chunks.contains_key(k) || protos.contains_key(k) || finishing.contains(k)
-            });
+            };
+            // The retain drops only a column that left the chunk map behind streaming's back
+            // (`decorated_may_shrink`). Most updates have none, and it then walked every
+            // resident column for nothing, at every update of the tick and of the chunk pump.
+            if decorated_may_shrink(
+                &self.decorated,
+                world,
+                self.decorated_basis,
+                protos,
+                finishing,
+            ) {
+                self.decorated.retain(kept);
+            } else {
+                debug_assert!(
+                    self.decorated.iter().all(kept),
+                    "a decorated key left unseen"
+                );
+            }
+            self.decorated_basis = world.chunks.membership_revision();
         }
         // Finalize chunks whose neighbourhood is decorated.
         if !self.protos.is_empty() {
@@ -2377,10 +2404,13 @@ impl Streaming {
             {
                 let ranges = self.ranges();
                 for (&(x, z), proto) in &self.protos {
+                    // The range first: most proto chunks lie in the rings past the columns that
+                    // finish, and it reads the areas' grid where the other two are look-ups.
+                    // The tests only read, so their order changes no answer.
                     if proto.is_none()
+                        || !ranges.in_range(x, z, 1)
                         || world.chunks.contains_key(&(x, z))
                         || self.finishing.contains(&(x, z))
-                        || !ranges.in_range(x, z, 1)
                     {
                         continue;
                     }
@@ -2465,10 +2495,12 @@ impl Streaming {
                     self.protos
                         .iter()
                         .filter(|&(&(x, z), proto)| {
+                            // The range first, as for the chunks that finish above: the outer
+                            // ring fails it without a look-up.
                             proto.is_some()
+                                && (ranges.in_range(x, z, 2) || ranges.near_finished(x, z, 1))
                                 && !self.decorated.contains(&(x, z))
                                 && !world.chunks.contains_key(&(x, z))
-                                && (ranges.in_range(x, z, 2) || ranges.near_finished(x, z, 1))
                         })
                         .map(|(&k, _)| k),
                     |x, z| ranges.priority(x, z),
@@ -2896,6 +2928,8 @@ impl Streaming {
         self.decorating = 0;
         self.decorating_finals.clear();
         self.finishing.clear();
+        // What was finishing may now be in none of the sets `decorated`'s keys are in.
+        self.decorated_basis = 0;
         self.viewing.clear();
         self.waiting.clear();
         self.meshing.clear();
@@ -4075,6 +4109,37 @@ fn submit_mesh_candidates(
     submitted
 }
 
+/// Whether `decorated` (`Streaming::decorated`) may hold a column that is neither resident, a
+/// proto chunk nor finishing, which `complete_commit`'s retain drops. A key goes in only while
+/// it is one of the three, and streaming drops it from `decorated` wherever it takes a key out
+/// of `protos` or `finishing` without moving it on to another of them (a sweep's unloads, far
+/// proto chunks, a column dropped as it arrives); a proto chunk that finishes goes to
+/// `finishing`, and a finished column to the chunk map, in the same step. So only a column that
+/// left the chunk map some other way can be one: the removals the map lists since `basis`, the
+/// revision at which `decorated` was last clean. When the map cannot list them (another map, a
+/// clear, more changes than it keeps, or `basis` 0), any key may be.
+fn decorated_may_shrink(
+    decorated: &FxHashSet<(i32, i32)>,
+    world: &World,
+    basis: u64,
+    protos: &FxHashMap<(i32, i32), Option<Proto>>,
+    finishing: &FxHashSet<(i32, i32)>,
+) -> bool {
+    let Some(mut changes) = world.chunks.deltas_since(basis) else {
+        return true;
+    };
+    changes.any(|(_, change)| match change {
+        ChunkMembershipDelta::Removed(key) => {
+            decorated.contains(&key)
+                && !world.chunks.contains_key(&key)
+                && !protos.contains_key(&key)
+                && !finishing.contains(&key)
+        }
+        ChunkMembershipDelta::Added(_) => false,
+        ChunkMembershipDelta::Reset => true,
+    })
+}
+
 /// Drop unsaved far proto chunks and clear their `decorated` markers when they
 /// are neither finishing nor resident, returning those that must be saved first.
 fn drop_unsaved_protos(
@@ -4742,6 +4807,109 @@ mod tests {
         assert!(decorated.contains(&(11, 0)));
         assert!(!protos.contains_key(&(12, 0)));
         assert!(decorated.contains(&(12, 0)));
+    }
+
+    /// `decorated_may_shrink` sends the retain to run whenever it would drop a column, as long
+    /// as `decorated` is kept the way streaming keeps it (a key goes in only while resident, a
+    /// proto chunk or finishing, and streaming drops it wherever it takes one out of them). It
+    /// then names exactly the updates where a column left the chunk map behind streaming's
+    /// back, and says yes whenever the map can no longer list its changes.
+    #[test]
+    fn decorated_retain_is_skipped_only_when_it_would_drop_nothing() {
+        type Keys = FxHashSet<(i32, i32)>;
+        type Protos = FxHashMap<(i32, i32), Option<Proto>>;
+        fn kept(world: &World, protos: &Protos, finishing: &Keys, k: &(i32, i32)) -> bool {
+            world.chunks.contains_key(k) || protos.contains_key(k) || finishing.contains(k)
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let chunk = Arc::new(Chunk::empty(0, 0));
+        let mut world = World::new(horizon_world::registry::BlockStateId(0), 0);
+        let mut protos = Protos::default();
+        let (mut finishing, mut decorated) = (Keys::default(), Keys::default());
+        let mut basis = 0;
+        let (mut skipped, mut walked, mut drops) = (0, 0, 0usize);
+        for step in 0..3000i32 {
+            for _ in 0..1 + rand(6) {
+                let key = (rand(16) as i32 - 8, rand(16) as i32 - 8);
+                let (what, coin, rare) = (rand(8), rand(4), rand(10) == 0);
+                match what {
+                    // A proto chunk arrives, decorated or not.
+                    0 if !world.chunks.contains_key(&key) => {
+                        protos.insert(key, Some(Box::new(())));
+                        if coin < 2 {
+                            decorated.insert(key);
+                        }
+                    }
+                    // It finishes, then arrives as a column, kept or dropped.
+                    1 => {
+                        if protos.remove(&key).is_some() {
+                            finishing.insert(key);
+                        }
+                    }
+                    2 if finishing.contains(&key) => {
+                        finishing.remove(&key);
+                        if coin > 0 {
+                            decorated.insert(key);
+                            world.chunks.insert(key, chunk.clone());
+                        } else if !protos.contains_key(&key) && !world.chunks.contains_key(&key) {
+                            decorated.remove(&key);
+                        }
+                    }
+                    // A sweep unloads a column, or drops a far proto chunk.
+                    3 => {
+                        decorated.remove(&key);
+                        world.chunks.remove(&key);
+                    }
+                    4 => {
+                        if protos.remove(&key).is_some()
+                            && !finishing.contains(&key)
+                            && !world.chunks.contains_key(&key)
+                        {
+                            decorated.remove(&key);
+                        }
+                    }
+                    // Behind streaming's back: a column taken away, or all of them.
+                    5 if coin == 0 => drop(world.chunks.remove(&key)),
+                    6 if coin == 0 && rare => world.chunks.clear(),
+                    _ => {}
+                }
+            }
+            // More changes than the map keeps.
+            if step % 500 == 250 {
+                for x in 0..300 {
+                    world.chunks.insert((100 + x, step), chunk.clone());
+                }
+            }
+            let may = decorated_may_shrink(&decorated, &world, basis, &protos, &finishing);
+            let would = decorated
+                .iter()
+                .any(|k| !kept(&world, &protos, &finishing, k));
+            assert!(
+                may || !would,
+                "step {step}: skipped a retain that drops a column"
+            );
+            if world.chunks.deltas_since(basis).is_some() {
+                assert_eq!(may, would, "step {step}");
+            }
+            drops += usize::from(would);
+            if may {
+                decorated.retain(|k| kept(&world, &protos, &finishing, k));
+                walked += 1;
+            } else {
+                skipped += 1;
+            }
+            basis = world.chunks.membership_revision();
+        }
+        assert!(
+            skipped > 1000 && walked > 20 && drops > 10,
+            "{skipped} {walked} {drops}"
+        );
     }
 
     #[test]

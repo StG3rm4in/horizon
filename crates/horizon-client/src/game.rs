@@ -896,6 +896,9 @@ struct TickScratch {
     boat_cells: Vec<BlockPos>,
     /// The cells of the boxes of the mobs and the other entities.
     touched: Vec<block_ticks::CellBox>,
+    /// Each sweeping entity's id and box, in the order the entity lists hold them, from the walk
+    /// of their feet for the walk of their boxes; `None` where that walk takes no box.
+    entity_boxes: Vec<(u32, Option<Aabb>)>,
     sensing: Vec<BlockPos>,
     later: Vec<BlockPos>,
     /// What the palettes of the sections those cells reach may hold.
@@ -6281,7 +6284,10 @@ impl Game<'_> {
         &self,
         chunks: impl IntoIterator<Item = &'a Arc<horizon_client::chunk::Chunk>>,
     ) -> Vec<Arc<horizon_client::chunk::Chunk>> {
-        horizon_client::save::chunks_with_block_entities(
+        // Each chunk's block entities through the map's index by chunk: the eager saves take up
+        // to twenty snapshots a tick, one chunk each, and a scan of every block entity of the
+        // level for each was most of their cost.
+        horizon_client::save::chunks_with_indexed_block_entities(
             chunks,
             &self.world.block_entities,
             &self.world.block_names,

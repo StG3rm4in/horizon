@@ -11,6 +11,7 @@ horizon-client game::block_entity_ticks::quiet_tick_tests::a_spawner_nobody_is_n
 horizon-client game::block_entity_ticks::quiet_tick_tests::a_trial_spawner_nobody_is_near_waits_as_its_whole_tick lib daily resources
 horizon-client game::block_entity_ticks::quiet_tick_tests::a_vault_with_nothing_due_waits_as_its_whole_tick lib daily resources
 horizon-client game::block_entity_ticks::quiet_tick_tests::the_waiting_blocks_read_every_state_as_the_registry_does lib daily resources
+horizon-client game::block_ticks::entity_box_tests::kept_boxes_touch_the_cells_boxes_worked_out_again_touch lib daily resources
 horizon-client game::block_ticks::sweep_sections_tests::sweep_sections_answer_as_world_may_hold lib daily resources
 horizon-client game::commands::modprofile::tests::modprofile_state_and_report_side_effects lib daily child-process
 horizon-client game::commands::selector_bounds_tests::actual_selector_uses_body_overlap_but_distance_stays_at_the_origin lib daily game-boot

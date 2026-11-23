@@ -101,23 +101,30 @@ impl Game<'_> {
         {
             use entity::{Entity as _, entity_lists_of, for_each_entity};
             let lists = entity_lists_of!(self);
+            // Every sweeping entity's box, worked out once for both walks: the walk of the boxes
+            // in `with_level` below takes one from an entity that is not removed and stands in an
+            // entity-ticking chunk, as this one does (for the living ones).
+            scratch.entity_boxes.clear();
             for_each_entity!(lists, e => {
                 // A kind that `applyEffectsFromBlocks` never reaches says so
                 // (`sweeps_blocks_inside`); the carts, swept with the players
                 // below, say so too.
-                let at = e.position();
-                if !e.is_removed()
-                    && e.is_alive()
-                    && e.sweeps_blocks_inside()
-                    && entity_ticking(at.x.floor() as i32, at.z.floor() as i32)
-                {
-                    let b = e.bounds();
-                    standing_feet(
-                        &mut scratch.standing,
-                        [at.x, at.y, at.z],
-                        e.on_ground(),
-                        (b.max_position().x - b.min_position().x) / 2.0,
-                    );
+                if e.sweeps_blocks_inside() {
+                    let at = e.position();
+                    let b = (!e.is_removed()
+                        && entity_ticking(at.x.floor() as i32, at.z.floor() as i32))
+                    .then(|| e.bounds());
+                    scratch.entity_boxes.push((e.id(), b));
+                    if let Some(b) = b
+                        && e.is_alive()
+                    {
+                        standing_feet(
+                            &mut scratch.standing,
+                            [at.x, at.y, at.z],
+                            e.on_ground(),
+                            (b.max_position().x - b.min_position().x) / 2.0,
+                        );
+                    }
                 }
             });
             // AbstractArrow.applyEffectsFromBlocks reaches a trident in the
@@ -173,11 +180,33 @@ impl Game<'_> {
                 let cells = box_cells([lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]);
                 scratch.touched.push(cells);
             };
+            // The lists the feet walk read, which the level only reads: the same sweeping
+            // entities in the same order, unchanged, each with the box that walk kept (`None`:
+            // removed, or outside the entity-ticking chunks). Once an id parts from the kept
+            // order (no path is known to), every box after it is worked out again.
+            let mut kept = scratch.entity_boxes.iter();
+            let mut parted = false;
             for_each_entity!(level.entities(), entity => {
-                if entity.triggers_blocks() && entity.sweeps_blocks_inside() {
-                    let at = entity.position();
-                    if entity_ticking(at.x.floor() as i32, at.z.floor() as i32) {
-                        touch(entity.bounds());
+                if entity.sweeps_blocks_inside() {
+                    let id = entity.id();
+                    let found = match kept.next() {
+                        Some(&(kept_id, b)) if !parted && kept_id == id => Some(b),
+                        _ => {
+                            parted = true;
+                            None
+                        }
+                    };
+                    if entity.triggers_blocks() {
+                        match found {
+                            Some(Some(b)) => touch(b),
+                            Some(None) => {}
+                            None => {
+                                let at = entity.position();
+                                if entity_ticking(at.x.floor() as i32, at.z.floor() as i32) {
+                                    touch(entity.bounds());
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -824,6 +853,127 @@ mod tests {
                 !game.block_ticks.moving_pistons.is_empty(),
                 "queued piston block event must still execute"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod entity_box_tests {
+    use super::*;
+    use crate::game::entity::{Entity as _, entity_lists_of, for_each_entity};
+    use horizon_client::chunk::Chunk;
+    use horizon_client::entities::ItemEntity;
+    use horizon_client::items::ItemStack;
+    use horizon_client::mobs::Mob;
+    use horizon_core::geometry::Vec3;
+    use std::sync::Arc;
+
+    /// The cells the walk of the boxes takes from the boxes the walk of the feet kept are the
+    /// cells it took when it worked each box out again: every sweeping entity that presses
+    /// blocks, in the lists' order, in the entity-ticking chunks only. Mobs of several sizes
+    /// (bats ignore block triggers), dead ones not yet removed, removed ones, items, some on
+    /// plates, some past the simulation distance.
+    #[test]
+    #[ignore = "daily"]
+    fn kept_boxes_touch_the_cells_boxes_worked_out_again_touch() {
+        crate::game::native_entity_refs::tests::with_game(|game| {
+            game.settings.simulation_distance = 4;
+            game.settings.render_distance = 12;
+            let registry = game.pack.assets.registry;
+            let stone = registry.default_state("minecraft:stone").unwrap();
+            let plate = registry
+                .default_state("minecraft:stone_pressure_plate")
+                .unwrap();
+            game.player = Some(
+                horizon_client::motion::PlayerMotion::new(game.motion, Vec3::new(8.5, 65.0, 8.5))
+                    .unwrap(),
+            );
+            // Chunks (0, 0) to (2, 0) inside the simulation distance, (8, 0) past it.
+            for cx in [0, 1, 2, 8] {
+                game.world
+                    .chunks
+                    .insert((cx, 0), Arc::new(Chunk::empty(cx, 0)));
+            }
+            for cx in [0, 1, 2, 8] {
+                game.load_ticking_neighbourhood(cx, 0);
+                for x in 16 * cx..16 * cx + 16 {
+                    for z in 0..16 {
+                        game.world.set(x, 63, z, stone).unwrap();
+                        if (x + z) % 5 == 0 {
+                            game.world.set(x, 64, z, plate).unwrap();
+                        }
+                    }
+                }
+            }
+            let kinds = [
+                "minecraft:zombie",
+                "minecraft:bat",
+                "minecraft:cow",
+                "minecraft:slime",
+                "minecraft:pufferfish",
+                "minecraft:chicken",
+            ]
+            .map(|id| game.res.mob_types().get(id).unwrap().clone());
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            let mut next = |n: u64| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (seed >> 33) % n
+            };
+            let mut id = 0u32;
+            for i in 0..400 {
+                id += 1;
+                let cx = [0, 1, 2, 8][next(4) as usize];
+                let at = Vec3::new(
+                    f64::from(16 * cx) + next(1_600) as f64 / 100.0,
+                    64.0 + next(300) as f64 / 100.0,
+                    next(1_600) as f64 / 100.0,
+                );
+                if i % 4 == 3 {
+                    let stack = ItemStack::new("minecraft:stone", 1);
+                    let mut item = ItemEntity::new(id, stack, at, Vec3::ZERO, 0.0);
+                    item.on_ground = next(2) == 0;
+                    game.dropped.push(item);
+                    continue;
+                }
+                let kind = kinds[next(kinds.len() as u64) as usize].clone();
+                let mut mob = Mob::new(id, kind, at, 0.0);
+                mob.on_ground = next(2) == 0;
+                mob.extra.size = next(4) as i32;
+                match next(10) {
+                    0 => mob.health = 0.0,
+                    1 => mob.removed = true,
+                    2 => mob.extra.age = -24_000,
+                    _ => {}
+                }
+                game.mobs.push(mob);
+            }
+            game.update_chunk_tickets();
+            for _ in 0..3 {
+                game.tick_blocks().unwrap();
+            }
+            // The walk of the boxes as it was, over the lists as they are now.
+            let ticking = game.entity_ticking_area();
+            let mut again = Vec::new();
+            for_each_entity!(entity_lists_of!(game), entity => {
+                if entity.triggers_blocks() && entity.sweeps_blocks_inside() {
+                    let at = entity.position();
+                    if ticking(at.x.floor() as i32, at.z.floor() as i32) {
+                        let b = entity.bounds();
+                        let (lo, hi) = (b.min_position(), b.max_position());
+                        again.push(box_cells([lo.x, lo.y, lo.z], [hi.x, hi.y, hi.z]));
+                    }
+                }
+            });
+            assert_eq!(game.tick_scratch.touched, again);
+            let kept = &game.tick_scratch.entity_boxes;
+            assert!(again.len() > 100, "{} boxes touched", again.len());
+            assert!(
+                kept.iter().filter(|(_, b)| b.is_none()).count() > 20,
+                "too few entities past the simulation distance or removed"
+            );
+            assert!(kept.len() > again.len(), "no bat, removed or far entity kept");
         });
     }
 }
