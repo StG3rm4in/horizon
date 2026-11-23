@@ -43,7 +43,9 @@ jobs:
       - name: clippy, the workspace (CUDA backend compiled)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: clippy, the server build without CUDA
-        run: cargo clippy -p horizon-client --all-targets --locked --no-default-features -- -D warnings
+        # --lib --bins, as upstream's CI: with --all-targets the dev-dependency horizon-client-render
+        # keeps its default features, `cuda` among them.
+        run: cargo clippy -p horizon-client --lib --bins --locked --no-default-features -- -D warnings
       - name: clippy, horizon-gpu without CUDA
         run: cargo clippy -p horizon-gpu --all-targets --locked -- -D warnings
       - name: unit tests (no GPU, no game files)
@@ -58,6 +60,15 @@ jobs:
         run: HORIZON_REQUIRE_NVRTC=1 cargo test --locked -p horizon-gpu --features cuda --lib nvrtc
       - name: horizon-world's tests (those that need the game's files skip without them)
         run: cargo test --locked -p horizon-world
+      - name: the client libraries' tests (the tick's optimizations have theirs there)
+        # Without the game's files. Skipped: an upstream menu test that reads a global counter other
+        # tests bump (it passes alone), and the render crate's GPU module (gfx::), which needs a real
+        # GPU: on the software GL adapter (llvmpipe) of a runner without one, its tests read other
+        # pixels and the test process can crash. The fork's render tests (rests, lent shapes,
+        # collisions) are outside it.
+        run: >-
+          cargo test --locked --no-fail-fast -p horizon-client-lib -p horizon-client-render --lib --
+          --skip menu::tests::installed_slot_rules_change_mod_menu_placement --skip gfx::
       - name: the layer check (docs/layers.md)
         run: python3 tools/check_layers.py
       - name: every daily test has its row (tools/ci/ignored-tests)
