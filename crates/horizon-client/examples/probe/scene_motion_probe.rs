@@ -18,6 +18,10 @@ use std::{
     fs,
     io::{BufRead, Write},
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 fn number(v: &Value) -> f64 {
     f64::from_bits(u64::from_str_radix(v.as_str().unwrap(), 16).unwrap())
@@ -286,14 +290,14 @@ pub fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .into_iter();
         let count = instances.len();
-        let used = std::rc::Rc::new(std::cell::Cell::new(0));
-        let counter = used.clone();
+        let used = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&used);
         let mut player = PlayerMotion::with_attribute_identities(
             &resources,
             vector(&f["position"]),
             &hashes,
             Box::new(move || {
-                counter.set(counter.get() + 1);
+                counter.fetch_add(1, Ordering::Relaxed);
                 instances.next().expect("unexpected instance allocation")
             }),
         )?;
@@ -744,7 +748,7 @@ pub fn main() -> Result<()> {
             )?;
         }
         writeln!(out, "end")?;
-        if used.get() != count {
+        if used.load(Ordering::Relaxed) != count {
             return Err("reference instance allocation count differs".into());
         }
     }
