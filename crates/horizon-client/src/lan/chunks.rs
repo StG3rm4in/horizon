@@ -1157,6 +1157,15 @@ impl ChunkEncoder {
             None => !matches!(entity, Some(BlockEntity::Mod(_))),
         }
     }
+    /// Whether a block of `state` may have block entity data sent with its change: the state has
+    /// a block entity type, or a mod declares one for it (whose block entity's queued update
+    /// fields [`Self::change_tag`] takes even when the type has no id). Otherwise there is no
+    /// type to send ([`Self::entity_type`] is `None`), and [`Self::entity_matches`] refuses only
+    /// a mod's block entity.
+    pub fn may_have_entity(&self, state: u32) -> bool {
+        self.entity_type(state).is_some()
+            || (self.mod_entities.get(state as usize)).is_some_and(Option::is_some)
+    }
 
     /// The update tag of the block entity at `pos` (`getUpdateTag`): a
     /// mod's from its hook, a vanilla one's from [`entity_tag`].
@@ -2178,6 +2187,65 @@ mod tests {
         chunk.set(15, MIN_Y + 3, 0, 0);
         chunk.set(9, MIN_Y + 3, 9, 3);
         assert_eq!(sent(&chunk), scan(&chunk));
+    }
+
+    /// `may_have_entity` is false exactly for a state without a block entity type that no mod
+    /// declares one for: there is no type to send, and of a block entity found at such a block
+    /// `entity_matches` lets only one that is not a mod's through.
+    #[test]
+    fn only_a_typed_or_declared_state_may_have_its_block_entity_sent() {
+        use crate::block_entity_types::BlockEntityTypes;
+        let builtin = Builtin::parse(
+            r#"{"minecraft:block_entity_type": {"entries": {
+                "minecraft:chest": {"protocol_id": 1},
+                "test:machine": {"protocol_id": 49}}}}"#,
+        )
+        .unwrap();
+        let types = BlockEntityTypes::new(
+            [
+                ("test:press".into(), "test:machine".into()),
+                // A declared type the registry lacks: no id, but a mod's all the same.
+                ("test:orphan".into(), "test:ghost".into()),
+            ]
+            .into(),
+            builtin
+                .get("minecraft:block_entity_type")
+                .unwrap()
+                .names
+                .clone(),
+        );
+        let names = [
+            "minecraft:air",
+            "minecraft:chest",
+            "minecraft:stone",
+            "test:press",
+            "test:orphan",
+            "test:plain",
+        ];
+        let states = names.map(|n| (Arc::<str>::from(n), false, None));
+        let encoder = ChunkEncoder::with_types(states, &builtin, &[], &[], Some(&types));
+        let modded = |id: &str| {
+            BlockEntity::Mod(Box::new(ModBlockEntity::new(id.into(), Default::default())))
+        };
+        let mut may = Vec::new();
+        // Past the table too: a state the encoder was not made with.
+        for state in 0..names.len() as u32 + 3 {
+            let declared = (encoder.mod_entities.get(state as usize)).is_some_and(Option::is_some);
+            let typed = encoder.entity_type(state).is_some();
+            assert_eq!(encoder.may_have_entity(state), typed || declared, "{state}");
+            if !encoder.may_have_entity(state) {
+                for entity in [modded("test:machine"), modded("test:ghost")] {
+                    assert!(!encoder.entity_matches(state, Some(&entity)), "{state}");
+                }
+                let chest = BlockEntity::Chest(vec![None; 27]);
+                assert!(encoder.entity_matches(state, Some(&chest)), "{state}");
+                assert!(encoder.entity_matches(state, None), "{state}");
+            }
+            may.push(encoder.may_have_entity(state));
+        }
+        // The chest and the press have a type, the orphan a declared one without an id.
+        let want = [false, true, false, true, true, false, false, false, false];
+        assert_eq!(may, want);
     }
 
     /// Shared types are resolved per state; undeclared and stale entities stay off the wire.
