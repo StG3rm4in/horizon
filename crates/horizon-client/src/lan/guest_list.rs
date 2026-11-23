@@ -582,6 +582,54 @@ mod tests {
         }
     }
 
+    /// `connection_index` is the first guest with the connection, the one a walk through the
+    /// guests finds, through pushes, inserts, replacements, removals, retains, reversals and
+    /// edits that change a connection, with connections two guests hold and ones none holds.
+    #[test]
+    fn connection_index_is_the_first_guest_a_scan_finds() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(n)) as u32
+        };
+        let mut list = GuestList::default();
+        for step in 0..600 {
+            let len = list.len() as u32;
+            match next(8) {
+                0 | 1 => list.push(guest(next(40))),
+                2 => {
+                    let at = next(len + 1) as usize;
+                    list.insert(at, guest(next(40)));
+                }
+                3 if len > 0 => {
+                    let at = next(len) as usize;
+                    let _ = list.replace(at, guest(next(40)));
+                }
+                4 if len > 0 => {
+                    let _ = list.remove(next(len) as usize);
+                }
+                5 if len > 0 => {
+                    let (at, conn) = (next(len) as usize, next(40));
+                    list.update(at, |g| g.conn = conn);
+                }
+                6 => {
+                    let cut = next(40);
+                    list.retain(|g| g.conn != cut);
+                }
+                _ => list.reverse(),
+            }
+            for conn in 0..45 {
+                assert_eq!(
+                    list.connection_index(conn),
+                    list.iter().position(|g| g.conn == conn),
+                    "{conn} after step {step}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn uuid_index_and_lock_free_written_tracking_match_linear_scan() {
         let mut list = GuestList::default();

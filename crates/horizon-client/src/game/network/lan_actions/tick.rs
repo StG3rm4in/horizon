@@ -56,7 +56,8 @@ impl Game<'_> {
             let Some(host) = self.lan.as_mut() else {
                 return;
             };
-            let Some(gi) = host.hub.guests.iter().position(|g| g.conn == conn) else {
+            // The first guest with the connection, as a walk through the guests finds it.
+            let Some(gi) = host.hub.guests.connection_index(conn) else {
                 continue;
             };
             // ServerGamePacketListenerImpl.tick: the chat and command throttlers

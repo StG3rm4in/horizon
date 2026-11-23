@@ -489,7 +489,9 @@ pub struct Hub {
     chat_type: i32,
     dimension_type: i32,
     clock_ids: Vec<i32>,
-    item_ids: std::collections::HashMap<Arc<str>, i32>,
+    /// Each item's registry id, once looked up: asked for every stack the tracked entities
+    /// show, every tick, and never iterated, so with the fast hasher.
+    item_ids: crate::fast_hash::FxHashMap<Arc<str>, i32>,
     entity_types: std::collections::HashMap<String, i32>,
     /// Each level's tracked entities, by dimension.
     entities: std::collections::HashMap<String, Entities>,
@@ -942,7 +944,8 @@ impl Hub {
     pub fn stack(&mut self, s: &Option<ItemStack>) -> Option<horizon_protocol::item::Stack> {
         let item = s.as_ref()?.item.clone();
         let id = self.item_id(&item);
-        let sync = self.sync.clone();
+        // Borrowed: nothing below changes the hub.
+        let sync = &*self.sync;
         // The stacks inside it (a bundle's contents, a crossbow's projectiles)
         // have ids of their own.
         let item_id = |name: &str| {
