@@ -1,0 +1,2 @@
+# The sculk chunk looks test boots Game with prepared resources.
+horizon-client game::sculk::tests::sculk_chunk_looks_follow_the_resident_chunks lib daily resources

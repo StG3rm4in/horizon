@@ -90,7 +90,7 @@ pub(super) struct SculkState {
     tables: Tables,
     /// The sculk block entities in the order they were added.
     index: Index,
-    pub known: HashSet<(i32, i32)>,
+    pub known: FxHashSet<(i32, i32)>,
     /// The chunk map's membership revision `known` was taken at.
     pub known_revision: Option<u64>,
     // Keyed by mob ids the server gives out: the fast hasher is safe.
@@ -464,20 +464,35 @@ impl Game<'_> {
         let revision = self.world.chunks.membership_revision();
         if self.sculk.ticks.is_multiple_of(10) && self.sculk.known_revision != Some(revision) {
             self.sculk.known_revision = Some(revision);
-            let loaded: HashSet<(i32, i32)> = self.world.chunks.keys().copied().collect();
-            let arrived: Vec<(i32, i32)> = loaded.difference(&self.sculk.known).copied().collect();
+            // The resident chunks not known yet, and the known ones no longer resident, each
+            // from one pass: a set of every resident chunk made anew and its two differences
+            // with the last one hashed tens of thousands of positions every half second. Then
+            // `known` is the resident chunks again. Nothing below loads or unloads a chunk.
+            let chunks = &self.world.chunks;
+            let known = &mut self.sculk.known;
+            let mut arrived: Vec<(i32, i32)> =
+                chunks.keys().copied().filter(|key| !known.contains(key)).collect();
+            // In position order: the old set's order was another in every process.
+            arrived.sort_unstable();
+            let mut gone = FxHashSet::<(i32, i32)>::default();
+            known.retain(|key| {
+                let resident = chunks.contains_key(key);
+                if !resident {
+                    gone.insert(*key);
+                }
+                resident
+            });
+            known.extend(arrived.iter().copied());
             for key in arrived {
                 self.sculk_scan_chunk(key);
             }
             // The blocks of every chunk that left, in one pass: a player
             // leaving unloads thousands of chunks at once.
-            let gone: HashSet<(i32, i32)> = self.sculk.known.difference(&loaded).copied().collect();
             if !gone.is_empty() {
                 self.sculk
                     .index
                     .retain(|p| !gone.contains(&(p.0 >> 4, p.2 >> 4)));
             }
-            self.sculk.known = loaded;
         }
         self.sculk_sync_writes();
     }
@@ -2775,6 +2790,82 @@ mod tests {
                 .unwrap();
             assert_eq!(info.source, Some(EventSource::Entity(123)));
             assert_eq!(info.owner, Some(Who::Player));
+        });
+    }
+
+    /// The half-second look at the chunk map scans the chunks that arrived since the last one,
+    /// in position order, and drops the sculk blocks of the ones that left: after chunks come,
+    /// go, come back and stay, `known` is the resident chunks and the index holds the sculk
+    /// blocks of those, each once.
+    #[test]
+    #[ignore = "daily"]
+    fn sculk_chunk_looks_follow_the_resident_chunks() {
+        use crate::game::native_entity_refs::tests::with_game;
+        use horizon_client::chunk::Chunk;
+        use std::sync::Arc;
+
+        /// `known` is the resident chunks, and the index the sensors of `resident`, once each.
+        fn check(game: &Game<'_>, resident: &[(i32, i32)]) {
+            let mut known: Vec<(i32, i32)> = game.sculk.known.iter().copied().collect();
+            let mut chunks: Vec<(i32, i32)> = game.world.chunks.keys().copied().collect();
+            known.sort_unstable();
+            chunks.sort_unstable();
+            assert_eq!(known, chunks);
+            let mut expected: Vec<(i32, i32, i32)> =
+                (resident.iter()).map(|&(x, z)| (x * 16 + 1, 64, z * 16 + 1)).collect();
+            let mut indexed: Vec<(i32, i32, i32)> = game.sculk.index.iter().copied().collect();
+            assert_eq!(indexed.len(), game.sculk.index.set.len());
+            expected.sort_unstable();
+            indexed.sort_unstable();
+            assert_eq!(indexed, expected);
+        }
+
+        with_game(|game| {
+            game.options.dedicated = Some(Vec::new());
+            game.sculk_prepare();
+            let registry = game.pack.assets.registry;
+            let sensor = registry.default_state("minecraft:sculk_sensor").unwrap();
+            // A chunk with a sensor at its corner, made before it comes, as streaming makes one.
+            let with_sensor = |x: i32, z: i32| {
+                let mut chunk = Chunk::empty(x, z);
+                chunk.set(1, 64, 1, sensor.0);
+                Arc::new(chunk)
+            };
+            for key in [(1, 0), (0, 0), (-1, 2)] {
+                game.world.chunks.insert(key, with_sensor(key.0, key.1));
+            }
+            game.sculk_sync_index();
+            check(game, &[(0, 0), (1, 0), (-1, 2)]);
+            // Scanned in position order, whatever the order they came in.
+            let order: Vec<(i32, i32, i32)> = game.sculk.index.iter().copied().collect();
+            assert_eq!(order, [(-15, 64, 33), (1, 64, 1), (17, 64, 1)]);
+            // One leaves, one comes.
+            game.world.chunks.remove(&(1, 0));
+            game.world.chunks.insert((3, -3), with_sensor(3, -3));
+            game.sculk_sync_index();
+            check(game, &[(0, 0), (-1, 2), (3, -3)]);
+            // The one that left comes back, another leaves, one without sculk comes.
+            game.world.chunks.insert((1, 0), with_sensor(1, 0));
+            game.world.chunks.remove(&(3, -3));
+            game.world.chunks.insert((5, 5), Arc::new(Chunk::empty(5, 5)));
+            game.sculk_sync_index();
+            check(game, &[(0, 0), (-1, 2), (1, 0)]);
+            // Nothing came or went: no look, the same index in the same order.
+            let order: Vec<(i32, i32, i32)> = game.sculk.index.iter().copied().collect();
+            game.sculk_sync_index();
+            assert_eq!(game.sculk.index.iter().copied().collect::<Vec<_>>(), order);
+            // A chunk leaves and comes back between two looks: it is neither arrived nor gone.
+            game.world.chunks.remove(&(0, 0));
+            game.world.chunks.insert((0, 0), with_sensor(0, 0));
+            game.sculk_sync_index();
+            check(game, &[(0, 0), (-1, 2), (1, 0)]);
+            assert_eq!(game.sculk.index.iter().copied().collect::<Vec<_>>(), order);
+            // Every chunk leaves.
+            for key in [(0, 0), (-1, 2), (1, 0), (5, 5)] {
+                game.world.chunks.remove(&key);
+            }
+            game.sculk_sync_index();
+            check(game, &[]);
         });
     }
 
