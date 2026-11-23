@@ -79,17 +79,22 @@ impl RingSearch {
         let z = cz - r + search.next_int_bound(r * 2 + 1).unwrap_or(0);
         ChunkPos::new(x >> 4, z >> 4)
     }
+    /// The quarts `find` samples, in vanilla's order (findBiomeHorizontal's `dz` loop, then its
+    /// `dx` loop, step 1): rows from the square's north edge, each from its west end, at y 0.
+    pub fn square(&self) -> Vec<[i32; 3]> {
+        let (cx, cz) = ((self.x * 16 + 8) >> 2, (self.z * 16 + 8) >> 2);
+        let r = SEARCH_QUARTS;
+        (-r..=r)
+            .flat_map(|dz| (-r..=r).map(move |dx| [cx + dx, 0, cz + dz]))
+            .collect()
+    }
     pub fn find(
         &self,
         preferred: &BTreeSet<BiomeId>,
         biomes: &mut dyn FnMut(&[[i32; 3]]) -> Vec<BiomeId>,
     ) -> ChunkPos {
         let mut search = self.random.clone();
-        let (cx, cz) = ((self.x * 16 + 8) >> 2, (self.z * 16 + 8) >> 2);
-        let r = SEARCH_QUARTS;
-        let quarts: Vec<[i32; 3]> = (-r..=r)
-            .flat_map(|dz| (-r..=r).map(move |dx| [cx + dx, 0, cz + dz]))
-            .collect();
+        let quarts = self.square();
         let mut found = 0;
         let mut result = None;
         for (quart, biome) in quarts.iter().zip(biomes(&quarts)) {

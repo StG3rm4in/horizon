@@ -1010,6 +1010,18 @@ pub trait StartContext: JigsawContext {
     /// BiomeSource.findBiomeHorizontal samples: each climate lookup starts
     /// from the previous result, which a tie keeps.
     fn noise_biomes(&mut self, quarts: &[[i32; 3]]) -> Vec<BiomeId>;
+    /// Whether `noise_biomes` answers from the generator's biome source, with no biomes of the
+    /// context's own (a `structure_terrain` provider's land has some): another context of the
+    /// same generator then answers the same lists.
+    fn biomes_from_source(&self) -> bool {
+        false
+    }
+    /// `noise_biomes` of many lists at once, each list as one `noise_biomes` call answers it,
+    /// when this context has a faster way than a call per list: the generator's GPU batches
+    /// (HORIZON_GPU_LOCATE), for the stronghold rings' squares. `None`: call `noise_biomes`.
+    fn noise_biome_lists(&mut self, _lists: &[Vec<[i32; 3]>]) -> Option<Vec<Vec<BiomeId>>> {
+        None
+    }
     /// `GenerationContext.validBiome`'s set: `None` is the `biome -> true`
     /// predicate `/place structure` passes, so every biome counts as valid.
     fn set_valid_biomes(&mut self, biomes: Option<&BTreeSet<BiomeId>>);

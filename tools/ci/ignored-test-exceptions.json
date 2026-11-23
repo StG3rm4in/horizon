@@ -1241,6 +1241,14 @@
   },
   {
     "package": "horizon-world",
+    "target": "lib",
+    "test": "worldgen::generator::tests::stronghold_squares_on_the_cpu_and_the_gpu",
+    "path": "crates/horizon-world/src/worldgen/generator.rs",
+    "reason": "benchmark",
+    "rationale": "Opt-in measurement, not an ordinary daily correctness check: times the stronghold rings' 128 biome squares on the CPU and, with HORIZON_GPU_LOCATE and a CUDA GPU, from one GPU batch, asserting the same biomes and vanilla's ring positions for seed 1234. Run by hand on an idle machine with the optimized profile, HORIZON_RESOURCES and --features cuda; all assertions remain in the test."
+  },
+  {
+    "package": "horizon-world",
     "target": "test:it",
     "test": "world_io::benchmark_saving_into_a_full_region",
     "path": "crates/horizon-world/tests/it/world_io.rs",
