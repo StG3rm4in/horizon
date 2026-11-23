@@ -83,9 +83,9 @@ mod loot_tests;
 /// mutating the world. Each map is visited once, retaining its iteration order
 /// within each chunk (including repeated chunk coordinates in the input).
 /// An empty batch skips both maps; one chunk uses the direct filter path.
-pub fn chunks_with_block_entities<'a, N: std::hash::BuildHasher>(
+pub fn chunks_with_block_entities<'a, E: std::hash::BuildHasher, N: std::hash::BuildHasher>(
     chunks: impl IntoIterator<Item = &'a Arc<Chunk>>,
-    entities: &HashMap<(i32, i32, i32), crate::containers::BlockEntity>,
+    entities: &HashMap<(i32, i32, i32), crate::containers::BlockEntity, E>,
     names: &HashMap<(i32, i32, i32), Tag, N>,
 ) -> Vec<Chunk> {
     let chunks: Vec<_> = chunks.into_iter().collect();

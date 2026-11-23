@@ -1366,7 +1366,7 @@ impl ChunkEncoder {
                 .or_else(|| pot_tag(chunk, hidden.pos))
                 .map(|tag| (kind, tag));
         }
-        let entities = chunk.block_entities.iter().cloned().collect();
+        let entities: HashMap<_, _> = chunk.block_entities.iter().cloned().collect();
         let body = self
             .prepare_view(chunk, &entities, SectionMask::ALL, Some(&wires))
             .write();
@@ -1506,7 +1506,7 @@ impl ChunkEncoder {
     fn body(
         &self,
         chunk: &Chunk,
-        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity, impl std::hash::BuildHasher>,
         around: SectionMask,
     ) -> Vec<u8> {
         self.prepare(chunk, block_entities, around).write()
@@ -1516,7 +1516,7 @@ impl ChunkEncoder {
     fn prepare(
         &self,
         chunk: &Chunk,
-        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity, impl std::hash::BuildHasher>,
         around: SectionMask,
     ) -> Prepared {
         self.prepare_view(chunk, block_entities, around, None)
@@ -1525,7 +1525,7 @@ impl ChunkEncoder {
     fn prepare_view(
         &self,
         chunk: &Chunk,
-        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity, impl std::hash::BuildHasher>,
         around: SectionMask,
         view: Option<&TerrainWires>,
     ) -> Prepared {
@@ -1614,7 +1614,7 @@ impl ChunkEncoder {
     pub fn encode(
         &self,
         chunk: &Chunk,
-        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity, impl std::hash::BuildHasher>,
     ) -> LevelChunkWithLight {
         let mut packet = self.encode_blocks(chunk, block_entities);
         packet.light = self.light_data(chunk, SectionMask::ALL);
@@ -1625,7 +1625,7 @@ impl ChunkEncoder {
     fn encode_blocks(
         &self,
         chunk: &Chunk,
-        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity, impl std::hash::BuildHasher>,
     ) -> LevelChunkWithLight {
         let (wires, block_entities) = self.blocks(chunk, block_entities, None);
         LevelChunkWithLight {
@@ -1659,7 +1659,7 @@ impl ChunkEncoder {
     fn blocks(
         &self,
         chunk: &Chunk,
-        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity, impl std::hash::BuildHasher>,
         view: Option<&TerrainWires>,
     ) -> (Vec<Arc<[u8]>>, Vec<BlockEntityInfo>) {
         let mut wires = Vec::with_capacity(self.sections.len());
@@ -1688,7 +1688,7 @@ impl ChunkEncoder {
     fn chunk_entity_info(
         &self,
         chunk: &Chunk,
-        block_entities: &HashMap<(i32, i32, i32), BlockEntity>,
+        block_entities: &HashMap<(i32, i32, i32), BlockEntity, impl std::hash::BuildHasher>,
         section: usize,
         index: u16,
         state: u32,
@@ -2300,6 +2300,52 @@ mod tests {
         encoder.mod_update_tag = None;
         let infos = encoder.encode(&chunk, &block_entities).chunk.block_entities;
         assert_eq!(infos[0].tag, Tag::End);
+    }
+
+    /// The level's block entities (`BlockEntities`, whose map is Fx-hashed) give a column the
+    /// same packet as a `std` map holding the same ones: the encoder reads them by position.
+    #[test]
+    fn the_levels_block_entities_encode_as_a_std_map_of_the_same() {
+        use crate::block_entity_types::BlockEntityTypes;
+        let builtin = Builtin::parse(
+            r#"{"minecraft:block_entity_type":{"entries":{"test:machine":{"protocol_id":49}}}}"#,
+        )
+        .unwrap();
+        let types = BlockEntityTypes::new(
+            [("test:machine".into(), "test:machine".into())].into(),
+            builtin
+                .get("minecraft:block_entity_type")
+                .unwrap()
+                .names
+                .clone(),
+        );
+        let states = ["minecraft:air", "test:machine"].map(|n| (Arc::<str>::from(n), false, None));
+        let mut encoder = ChunkEncoder::with_types(states, &builtin, &[], &[], Some(&types));
+        encoder.mod_update_tag = Some(|pos, entity| {
+            let mut tag = entity.nbt.clone();
+            tag.insert("x".into(), Tag::Int(pos[0]));
+            Some(tag)
+        });
+        let mut chunk = Chunk::empty(0, 0);
+        let mut plain = HashMap::new();
+        let mut level = crate::block_entities::BlockEntities::default();
+        let at = [(1, 2, 3), (15, 40, 0), (0, 300, 15), (7, 7, 7), (4, 2, 3)];
+        for (i, (x, y, z)) in at.into_iter().enumerate() {
+            let pos = (x, MIN_Y + y, z);
+            chunk.set(pos.0, pos.1, pos.2, 1);
+            // A machine block without its block entity is left out by both.
+            if i == 3 {
+                continue;
+            }
+            let mut machine = ModBlockEntity::new("test:machine".into(), Default::default());
+            machine.nbt.insert("i".into(), Tag::Int(i as i32));
+            plain.insert(pos, BlockEntity::Mod(Box::new(machine.clone())));
+            level.insert(pos, BlockEntity::Mod(Box::new(machine)));
+        }
+        let bytes = |packet| play::Clientbound::LevelChunkWithLight(packet).encode();
+        let from_plain = encoder.encode(&chunk, &plain);
+        assert_eq!(from_plain.chunk.block_entities.len(), 4);
+        assert_eq!(bytes(encoder.encode(&chunk, &level)), bytes(from_plain));
     }
 
     /// A chunk leaves queued one-shot fields alone; a change's tag takes them, once.
