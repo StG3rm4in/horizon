@@ -2854,3 +2854,70 @@ impl OreGpu {
         }
     }
 }
+
+/// The kernels compile with NVRTC as the GPU stages compile them, on a machine without a GPU: NVRTC
+/// is a compiler library (`tools/gpu_worldgen.py` checks the kernels' results on a GPU). Without
+/// NVRTC the test says so and passes, unless `HORIZON_REQUIRE_NVRTC` is set, as the fork's CI sets it.
+#[cfg(all(test, feature = "cuda"))]
+mod nvrtc_tests {
+    use super::{CompileOptions, NVRTC_OPTIONS, compile_ptx_with_opts};
+    use horizon_core::density::TilingMode;
+    use horizon_core::density::graph::{DensityCompiler, DensityGraph, GraphBinary, GraphNode};
+    use horizon_core::geometry::Axis;
+
+    fn compile(name: &str, src: &str) {
+        let options = CompileOptions {
+            // The oldest architecture CUDA 13 still compiles for.
+            arch: Some("sm_75"),
+            options: NVRTC_OPTIONS.iter().map(|&o| o.into()).collect(),
+            ..Default::default()
+        };
+        if let Err(e) = compile_ptx_with_opts(src, options) {
+            panic!("{name} does not compile: {e:?}");
+        }
+    }
+
+    #[test]
+    fn the_kernels_compile_with_nvrtc() {
+        if super::nvrtc_version().is_none() {
+            assert!(
+                std::env::var_os("HORIZON_REQUIRE_NVRTC").is_none(),
+                "HORIZON_REQUIRE_NVRTC is set, but no NVRTC library was found"
+            );
+            eprintln!("no NVRTC library: the kernels' compilation is not checked");
+            return;
+        }
+        for (name, src) in [
+            ("caves.cu", include_str!("caves.cu")),
+            ("sections.cu", include_str!("sections.cu")),
+            ("ores.cu", include_str!("ores.cu")),
+            ("light.cu", include_str!("light.cu")),
+        ] {
+            compile(name, src);
+        }
+        // final_density's kernels, as codegen writes them, for a gradient along y times a constant.
+        let mut graph = DensityGraph::default();
+        let gradient = graph
+            .insert(GraphNode::Gradient {
+                axis: Axis::Y,
+                tiling: TilingMode::ClampToEdge,
+                from: -64,
+                to: 320,
+                low: 1.0,
+                high: -1.0,
+            })
+            .unwrap();
+        let factor = graph.insert(GraphNode::Constant(0.25)).unwrap();
+        let root = graph
+            .insert(GraphNode::Binary {
+                kind: GraphBinary::Multiply,
+                left: gradient,
+                right: factor,
+            })
+            .unwrap();
+        let program =
+            super::codegen::generate(&DensityCompiler::new(graph), root, 0, [16, 384, 16])
+                .expect("codegen writes the graph's CUDA");
+        compile("final_density", &program.src);
+    }
+}
