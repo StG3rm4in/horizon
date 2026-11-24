@@ -6,7 +6,7 @@ La génération du monde sur le GPU et un tick serveur accéléré, pour Horizon
 
 Ce dépôt est un fork d'[Horizon](https://github.com/horizon-rust/horizon), une réimplémentation en Rust de Minecraft: Java Edition 26.3 avec un client, un serveur et un lanceur. Le fork vise à préserver la génération du monde de vanilla et le comportement du tick en série en mode `exact`.
 
-1. **La génération du monde sur le GPU.** Dans l'Overworld, NVIDIA CUDA peut calculer la densité finale, les aquifères, le beardifier, les règles de surface, une partie de la génération des minerais, le creusement des grottes, la lumière des chunks générés, les sections compactes et les biomes multi-bruit. Le Nether prend aussi en charge sur GPU la densité, le creusement, les règles de surface et les biomes. L'End prend en charge la densité sur GPU. Dans ces deux dimensions, le sélecteur global de fluides remplace les aquifères actifs. Les biomes de l'End et les sections compactes du Nether restent sur le CPU. Voir les [notes sur le Nether et l'End](../crates/horizon-gpu/NETHER_END.md).
+1. **La génération du monde sur le GPU.** Dans l'Overworld, NVIDIA CUDA peut calculer la densité finale, les aquifères, le beardifier, les règles de surface, une partie de la génération des minerais, les cellules des géodes d'améthyste, le creusement des grottes, la lumière des chunks générés, les sections compactes et les biomes multi-bruit. Le Nether prend aussi en charge sur GPU la densité, le creusement, les règles de surface et les biomes. L'End prend en charge la densité sur GPU. Dans ces deux dimensions, le sélecteur global de fluides remplace les aquifères actifs. Les biomes de l'End et les sections compactes du Nether restent sur le CPU. Voir les [notes sur le Nether et l'End](../crates/horizon-gpu/NETHER_END.md).
 2. **Un tick du serveur dédié plus rapide.** Le fork mesure les performances avec 100 bots de charge et compare des builds d'Horizon tick par tick dans des scènes contrôlées.
 
 ## Résultats
@@ -68,6 +68,7 @@ Suivre le [README de l'amont](../README.md) pour l'installation. Le build du jeu
 | `HORIZON_GPU_SECTIONS` | `1` | Chemin de surface GPU (`HORIZON_GPU_SURFACE`) | Active les sections compactes sur GPU |
 | `HORIZON_GPU_CAVES` | `1` | `HORIZON_GPU_DENSITY` pour la matière des cellules creusées | Active le creusement pris en charge sur GPU (les masques peuvent tourner sans densité GPU) |
 | `HORIZON_GPU_ORES` | `1` | Moteur d'exécution CUDA | Active les travaux pris en charge sur les amas et filons souterrains de minerais sur GPU |
+| `HORIZON_GPU_GEODES` | `1`, `test` | Moteur d'exécution CUDA | Active le classement sur GPU des cellules des géodes d'améthyste (décoration `minecraft:amethyst_geode` seulement ; les autres géodes restent sur le CPU) ; `test` compare chaque cellule au CPU |
 | `HORIZON_GPU_LIGHT` | `1` | Moteur d'exécution CUDA | Active le calcul de lumière sur GPU pour les chunks nouvellement générés |
 | `HORIZON_GPU_BIOMES` | `1` | Moteur d'exécution CUDA | Active les biomes multi-bruit sur GPU pour les sources admissibles |
 | `HORIZON_GPU_LOCATE` | `1` | Moteur d'exécution CUDA | Active les recherches de biomes prises en charge sur GPU (dont `/locate biome`) |
