@@ -334,7 +334,10 @@ impl Islands<'_> {
             .map(|p| (p.uuid, p.position))
             .collect();
         horizon_client::spans::time("islands_plan", || {
-            let list = match reaches_why(mobs, snapshot, turns, &players) {
+            let reaches = horizon_client::spans::time("islands_plan_reach", || {
+                reaches_why(mobs, snapshot, turns, &players)
+            });
+            let list = match reaches {
                 Ok(list) => list,
                 Err(bad) => {
                     bad.verdict.record(&Census::default());
@@ -1333,6 +1336,115 @@ fn islands_why(
     islands_in_cells(reaches, lanes, census, INDEX_CELL)
 }
 
+const MIN_PARALLEL_COLUMNS: usize = 256;
+
+#[derive(Clone, Copy)]
+struct Column {
+    first: u32,
+    body: Aabb,
+    sense: Aabb,
+    claims: Option<Aabb>,
+    village_reads: Option<Aabb>,
+}
+
+fn scan_columns(
+    columns: &[Column],
+    bodies: &Cells,
+    claims: &Cells,
+    claiming: &[u32],
+    range: std::ops::Range<usize>,
+    budget: &mut usize,
+    mut join: impl FnMut(u32, u32),
+) -> std::result::Result<(), Verdict> {
+    // The column whose read last met each column: one whose bodies span several of the cells a
+    // read looks up is tested once, as a second test would find the same.
+    let mut met = vec![u32::MAX; columns.len()];
+    for c in range {
+        let col = &columns[c];
+        let c = c as u32;
+        bodies
+            .query(col.sense, budget, |j| {
+                if std::mem::replace(&mut met[j as usize], c) == c {
+                    return;
+                }
+                let other = &columns[j as usize];
+                if other.body.intersects(col.sense) {
+                    join(col.first, other.first);
+                }
+            })
+            .ok_or(Verdict::OverBudget)?;
+        if let Some(reads) = col.village_reads {
+            let mut meet = |j: u32| {
+                let other = &columns[j as usize];
+                if other.claims.is_some_and(|b| b.intersects(reads)) {
+                    join(col.first, other.first);
+                }
+            };
+            // A village read covers some hundred cells, and a level has few claiming columns:
+            // testing each of them finds the same ones for less.
+            if claiming.len() < Cells::count(reads, claims.size).ok_or(Verdict::OverBudget)? {
+                *budget = budget
+                    .checked_sub(claiming.len())
+                    .ok_or(Verdict::OverBudget)?;
+                claiming.iter().copied().for_each(&mut meet);
+            } else {
+                claims
+                    .query(reads, budget, &mut meet)
+                    .ok_or(Verdict::OverBudget)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn connect_columns(
+    columns: &[Column],
+    bodies: &Cells,
+    claims: &Cells,
+    claiming: &[u32],
+    sets: &mut Sets,
+    budget: &mut usize,
+    workers: usize,
+    min_range: usize,
+) -> std::result::Result<(), Verdict> {
+    if workers < 2 {
+        return scan_columns(columns, bodies, claims, claiming, 0..columns.len(), budget, |a, b| {
+            sets.join(a, b);
+        });
+    }
+
+    let size = columns.len().div_ceil(workers).max(min_range);
+    let ranges: Vec<_> = (0..columns.len())
+        .step_by(size)
+        .map(|lo| lo..(lo + size).min(columns.len()))
+        .collect();
+    let cap = *budget;
+    let parts = horizon_client::parallel::par_map_on(&ranges, 2, workers, |ranges, out| {
+        for range in ranges {
+            let mut left = cap;
+            let mut edges = Vec::new();
+            let result = scan_columns(
+                columns, bodies, claims, claiming, range.clone(), &mut left, |a, b| {
+                    if a != b {
+                        edges.push((a, b));
+                    }
+                },
+            );
+            out.push(result.map(|()| (cap - left, edges)));
+        }
+    });
+    // All charges are nonnegative. A range fits the serial prefix exactly
+    // when its total fits the remaining budget at the start of that range.
+    for part in parts {
+        let (spent, edges) = part?;
+        *budget = budget.checked_sub(spent).ok_or(Verdict::OverBudget)?;
+        for (a, b) in edges {
+            sets.join(a, b);
+        }
+    }
+    Ok(())
+}
+
 /// [`islands_why`], finding the boxes a column reads by cells of `index_cell` blocks: the size
 /// changes how many cells a query looks up and how many boxes it then tests, not which boxes meet,
 /// so the plan is the same at any size (only the budget a query spends differs).
@@ -1360,14 +1472,6 @@ fn islands_in_cells(
     // joins every column its mobs' reaches meet. A column holds the box around its mobs' bodies,
     // around their reads, around its villagers' points of interest and around the village reads of
     // the mobs that make them.
-    #[derive(Clone, Copy)]
-    struct Column {
-        first: u32,
-        body: Aabb,
-        sense: Aabb,
-        claims: Option<Aabb>,
-        village_reads: Option<Aabb>,
-    }
     let widen = |a: Option<Aabb>, b: Option<Aabb>| match (a, b) {
         (Some(a), Some(b)) => Some(union_box(a, b)),
         (a, b) => a.or(b),
@@ -1423,43 +1527,14 @@ fn islands_in_cells(
             claiming.push(c as u32);
         }
     }
-    // The column whose read last met each column: one whose bodies span several of the cells a
-    // read looks up is tested once, as a second test would find the same.
-    let mut met = vec![u32::MAX; columns.len()];
-    for (c, col) in columns.iter().enumerate() {
-        let c = c as u32;
-        bodies
-            .query(col.sense, &mut budget, |j| {
-                if std::mem::replace(&mut met[j as usize], c) == c {
-                    return;
-                }
-                let other = &columns[j as usize];
-                if other.body.intersects(col.sense) {
-                    sets.join(col.first, other.first);
-                }
-            })
-            .ok_or(Verdict::OverBudget)?;
-        if let Some(reads) = col.village_reads {
-            let mut meet = |j: u32| {
-                let other = &columns[j as usize];
-                if other.claims.is_some_and(|b| b.intersects(reads)) {
-                    sets.join(col.first, other.first);
-                }
-            };
-            // A village read covers some hundred cells, and a level has few claiming columns:
-            // testing each of them finds the same ones for less.
-            if claiming.len() < Cells::count(reads, index_cell).ok_or(Verdict::OverBudget)? {
-                budget = budget
-                    .checked_sub(claiming.len())
-                    .ok_or(Verdict::OverBudget)?;
-                claiming.iter().copied().for_each(&mut meet);
-            } else {
-                claims
-                    .query(reads, &mut budget, &mut meet)
-                    .ok_or(Verdict::OverBudget)?;
-            }
-        }
-    }
+    horizon_client::spans::time("islands_plan_spatial", || {
+        let workers = if columns.len() >= MIN_PARALLEL_COLUMNS && !defers() {
+            on_helpers(lanes)
+        } else {
+            1
+        };
+        connect_columns(&columns, &bodies, &claims, &claiming, &mut sets, &mut budget, workers, 1)
+    })?;
     let mut raids = FxHashMap::<i32, u32>::default();
     for (i, r) in reaches.iter().enumerate() {
         for id in &r.links {
@@ -2206,6 +2281,66 @@ mod tests {
             }
         }
         assert!(grouped * 4 > cases, "too few scenes split ({grouped} of {cases})");
+    }
+
+    #[test]
+    fn parallel_spatial_merges_ranges_and_matches_serial_budget() {
+        if horizon_client::parallel::helpers() < 2 {
+            eprintln!("skipping parallel spatial test: at least two tick helpers are required");
+            return;
+        }
+        const WORKERS: usize = 2;
+        const TEST_MIN_RANGE: usize = 4;
+        // Two four-column ranges. Bodies 3 and 4 meet across the split;
+        // column 0 also reads a claim from column 7 in the second range.
+        let columns: Vec<_> = [0.0, 20.0, 40.0, 60.0, 80.0, 1000.0, 2000.0, 175.0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let first = i as u32;
+                let reach = at(first, x, 0.0);
+                Column {
+                    first,
+                    body: reach.body,
+                    sense: reach.sense,
+                    claims: (i == 7).then(|| grow(reach.body, POI_CLAIM)),
+                    village_reads: (i == 0).then(|| grow(reach.body, VILLAGE_SENSE)),
+                }
+            })
+            .collect();
+        assert_eq!(columns.len(), WORKERS * TEST_MIN_RANGE);
+
+        let mut bodies = Cells::new(INDEX_CELL, columns.len());
+        let mut claims = Cells::new(INDEX_CELL, 0);
+        let mut claiming = Vec::new();
+        let mut budget = PLAN_BUDGET;
+        for col in &columns {
+            bodies.insert(col.first, col.body, &mut budget).unwrap();
+            if let Some(bounds) = col.claims {
+                claims.insert(col.first, bounds, &mut budget).unwrap();
+                claiming.push(col.first);
+            }
+        }
+        let run = |workers, mut left| {
+            let mut sets = Sets { parent: (0..columns.len() as u32).collect() };
+            connect_columns(
+                &columns, &bodies, &claims, &claiming, &mut sets, &mut left, workers,
+                TEST_MIN_RANGE,
+            )?;
+            let roots: Vec<_> = (0..columns.len() as u32).map(|i| sets.find(i)).collect();
+            Ok::<_, Verdict>((roots, left))
+        };
+
+        let serial = run(1, budget).unwrap();
+        assert_eq!(serial.0, vec![0, 0, 0, 0, 0, 5, 6, 0]);
+        assert_eq!(run(WORKERS, budget).unwrap(), serial);
+        let spent = budget - serial.1;
+        // The exact total fits, even though the first range spends more than half.
+        assert_eq!(run(WORKERS, spent), Ok((serial.0, 0)));
+        // Both ranges fit this cap individually, but their sum exceeds it.
+        assert_eq!(run(1, spent - 1), Err(Verdict::OverBudget));
+        assert_eq!(run(WORKERS, spent - 1), Err(Verdict::OverBudget));
+        assert_eq!(run(WORKERS, 0), Err(Verdict::OverBudget));
     }
 
     /// A mob with a one-block body at (x, z), reading 34 blocks around it (`MIN_SENSE` + `SLACK`).
