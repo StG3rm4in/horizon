@@ -4,110 +4,81 @@ La génération du monde sur le GPU et un tick serveur accéléré, pour Horizon
 
 [English](README.md)
 
-Ce dépôt est un fork d'[Horizon](https://github.com/horizon-rust/horizon), une réécriture complète en Rust de
-Minecraft: Java Edition 26.3 (client, serveur et lanceur), vérifiée contre le jeu vanilla. Le fork ajoute deux
-choses, avec la même règle que l'amont : **rien ne doit différer du vanilla**.
+Ce dépôt est un fork d'[Horizon](https://github.com/horizon-rust/horizon), une réimplémentation en Rust de Minecraft: Java Edition 26.3 avec un client, un serveur et un lanceur. Le fork vise à préserver la génération du monde de vanilla et le comportement du tick en série en mode `exact`.
 
-1. **La génération du monde sur le GPU.** La densité, les aquifères, le beardifier, les règles de surface, les
-   minerais, les grottes, la lumière, les sections et les biomes tournent sur un GPU NVIDIA (CUDA) dans
-   l'Overworld. Le Nether et l'End n'ont pas d'aquifères ; le GPU y fait la densité et les grottes, et dans le
-   Nether aussi les règles de surface et les biomes ; les biomes de l'End et les sections compactes du Nether
-   restent sur le CPU (`crates/horizon-gpu/NETHER_END.md`). Chaque chunk sort identique, bloc par bloc, au chemin
-   CPU, lui-même identique au vanilla.
-2. **Un tick du serveur dédié plus rapide à 100 joueurs.** Chaque optimisation garde le tick identique au bit
-   près au code d'avant, ce que vérifie un harnais tick par tick sur une scène fixe (voir plus bas).
+1. **La génération du monde sur le GPU.** Dans l'Overworld, NVIDIA CUDA peut calculer la densité finale, les aquifères, le beardifier, les règles de surface, une partie de la génération des minerais, le creusement des grottes, la lumière des chunks générés, les sections compactes et les biomes multi-bruit. Le Nether prend aussi en charge sur GPU la densité, le creusement, les règles de surface et les biomes. L'End prend en charge la densité sur GPU. Dans ces deux dimensions, le sélecteur global de fluides remplace les aquifères actifs. Les biomes de l'End et les sections compactes du Nether restent sur le CPU. Voir les [notes sur le Nether et l'End](../crates/horizon-gpu/NETHER_END.md).
+2. **Un tick du serveur dédié plus rapide.** Le fork mesure les performances avec 100 bots de charge et compare des builds d'Horizon tick par tick dans des scènes contrôlées.
 
 ## Résultats
 
-Mesurés sur une seule machine : un Intel i5-10600K (6 cœurs, 12 threads) à 4,9 GHz, 32 Go de mémoire en double
-canal, une NVIDIA RTX 3080.
+Le serveur de mesure est équipé d'un Intel i5-10600K (6 cœurs, 12 threads), de 32 Go de mémoire en double canal et d'une NVIDIA RTX 3080.
 
-### Génération du monde (`/pregen`, zones neuves)
+### Génération du monde (`/pregen`, serveurs neufs)
 
-| Dimension | CPU seul | CPU + GPU |
-|---|---|---|
-| Overworld | 853 chunks/s, 12,9 ms de CPU par chunk | **2 287 chunks/s (×2,7)**, 3,4 ms de CPU par chunk |
-| Nether | — | ×2,4 |
-| End | — | ×1,9 |
+La comparaison du 17 novembre 2026 utilise le même build du fork pour les passages CPU seul et CPU + GPU, avec deux répétitions.
 
-Ce qui limite maintenant, ce sont les 6 cœurs du CPU : le GPU travaille environ deux tiers du temps.
+| Dimension | CPU seul | CPU + GPU | Rapport de débit |
+|---|---:|---:|---:|
+| Overworld | 853 chunks/s, 12,92 ms CPU/chunk | **2 287 chunks/s, 3,37 ms CPU/chunk** | ×2,68 |
+| Nether | 1 340 chunks/s | 3 183 chunks/s | ×2,38 |
+| End | 3 586 chunks/s | 6 879 chunks/s | ×1,92 |
 
-### Tick du serveur, 100 joueurs (millisecondes par tick en moyenne ; 20 ticks par seconde demandent moins de 50 ms)
+Dans les passages GPU profilés sur l'Overworld, le débit est limité par les 6 cœurs physiques du CPU plutôt que par la saturation du GPU.
 
-| Build | ms par tick |
-|---|---|
-| Premier banc, 16/11/2026 | 241 (environ 4 ticks par seconde) |
-| Mode exact, build natif, 22/11/2026 | 55,0 |
-| **Mode exact, build PGO** | **44,2** |
-| **Mode exact, PGO, thread du tick épinglé sur un cœur** | **42,1** |
-| Îlots de mobs (option, non exact), PGO | 34,7 |
-| Îlots de mobs, PGO, épinglé | 33,5 |
+### Tick du serveur dédié, 100 bots
 
-Le banc, ce sont 100 bots qui volent dans un même monde, chacun chargeant sa propre zone ; chaque chiffre est la
-moyenne de passages faits dans l'ordre A B B A. La première ligne inclut aussi les progrès de l'amont depuis,
-que le fork intègre régulièrement.
+Chaque chiffre est la durée moyenne du tick sur un passage. À 20 ticks par seconde, le budget est de 50 ms par tick.
+
+| Build et mode | Date | Moyenne en ms par tick |
+|---|---|---:|
+| Référence historique | 16 nov. 2026 | 241 (~4 TPS) |
+| `gpu-worldgen` (`d46ac9ab1f`), natif, `exact` | 23 nov. 2026 | 42,6 / 42,9 |
+| Build du fork, PGO frais, `exact` | 24 nov. 2026 | **37,8 / 38,1** |
+
+Les mesures des 23 et 24 novembre utilisent 100 bots avec le comportement `mixed`, des comparaisons A–B–B–A et un CPU à 4,9 GHz pendant les passages chronométrés. Le gain depuis la référence initiale comprend à la fois des changements du fork et des fusions de l'amont.
 
 ## Comment l'exactitude est vérifiée
 
-- **Génération du monde :** les chunks générés sont comparés à ceux du serveur vanilla à la graine 12345
-  (785 chunks, 27 biomes, 74 sites de structures : 0 différence, sur le GPU comme sur le CPU), et une sonde compare
-  les chemins CPU et GPU dans les trois dimensions. Une seule graine est comparée au vanilla ; les étapes GPU ont
-  aussi des modes de test qui comparent chaque résultat à celui du CPU.
-- **Tick du serveur :** un harnais fait tourner deux scènes fixes, 600 ticks avec 100 joueurs simulés : celle
-  par défaut (des joueurs en créatif qui volent dans l'Overworld, de jour) et une scène de survie (la nuit, en
-  difficile, une arène de générateurs et de dangers, des mobs qui combattent les joueurs, des joueurs dans le
-  Nether et l'End). À chaque tick, il hache l'aléa du niveau et sa gaussienne, les écritures de blocs, les ticks
-  planifiés, le mouvement de chaque entité et ses champs lus tels quels (santé, absorption, temps de blessure et
-  de mort, feu, gel, air, effets, cible et joueur auquel elle est liée, orientations, coups…), l'aléa propre de
-  chaque entité, les compteurs, le NBT des block entities qui tickent, les données de chaque joueur, chaque
-  paquet envoyé à chaque joueur, chaque niveau qui tick et les chunks chargés (et tous les 50 ticks les blocs et
-  la lumière de chaque section). Deux builds doivent donner les mêmes lignes, en série et avec le tick parallèle
-  (`HORIZON_PARALLEL_TICK=exact`).
-
-  Cela montre qu'une optimisation ne change rien par rapport au build d'avant, sur ces scènes ; ce n'est pas une
-  comparaison avec le vanilla. Le harnais est dans chaque build du serveur, mais ne tourne qu'avec
-  `HORIZON_TICK_DIGEST` (que `tools/tick_digest.py` définit).
-- **Îlots de mobs :** `HORIZON_PARALLEL_TICK=verify` fait tourner les mobs à la fois en groupes et en série, et
-  compare les deux.
+- **Génération du monde.** `tools/test_chunk_generation_parity.py` compare des chunks échantillonnés à un oracle Java qui utilise le JAR du serveur vanilla. Le projet a relevé zéro différence sur les chemins CPU et GPU pour un échantillon de 785 chunks couvrant 27 biomes et 74 sites de structures, avec la graine 12345 et un site de régression dans le Nether. `tools/gpu_worldgen.py probe` compare les sorties CPU et GPU sur des zones échantillonnées dans les trois dimensions, et la densité fait aussi l'objet d'un autotest au démarrage en plus des modes de comparaison par étape. Ces contrôles vérifient les chunks et zones échantillonnés, et non une équivalence universelle avec vanilla ni la reproductibilité des mondes sauvegardés d'une exécution à l'autre. Voir le [guide des bancs et des vérifications](../crates/horizon-gpu/BENCHMARKS.md).
+- **Tick du serveur.** Le moteur du serveur dédié intègre un harnais d'empreintes (`tools/tick_digest.py`, piloté par `HORIZON_TICK_DIGEST`). Les passages de validation couvrent 600 ticks et 100 joueurs simulés sur deux scènes — vol en créatif de jour dans l'Overworld, et survie en difficulté élevée la nuit avec combats, générateurs, dangers et passages dans le Nether et l'End — avec des vérifications complètes des blocs et de la lumière des sections tous les 50 ticks. L'empreinte hache une sélection d'état des niveaux qui tickent et des entités suivies : état des générateurs aléatoires, écritures de blocs enregistrées, ticks planifiés de blocs et de fluides, chunks chargés, NBT normalisé des block entities, données de sauvegarde des joueurs suivis et paquets normalisés de la scène. **Il s'agit d'un contrôle de régression entre builds d'Horizon dans le même mode (série contre série, `exact` contre `exact`), pas d'une comparaison avec vanilla** ; la parité vanilla est vérifiée sur la génération du monde avec l'oracle Java ci-dessus.
 
 ## Ce qui a été optimisé
 
-- Les étapes GPU ci-dessus, avec un repli sur le CPU pour chaque étape et pour tout ce qu'une étape GPU ne
-  couvre pas.
-- La génération et la sauvegarde sur le CPU : les décorations, un écrivain NBT direct pour les chunks
-  sauvegardés, des palettes de sections stockées en ligne.
-- Le tick : des raccourcis à la manière de Lithium (un mob immobile sur un bloc plein, les contacts avec les
-  blocs par une table de bits, les block entities sans joueur à portée), des masques compacts pour les ticks
-  aléatoires, une apparition naturelle qui garde le travail par chunk et par passe, les corps des joueurs
-  partagés entre les tours, moins de recherches et d'allocations dans les chemins chauds.
-- Le build : l'optimisation guidée par un profil (PGO, environ −20 % en mode exact) et l'épinglage optionnel du
-  thread du tick sur un CPU (`HORIZON_TICK_CPU`).
-- Les îlots de mobs (branche `parallel-mobs`) : les mobs qui ne peuvent pas s'influencer sont tickés en groupes
-  sur des threads d'aide, et le résultat est vérifié égal à celui de la boucle en série.
+- Les étapes GPU de la génération passent par le CPU lorsque le moteur CUDA est indisponible ou lorsque le travail sort du domaine pris en charge. En dehors de la génération des chunks, le GPU peut aussi traiter des recherches de biomes et des rayons d'exposition aux explosions.
+- La génération et la sauvegarde sur CPU bénéficient de chemins accélérés pour les décorations, de l'écriture NBT directe des chunks et du stockage en ligne des petites listes d'identifiants des palettes.
+- Le tick utilise des chemins rapides pour les mobs immobiles sur des blocs pleins, les contacts avec les blocs et certains tests de proximité des block entities. Il utilise aussi des masques compacts pour les ticks aléatoires, réutilise des calculs au sein des passes d'apparition naturelle et partage les corps de collision des joueurs entre les tours des mobs, ce qui réduit les recherches et les allocations dans les chemins les plus sollicités.
+- Le build peut utiliser l'optimisation guidée par profil (PGO). Lors de la comparaison en mode `exact` du 24 novembre, la durée moyenne a baissé d'environ 12 % sur les passages appariés. Sous Linux, le thread du tick dédié peut aussi être épinglé.
 
 ## Branches
 
 | Branche | Contenu |
 |---|---|
-| `gpu-worldgen` (par défaut) | la génération sur GPU et les optimisations exactes du tick |
-| `parallel-mobs` | `gpu-worldgen` plus les îlots de mobs |
-| `main` | Horizon de l'amont, sans changement |
+| `gpu-worldgen` (par défaut) | La génération sur GPU et les optimisations du tick en mode `exact` |
+| `parallel-mobs` | Le code commun, avec les îlots de mobs et l'apparition naturelle en couloirs sur des threads auxiliaires en option |
+| `main` | Horizon de l'amont, suivi par avance rapide |
 
 ## Utilisation
 
-Compiler et lancer comme l'amont (voir le [README de l'amont](../README.md)). Les options du fork :
+Suivre le [README de l'amont](../README.md) pour l'installation. Le build du jeu active `cuda` par défaut ; pour un build du moteur dédié avec `--no-default-features`, ajouter `--features cuda` pour la prise en charge du GPU. Le pilote CUDA et NVRTC sont chargés à l'exécution.
 
-- `HORIZON_GPU_<ÉTAPE>=1` pour `DENSITY`, `SURFACE`, `ORES`, `CAVES`, `LIGHT`, `SECTIONS`, `BIOMES` : fait
-  tourner cette étape sur le GPU (CUDA). Le jeu se replie sur le CPU quand aucun GPU n'est disponible.
-- `HORIZON_PARALLEL_TICK=exact` : le tick parallèle, gardé exact.
-- `HORIZON_TICK_CPU=<cpu>` (Linux) : épingle le thread du tick du serveur dédié sur un CPU.
-- Îlots de mobs : un build de `parallel-mobs` avec la fonctionnalité `upstream-parallel-mob-islands`, et
-  `parallel_tick = true` dans `server.toml`.
+| Variable | Valeurs | Prérequis / Priorité | Effet |
+|---|---|---|---|
+| `HORIZON_GPU_DENSITY` | `1`, `wait` | Moteur d'exécution CUDA | Active la densité finale prise en charge sur GPU (avec aquifères et beardifier) ; `1` compile en arrière-plan avec repli CPU entre-temps, `wait` attend l'initialisation |
+| `HORIZON_GPU_SURFACE` | `1` | Remplissage GPU | Active les règles de surface prises en charge sur GPU |
+| `HORIZON_GPU_SECTIONS` | `1` | Chemin de surface GPU (`HORIZON_GPU_SURFACE`) | Active les sections compactes sur GPU |
+| `HORIZON_GPU_CAVES` | `1` | `HORIZON_GPU_DENSITY` pour la matière des cellules creusées | Active le creusement pris en charge sur GPU (les masques peuvent tourner sans densité GPU) |
+| `HORIZON_GPU_ORES` | `1` | Moteur d'exécution CUDA | Active les travaux pris en charge sur les amas et filons souterrains de minerais sur GPU |
+| `HORIZON_GPU_LIGHT` | `1` | Moteur d'exécution CUDA | Active le calcul de lumière sur GPU pour les chunks nouvellement générés |
+| `HORIZON_GPU_BIOMES` | `1` | Moteur d'exécution CUDA | Active les biomes multi-bruit sur GPU pour les sources admissibles |
+| `HORIZON_GPU_LOCATE` | `1` | Moteur d'exécution CUDA | Active les recherches de biomes prises en charge sur GPU (dont `/locate biome`) |
+| `HORIZON_GPU_TNT` | `1` | Moteur d'exécution CUDA | Laisse un modèle de coût choisir CUDA pour les rayons d'exposition aux explosions |
+| `HORIZON_PARALLEL_TICK` | `exact`, `0` | — | `exact` partage le travail compatible tout en conservant les flux aléatoires du chemin série ; `0` sélectionne le tick en série |
+| `HORIZON_TICK_CPU` | `<cpu>` | Serveur dédié Linux ; `HORIZON_SERVER_CORE=1` est prioritaire | Épingle le thread du tick dédié sur un cœur CPU |
+
+**Utiliser `parallel-mobs` :** La branche `parallel-mobs` ajoute en option les îlots de mobs et l'apparition naturelle en couloirs sur des threads auxiliaires. Compiler avec `horizon-client/upstream-parallel-mob-islands` (qui implique `upstream-parallel-mobs`) pour les deux, ou `horizon-client/upstream-parallel-mobs` pour les couloirs d'apparition seuls, et activer à l'exécution avec `HORIZON_PARALLEL_TICK=1`, `[engine] parallel_tick = true` dans `server.toml`, ou les réglages Parallel Tick en solo. Ces chemins peuvent utiliser des flux aléatoires par mob ou par chunk hors parité `exact` (et peuvent donc diverger des tirages du mode série et de vanilla) ; sur cette branche, `HORIZON_PARALLEL_TICK=verify` vérifie les ticks à plusieurs groupes admissibles face à une référence à un seul groupe avec graines rejouées.
 
 ## Notes
 
-- Licence : LGPL-3.0-or-later, comme l'amont. Aucun fichier du jeu Minecraft n'est inclus ; Horizon les prépare
-  à partir de votre propre exemplaire du jeu.
-- Ce n'est pas un produit officiel Minecraft, ni approuvé par Mojang ou Microsoft, ni associé à eux.
-- Le code du fork a été écrit avec Claude (Anthropic) sous la direction du propriétaire du dépôt, et chaque
-  changement est vérifié par les harnais ci-dessus avant d'être intégré.
+- Horizon et ce fork sont sous licence LGPL-3.0-or-later. Horizon prépare les ressources Minecraft à partir de votre propre exemplaire du jeu.
+- Ce dépôt est un fork communautaire non officiel.
+- Les notes du projet attribuent des contributions à des travaux menés avec Claude, Codex et Gemini sous la direction du propriétaire du dépôt.
