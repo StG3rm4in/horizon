@@ -629,6 +629,7 @@ impl Decoration {
         level_random: &mut dyn super::structure::legacy::PieceRandom,
         structures: Option<&super::generator_structures::StructureState>,
         ores: Option<&horizon_gpu::OreGpu>,
+        geodes: Option<&horizon_gpu::GeodeGpu>,
     ) -> Result<DecorateStats, GeneratorError> {
         let started = self.times.as_ref().map(|_| std::time::Instant::now());
         let center = region[4].position();
@@ -821,7 +822,18 @@ impl Decoration {
                         random,
                         origin,
                         id,
-                        |world, random, p| feature.feature.place(world, random, p, blocks),
+                        |world, random, p| {
+                            if let Some(gpu) = geodes
+                                && self.names[id.0 as usize] == "minecraft:amethyst_geode"
+                                && let FeatureDefinition::Geode(geode) = &*feature.feature
+                            {
+                                // Direct leaf. All composite and named structure paths still
+                                // execute through the regular feature evaluator.
+                                geode.place_with_gpu(world, random, p, Some(gpu))
+                            } else {
+                                feature.feature.place(world, random, p, blocks)
+                            }
+                        },
                     );
                     if placed.is_err() {
                         stats.failed += 1;

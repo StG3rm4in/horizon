@@ -403,6 +403,7 @@ struct Pipeline<R: RandomSource> {
     /// The cells of the ores' blobs on the GPU (HORIZON_GPU_ORES=1, or `test` to check them
     /// against the CPU's).
     ores_gpu: Option<horizon_gpu::OreGpu>,
+    geodes_gpu: Option<horizon_gpu::GeodeGpu>,
     /// The carvers' masks traced on the GPU, with the aquifer's substance of their cells
     /// (HORIZON_GPU_CAVES=1, or `test` to check both against the CPU's).
     caves_gpu: Option<horizon_gpu::CaveGpu>,
@@ -862,6 +863,36 @@ where
                 Err(e) => eprintln!("GPU surface S3: no GPU surface: {e}"),
             }
         }
+        let geodes_gpu = match std::env::var("HORIZON_GPU_GEODES").as_deref() {
+            Ok("1" | "test") if !data.geode_base_bundle => {
+                eprintln!("GPU geodes: worldgen overrides present; using CPU");
+                None
+            }
+            Ok(mode @ ("1" | "test")) if !settings.legacy => {
+                let canonical = data
+                    .placed_feature_json("minecraft:amethyst_geode")
+                    .and_then(|json| serde_json::from_str::<Value>(json).ok())
+                    .is_some_and(|placed| {
+                        matches!(
+                            placed["feature"].as_str(),
+                            Some("minecraft:amethyst_geode" | "amethyst_geode")
+                        )
+                    });
+                if canonical {
+                    match horizon_gpu::GeodeGpu::new(mode == "test") {
+                        Ok(gpu) => Some(gpu),
+                        Err(error) => {
+                            eprintln!("GPU geodes: using CPU: {error}");
+                            None
+                        }
+                    }
+                } else {
+                    eprintln!("GPU geodes: bundled amethyst_geode holder absent; using CPU");
+                    None
+                }
+            }
+            _ => None,
+        };
         let ores_gpu = match std::env::var("HORIZON_GPU_ORES").as_deref() {
             Ok("1" | "test") => match horizon_gpu::OreGpu::new() {
                 Ok(g) => Some(g),
@@ -980,6 +1011,7 @@ where
             surface_gpu,
             surface_inline,
             ores_gpu,
+            geodes_gpu,
             caves_gpu,
             caves_test,
             carver_plans: Mutex::new(HashMap::new()),
@@ -4070,6 +4102,7 @@ where
                     &mut random,
                     self.structures.as_ref(),
                     self.ores_gpu.as_ref(),
+                    self.geodes_gpu.as_ref(),
                 )
             }
             // A mod's level that asks for neither structures nor features has nothing to place.

@@ -99,6 +99,9 @@ impl OverworldGenerator {
             .filter(|(_, (hole, _))| **hole)
             .map(|(i, (_, &state))| (level_min_y + i as i32, state))
             .collect();
+        if pipeline.geodes_gpu.take().is_some() {
+            eprintln!("GPU geodes: flat chunk generator; using CPU");
+        }
         pipeline.flat = Some(FlatLayers {
             min_y: level_min_y,
             states,
