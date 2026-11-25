@@ -100,6 +100,11 @@ horizon-bots: load-test bots for a Minecraft Java Edition 26.3 server (offline m
                          ground (give them swords); for PvP benches (crit and sweep particles)
   --name PREFIX          bot names: PREFIX0, PREFIX1...; default Bot
   --brand B              the client brand sent in configuration (minecraft:brand); default none
+  --mirror-payloads      claim every payload the server declares (horizon:payloads), whatever the brand:
+                         asks for the server's manifest and offers it back, so that the bots join a server
+                         whose mods require payloads; the bots ignore those packets (modded load tests).
+                         With --brand horizon, also sends back the server's both-side mod list and
+                         content registry digest
   --far D                ask the server for far terrain out to D chunks, 1024 at most (horizon:lod, needs
                          --brand horizon and a server with horizon-lod-distance), as a Horizon client with
                          LOD Distance D does: one pass of its plan, nearest first; the report gives each
@@ -201,6 +206,8 @@ struct Options {
     name: String,
     /// The `minecraft:brand` to send, if any.
     brand: Option<String>,
+    /// --mirror-payloads: offer back the payload manifest the server declares.
+    mirror_payloads: bool,
     report: Option<String>,
     /// --capture: where the first bot's play packets go.
     capture: Option<String>,
@@ -243,6 +250,7 @@ fn options() -> Result<Options, String> {
         report: None,
         capture: None,
         brand: None,
+        mirror_payloads: false,
         timer: 1.0,
         far: 0,
         far_after: 3.0,
@@ -272,6 +280,10 @@ fn options() -> Result<Options, String> {
         }
         if arg == "--ground" {
             o.ground = true;
+            continue;
+        }
+        if arg == "--mirror-payloads" {
+            o.mirror_payloads = true;
             continue;
         }
         let value = args.next().ok_or(format!("{arg} needs a value"))?;
@@ -886,6 +898,10 @@ fn join(o: &Options, name: &str) -> Result<Connection, String> {
         )
         .map_err(err)?;
     }
+    // --mirror-payloads: from our Query until our mirrored Offer, the known-packs answer waits (the
+    // server checks the payloads at that barrier), then follows the Offer.
+    let mut awaiting_offer = false;
+    let mut held: Option<configuration::Serverbound> = None;
     loop {
         let (id, body) = c.recv().map_err(err)?;
         let reply = match id {
@@ -898,11 +914,31 @@ fn join(o: &Options, name: &str) -> Result<Connection, String> {
             | cb::DISCONNECT
             | cb::FINISH_CONFIGURATION => {
                 match configuration::Clientbound::decode(id, &body).map_err(err)? {
+                    // --mirror-payloads: the server's both-side mods and content registry identity,
+                    // sent back as ours.
+                    configuration::Clientbound::CustomPayload(p)
+                        if o.mirror_payloads
+                            && (p.channel == horizon_protocol::mod_list::CHANNEL
+                                || p.channel == CONTENT_IDENTITY_CHANNEL) =>
+                    {
+                        configuration::Serverbound::CustomPayload(p)
+                    }
                     configuration::Clientbound::CustomPayload(p) => {
-                        let Some(answer) = raw_protocol_answer(o.brand.as_deref(), &p)? else {
+                        let Some(answer) =
+                            raw_protocol_answer(o.brand.as_deref(), o.mirror_payloads, &p)?
+                        else {
                             continue;
                         };
+                        if o.mirror_payloads {
+                            use horizon_protocol::payload_negotiation::Control;
+                            awaiting_offer =
+                                matches!(Control::decode(&answer.data), Ok(Control::Query));
+                        }
                         configuration::Serverbound::CustomPayload(answer)
+                    }
+                    configuration::Clientbound::SelectKnownPacks(p) if awaiting_offer => {
+                        held = Some(configuration::Serverbound::SelectKnownPacks(p));
+                        continue;
                     }
                     configuration::Clientbound::SelectKnownPacks(p) => {
                         configuration::Serverbound::SelectKnownPacks(p)
@@ -935,25 +971,38 @@ fn join(o: &Options, name: &str) -> Result<Connection, String> {
             _ => continue,
         };
         c.send(&reply.encode()).map_err(err)?;
+        if !awaiting_offer && let Some(held) = held.take() {
+            c.send(&held.encode()).map_err(err)?;
+        }
     }
 }
 
-/// Only a bot claiming Horizon support answers the fork's raw-protocol Query.
+/// horizon-client's `content_identity::CHANNEL`: the server's registry digest, which a client with the
+/// same content mods answers with its own (equal) digest.
+const CONTENT_IDENTITY_CHANNEL: &str = "horizon:block_registry";
+
+/// Only a bot claiming Horizon support answers the fork's raw-protocol Query, with an empty Offer.
+/// With `mirror` (--mirror-payloads), whatever the brand, it answers the Query with a Query (the server
+/// then offers its manifest) and that Offer with the same manifest, so every declaration matches.
 fn raw_protocol_answer(
     brand: Option<&str>,
+    mirror: bool,
     payload: &configuration::CustomPayload,
 ) -> Result<Option<configuration::CustomPayload>, String> {
     use horizon_protocol::payload_negotiation::{CHANNEL, Control, Manifest};
-    if brand != Some("horizon") || payload.channel != CHANNEL {
+    if (brand != Some("horizon") && !mirror) || payload.channel != CHANNEL {
         return Ok(None);
     }
-    match Control::decode(&payload.data).map_err(err)? {
-        Control::Query => Ok(Some(configuration::CustomPayload {
-            channel: CHANNEL.into(),
-            data: Control::Offer(Manifest::default()).encode().map_err(err)?,
-        })),
-        Control::Offer(_) => Ok(None),
-    }
+    let answer = match Control::decode(&payload.data).map_err(err)? {
+        Control::Query if mirror => Control::Query,
+        Control::Query => Control::Offer(Manifest::default()),
+        Control::Offer(manifest) if mirror => Control::Offer(manifest),
+        Control::Offer(_) => return Ok(None),
+    };
+    Ok(Some(configuration::CustomPayload {
+        channel: CHANNEL.into(),
+        data: answer.encode().map_err(err)?,
+    }))
 }
 
 /// ChunkBatchSizeCalculator: the chunks per tick a vanilla client asks for, from how long its batches take
@@ -1726,25 +1775,29 @@ mod tests {
             channel: CHANNEL.into(),
             data: vec![0, 1],
         };
-        let answer = raw_protocol_answer(Some("horizon"), &payload)
+        let answer = raw_protocol_answer(Some("horizon"), false, &payload)
             .unwrap()
             .unwrap();
         assert_eq!(answer.channel, CHANNEL);
         assert_eq!(answer.data, [1, 1, 0]);
         for brand in [None, Some("vanilla")] {
-            assert!(raw_protocol_answer(brand, &payload).unwrap().is_none());
+            assert!(
+                raw_protocol_answer(brand, false, &payload)
+                    .unwrap()
+                    .is_none()
+            );
         }
         payload.data = vec![1, 1, 0];
         assert!(
-            raw_protocol_answer(Some("horizon"), &payload)
+            raw_protocol_answer(Some("horizon"), false, &payload)
                 .unwrap()
                 .is_none()
         );
         payload.data = vec![0, 2];
-        assert!(raw_protocol_answer(Some("horizon"), &payload).is_err());
+        assert!(raw_protocol_answer(Some("horizon"), false, &payload).is_err());
         payload.channel = "other:plugin".into();
         assert!(
-            raw_protocol_answer(Some("horizon"), &payload)
+            raw_protocol_answer(Some("horizon"), false, &payload)
                 .unwrap()
                 .is_none()
         );
