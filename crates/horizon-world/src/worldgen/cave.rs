@@ -18,8 +18,12 @@ use super::{
 use crate::registry::BlockStateId;
 use horizon_core::{
     geometry::Direction,
-    noise::{Noise, NormalNoise},
+    noise::{Noise, NoiseStack, NormalNoise},
     random::{LegacyRandom, RandomSource},
+};
+use horizon_gpu::{
+    GEODE_CRACK, GEODE_EMPTY, GEODE_FILL, GEODE_INNER, GEODE_MIDDLE, GEODE_OUTER, GEODE_SIDE,
+    GeodeGeometry, GeodeGpu,
 };
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -571,6 +575,16 @@ impl GeodeFeature {
         random: &mut R,
         origin: [i32; 3],
     ) -> TreeResult<bool, W::Error> {
+        self.place_with_gpu(world, random, origin, None)
+    }
+
+    pub(super) fn place_with_gpu<W: FeatureWorld + PlacementContext, R: RandomSource>(
+        &self,
+        world: &mut W,
+        random: &mut R,
+        origin: [i32; 3],
+        gpu: Option<&GeodeGpu>,
+    ) -> TreeResult<bool, W::Error> {
         let blocks = &*self.blocks;
         let cannot = |s: BlockStateId| self.cannot_replace.contains(&s);
         let num_points = self.distribution_points.sample(random)?;
@@ -621,47 +635,43 @@ impl GeodeFeature {
                 crack_points.push(tb::offset(origin, cx, y, cz));
             }
         }
-        let dist_sqr = |a: [i32; 3], b: [i32; 3]| -> f64 {
-            (0..3)
-                .map(|i| {
-                    let d = f64::from(a[i]) - f64::from(b[i]);
-                    d * d
-                })
-                .sum()
-        };
         let mut potential = Vec::new();
         let air_state = blocks
             .default_state("minecraft:air")
             .ok_or(FeatureExecutionError::InvalidState)?;
         let (lo, hi) = (self.min_gen_offset, self.max_gen_offset);
+        let shape = GeodeGeometry {
+            origin,
+            offsets: [lo, hi],
+            points: &points,
+            crack_points: &crack_points,
+            crack_offset: self.crack_point_offset,
+            multiplier: self.noise_multiplier,
+            thresholds: [inner_air, innermost, inner_crust, outer_crust, crack_size],
+        };
+        let classes = gpu.and_then(|gpu| {
+            let classes = gpu.classify(&shape, &noise)?;
+            if gpu.test && !check_geode_classes(gpu, &shape, &noise, classes.cells()) {
+                return None;
+            }
+            Some(classes)
+        });
+        let mut classes = classes.as_ref().map(|classes| classes.cells().iter());
         // BlockPos.betweenClosed iterates x fastest, then y, then z.
         for dz in lo..=hi {
             for dy in lo..=hi {
                 for dx in lo..=hi {
                     let p = tb::offset(origin, dx, dy, dz);
-                    let noise_offset =
-                        f64::from(noise.get3(f64::from(p[0]), f64::from(p[1]), f64::from(p[2])))
-                            * self.noise_multiplier;
-                    let mut shell = 0.0;
-                    for (point, offset) in &points {
-                        shell +=
-                            1.0 / (dist_sqr(p, *point) + f64::from(*offset)).sqrt() + noise_offset;
-                    }
-                    if shell < outer_crust {
-                        continue;
-                    }
-                    if shell >= inner_air {
+                    let class = match &mut classes {
+                        Some(cells) => *cells.next().expect("one class per geode cell"),
+                        None => geode_cell(&shape, &noise, p),
+                    };
+                    if class == GEODE_FILL {
                         let value = sample_state(&self.filling, world, random, p)?;
                         safe_set(world, p, value, cannot)?;
                         continue;
                     }
-                    let mut crack_sum = 0.0;
-                    for point in &crack_points {
-                        crack_sum += 1.0
-                            / (dist_sqr(p, *point) + f64::from(self.crack_point_offset)).sqrt()
-                            + noise_offset;
-                    }
-                    if crack && crack_sum >= crack_size {
+                    if class == GEODE_CRACK {
                         safe_set(world, p, air_state, cannot)?;
                         for direction in Direction::ALL {
                             let q = tb::relative(p, direction, 1);
@@ -672,7 +682,7 @@ impl GeodeFeature {
                                     .map_err(query)?;
                             }
                         }
-                    } else if shell >= innermost {
+                    } else if class == GEODE_INNER {
                         let alternate = f64::from(random.next_float()) < self.alternate_chance;
                         let provider = if alternate {
                             &self.alternate_inner
@@ -686,10 +696,10 @@ impl GeodeFeature {
                         {
                             potential.push(p);
                         }
-                    } else if shell >= inner_crust {
+                    } else if class == GEODE_MIDDLE {
                         let value = sample_state(&self.middle, world, random, p)?;
                         safe_set(world, p, value, cannot)?;
-                    } else if shell >= outer_crust {
+                    } else if class == GEODE_OUTER {
                         let value = sample_state(&self.outer, world, random, p)?;
                         safe_set(world, p, value, cannot)?;
                     }
@@ -725,6 +735,130 @@ impl GeodeFeature {
             }
         }
         Ok(true)
+    }
+}
+
+#[inline]
+fn geode_cell(shape: &GeodeGeometry<'_>, noise: &NoiseStack, p: [i32; 3]) -> u8 {
+    let [x, y, z] = p.map(f64::from);
+    let noise_offset = f64::from(noise.get3(x, y, z)) * shape.multiplier;
+    geode_cell_with_offset(shape, p, noise_offset)
+}
+
+#[inline]
+fn geode_cell_with_offset(shape: &GeodeGeometry<'_>, p: [i32; 3], noise_offset: f64) -> u8 {
+    let dist_sqr = |point: [i32; 3]| -> f64 {
+        (0..3)
+            .map(|i| {
+                let d = f64::from(p[i]) - f64::from(point[i]);
+                d * d
+            })
+            .sum()
+    };
+    let [inner_air, innermost, inner_crust, outer_crust, crack_size] = shape.thresholds;
+    let mut shell = 0.0;
+    for (point, offset) in shape.points {
+        shell += 1.0 / (dist_sqr(*point) + f64::from(*offset)).sqrt() + noise_offset;
+    }
+    if shell < outer_crust {
+        return GEODE_EMPTY;
+    }
+    if shell >= inner_air {
+        return GEODE_FILL;
+    }
+    let mut crack_sum = 0.0;
+    for point in shape.crack_points {
+        crack_sum += 1.0 / (dist_sqr(*point) + f64::from(shape.crack_offset)).sqrt() + noise_offset;
+    }
+    if !shape.crack_points.is_empty() && crack_sum >= crack_size {
+        GEODE_CRACK
+    } else if shell >= innermost {
+        GEODE_INNER
+    } else if shell >= inner_crust {
+        GEODE_MIDDLE
+    } else if shell >= outer_crust {
+        GEODE_OUTER
+    } else {
+        GEODE_EMPTY
+    }
+}
+
+fn check_geode_classes(
+    gpu: &GeodeGpu,
+    shape: &GeodeGeometry<'_>,
+    noise: &NoiseStack,
+    classes: &[u8],
+) -> bool {
+    let mut mismatches = 0;
+    for (i, &actual) in classes.iter().enumerate() {
+        let p = tb::offset(
+            shape.origin,
+            (i % GEODE_SIDE) as i32 + shape.offsets[0],
+            (i / GEODE_SIDE % GEODE_SIDE) as i32 + shape.offsets[0],
+            (i / (GEODE_SIDE * GEODE_SIDE)) as i32 + shape.offsets[0],
+        );
+        let expected = geode_cell(shape, noise, p);
+        if expected != actual {
+            if mismatches == 0 {
+                eprintln!(
+                    "GPU geodes: first mismatch at {p:?}, origin {:?}, CPU {expected}, GPU {actual}",
+                    shape.origin
+                );
+            }
+            mismatches += 1;
+        }
+    }
+    gpu.note_comparison(classes.len(), mismatches);
+    mismatches == 0
+}
+
+#[cfg(test)]
+mod geode_reference_tests {
+    use super::*;
+
+    #[test]
+    fn inclusive_thresholds_and_crack_priority() {
+        let p = [-10, -20, 30];
+        let mut shape = GeodeGeometry {
+            origin: p,
+            offsets: [-16, 16],
+            points: &[(p, 1)],
+            crack_points: &[p; 3],
+            crack_offset: 1,
+            multiplier: 0.05,
+            thresholds: [1.0, 1.0, 1.0, 1.0, 3.0],
+        };
+        assert_eq!(geode_cell_with_offset(&shape, p, 0.0), GEODE_FILL);
+        shape.thresholds[0] = 2.0;
+        assert_eq!(geode_cell_with_offset(&shape, p, 0.0), GEODE_CRACK);
+        shape.crack_points = &[];
+        assert_eq!(geode_cell_with_offset(&shape, p, 0.0), GEODE_INNER);
+        shape.thresholds[1] = 2.0;
+        assert_eq!(geode_cell_with_offset(&shape, p, 0.0), GEODE_MIDDLE);
+        shape.thresholds[2] = 2.0;
+        assert_eq!(geode_cell_with_offset(&shape, p, 0.0), GEODE_OUTER);
+        shape.thresholds[3] = 2.0;
+        assert_eq!(geode_cell_with_offset(&shape, p, 0.0), GEODE_EMPTY);
+    }
+
+    #[test]
+    fn noise_is_added_to_every_term_and_points_use_world_coordinates() {
+        let p = [-5, -10, 20];
+        let shape = GeodeGeometry {
+            origin: p,
+            offsets: [-16, 16],
+            points: &[(p, 1), (p, 1)],
+            crack_points: &[],
+            crack_offset: 2,
+            multiplier: 0.05,
+            thresholds: [2.25, 2.0, 1.5, 1.0, 1.0],
+        };
+        assert_eq!(geode_cell_with_offset(&shape, p, 0.125), GEODE_FILL);
+        assert_eq!(geode_cell_with_offset(&shape, p, 0.0), GEODE_INNER);
+        assert_eq!(
+            geode_cell_with_offset(&shape, [-5, -10, 24], 0.0),
+            GEODE_EMPTY
+        );
     }
 }
 

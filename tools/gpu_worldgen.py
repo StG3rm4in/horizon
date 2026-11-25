@@ -66,12 +66,15 @@ EXE = ".exe" if os.name == "nt" else ""
 # The switches of the GPU stages (crates/horizon-gpu/src/lib.rs); settings such as HORIZON_GPU_DEVICE,
 # HORIZON_GPU_MEMORY_MB or HORIZON_GPU_CACHE pass through untouched.
 STAGES = ["HORIZON_GPU_DENSITY", "HORIZON_GPU_SURFACE", "HORIZON_GPU_SURFACE_TEST", "HORIZON_GPU_ORES",
-          "HORIZON_GPU_CAVES", "HORIZON_GPU_LIGHT", "HORIZON_GPU_SECTIONS", "HORIZON_GPU_BIOMES"]
+          "HORIZON_GPU_CAVES", "HORIZON_GPU_LIGHT", "HORIZON_GPU_SECTIONS", "HORIZON_GPU_BIOMES",
+          "HORIZON_GPU_GEODES"]
 PROBE_GPU = {"HORIZON_GPU_DENSITY": "wait", "HORIZON_GPU_SURFACE": "1", "HORIZON_GPU_ORES": "1",
+             "HORIZON_GPU_GEODES": "1",
              "HORIZON_GPU_CAVES": "1", "HORIZON_GPU_SECTIONS": "1", "HORIZON_GPU_BIOMES": "1"}
 # The test modes: every stage compared with the CPU inside the probe, the surface too (its test mode
 # computes the GPU surface and compares it, block by block, with the CPU's)
 PROBE_TEST = {"HORIZON_GPU_DENSITY": "wait", "HORIZON_GPU_SURFACE_TEST": "1", "HORIZON_GPU_ORES": "test",
+              "HORIZON_GPU_GEODES": "test",
               "HORIZON_GPU_CAVES": "test", "HORIZON_GPU_BIOMES": "test"}
 # The compact sections are built from the GPU surface, which the surface's test mode does not keep: their
 # test mode gets a run of its own.
@@ -244,6 +247,17 @@ def probe(args, built=None):
             ok &= same and not problems
             notes += [f"   !! {mode}: {problem}" for problem in problems]
         lines += [f"== {dim} {zone}: {', '.join(cells)}", *notes]
+    # Geodes are rare and admission is terrain-dependent. Require coverage
+    # across the Overworld corpus, independently in GPU and comparison modes.
+    for mode in ("gpu", "test"):
+        logs = [f.read_text() for f in out.glob(f"overworld.*.{mode}.err")]
+        geode_lines = [line for log in logs for line in log.splitlines()
+                       if line.startswith("GPU geodes: ")]
+        pattern = (r"^GPU geodes: [1-9]\d* batches" if mode == "gpu"
+                   else r"\b[1-9]\d* cells checked")
+        if not any(re.search(pattern, line) for line in geode_lines):
+            ok = False
+            lines.append(f"   !! {mode}: no admitted geodes exercised CUDA in the Overworld corpus")
     stats = sorted({line.strip() for f in out.glob("*.gpu.err") for line in f.read_text().splitlines()
                     if line.startswith("GPU final_density: ")})
     lines.append(f"== probe: {len(runs)} runs in {time.time() - t:.0f} s, {args.jobs} at a time")

@@ -6,7 +6,7 @@ World generation on the GPU and a faster server tick, for Horizon.
 
 This is a fork of [Horizon](https://github.com/horizon-rust/horizon), a Rust reimplementation of Minecraft: Java Edition 26.3 with a client, server and launcher. The `parallel-mobs` branch adds opt-in mob islands and natural spawning on helper threads to the GPU generation and tick work on `gpu-worldgen`.
 
-1. **World generation on the GPU.** The Overworld can use NVIDIA CUDA for final density, aquifers, the beardifier, surface rules, ore work, carving, lighting for generated chunks, compact sections and multi-noise biomes. The Nether also supports GPU density, carving, surface rules and biomes. The End supports GPU density. Both dimensions use the global fluid picker in place of enabled aquifers. End biomes and Nether compact sections stay on the CPU. See the [Nether and End notes](../crates/horizon-gpu/NETHER_END.md).
+1. **World generation on the GPU.** The Overworld can use NVIDIA CUDA for final density, aquifers, the beardifier, surface rules, ore work, amethyst geode cells, carving, lighting for generated chunks, compact sections and multi-noise biomes. The Nether also supports GPU density, carving, surface rules and biomes. The End supports GPU density. Both dimensions use the global fluid picker in place of enabled aquifers. End biomes and Nether compact sections stay on the CPU. See the [Nether and End notes](../crates/horizon-gpu/NETHER_END.md).
 2. **A faster dedicated server tick.** `exact` shares eligible work while keeping the serial random streams. The optional islands mode can group eligible mobs and run natural spawning in lanes. These paths can use their own random streams, which can produce different draws from vanilla.
 
 ## Results
@@ -74,6 +74,7 @@ Follow the [upstream README](../README.md) for setup. The game build enables `cu
 | `HORIZON_GPU_SECTIONS` | `1` | GPU surface path (`HORIZON_GPU_SURFACE`) | Enables GPU compact sections |
 | `HORIZON_GPU_CAVES` | `1` | `HORIZON_GPU_DENSITY` for carved-cell substance | Enables supported GPU carving (carving masks can run without GPU density) |
 | `HORIZON_GPU_ORES` | `1` | CUDA runtime | Enables supported GPU ore-blob and underground ore-vein work |
+| `HORIZON_GPU_GEODES` | `1`, `test` | CUDA runtime | Enables GPU classification of amethyst geode cells (the `minecraft:amethyst_geode` decoration only; other geode features stay on the CPU); `test` compares every cell with the CPU |
 | `HORIZON_GPU_LIGHT` | `1` | CUDA runtime | Enables GPU lighting for newly generated chunks |
 | `HORIZON_GPU_BIOMES` | `1` | CUDA runtime | Enables GPU multi-noise biomes on eligible sources |
 | `HORIZON_GPU_LOCATE` | `1` | CUDA runtime | Enables supported GPU biome searches (including `/locate biome`) |

@@ -25,6 +25,8 @@ type RegistryCache = BTreeMap<&'static str, (OnceLock<Option<RegistryNames>>, Re
 /// Seed-independent generation resources, loaded once and shared by every
 /// generator. Biome identities are indices into the sorted biome registry.
 pub struct GeneratorData {
+    /// Geode offload requires the bundled worldgen registries and tags.
+    pub(super) geode_base_bundle: bool,
     pub(super) registry: &'static BlockRegistry,
     pub(super) states: GenBlockStates,
     pub(super) integers: BTreeSet<(String, String)>,
@@ -369,6 +371,7 @@ impl GeneratorData {
         };
         let behaviours = joined(behaviours);
         Ok(Arc::new(Self {
+            geode_base_bundle: ov.is_empty(),
             behaviours,
             structure_resources,
             structures,

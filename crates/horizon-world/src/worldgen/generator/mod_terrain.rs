@@ -142,6 +142,9 @@ where
                 )));
             }
         }
+        if self.geodes_gpu.take().is_some() {
+            eprintln!("GPU geodes: mod chunk generator; using CPU");
+        }
         self.mod_terrain = Some(terrain);
         Ok(self)
     }

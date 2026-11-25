@@ -1,5 +1,5 @@
 //! World generation on the GPU (CUDA), bit-identical to Horizon's CPU code: final_density and the
-//! aquifers (this module), the surface rules, ore veins, carvers (`caves`), light (`light`), the
+//! aquifers (this module), the surface rules, ore veins, geodes (`geodes`), carvers (`caves`), light (`light`), the
 //! sections' palettes and the multi-noise biomes (`biomes`).
 //!
 //! The GPU computes the final_density of a region of R x R chunks at once (8 x 8 by default) and
@@ -52,6 +52,7 @@ mod biomes;
 mod caves;
 mod codegen;
 mod exposure;
+mod geodes;
 mod light;
 mod locate;
 
@@ -65,6 +66,10 @@ use cuda_off as cuda;
 
 pub use biomes::{BiomeGpu, BiomeTree};
 pub use exposure::{ExposureGpu, RAY_HIT, RAY_MISS, RAY_OUTSIDE, RayCube, RayShapes};
+pub use geodes::{
+    GEODE_CRACK, GEODE_EMPTY, GEODE_FILL, GEODE_INNER, GEODE_MIDDLE, GEODE_OUTER, GEODE_SIDE,
+    GeodeClasses, GeodeGeometry, GeodeGpu,
+};
 pub use light::{LightGpu, LightInput, LightJob, LightSection};
 pub use locate::{LOCATE_BATCH, LocateGpu, LocateSamples};
 
@@ -2947,6 +2952,7 @@ mod nvrtc_tests {
             ("caves.cu", include_str!("caves.cu")),
             ("sections.cu", include_str!("sections.cu")),
             ("ores.cu", include_str!("ores.cu")),
+            ("geodes.cu", super::geodes::SOURCE),
             ("light.cu", include_str!("light.cu")),
         ] {
             compile(name, src);

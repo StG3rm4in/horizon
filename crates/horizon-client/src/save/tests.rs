@@ -2001,6 +2001,33 @@ fn region_files_kept_open_stay_under_vanillas_cache_size() {
     )
     .unwrap()
     .unwrap();
+    // A region whose write a failed sync left staged, held by no one, is
+    // not closed for room either: the next write finishes that commit.
+    let staged = super::cached_region(
+        &save.regions,
+        (-1, 0),
+        &save.region_path("region", -1, 0),
+        true,
+    )
+    .unwrap()
+    .unwrap();
+    staged
+        .lock()
+        .unwrap()
+        .write(
+            ChunkPos::new(-32, 0),
+            &horizon_world::region::ChunkRecord {
+                compression: horizon_world::compression::Compression::None,
+                compressed: vec![1; 10],
+                timestamp: 1,
+            },
+        )
+        .unwrap();
+    let staged = {
+        let weak = Arc::downgrade(&staged);
+        drop(staged);
+        weak
+    };
     for x in 1..=600 {
         super::cached_region(
             &save.regions,
@@ -2028,6 +2055,10 @@ fn region_files_kept_open_stay_under_vanillas_cache_size() {
         &cache.regions[&(0, 0)].0.clone().unwrap(),
         &held
     ));
+    let kept = cache.regions[&(-1, 0)].0.clone().unwrap();
+    assert!(std::ptr::eq(Arc::as_ptr(&kept), staged.as_ptr()));
+    assert!(kept.lock().unwrap().has_staged_changes());
+    drop(kept);
     drop(cache);
     // What was written to regions since closed reads back from the disk.
     let entity = |x: i32| Tag::compound([("x", Tag::Int(x))]);
@@ -5091,7 +5122,7 @@ fn direct_chunk_bytes_match_the_tree() {
                 None,
                 limits,
             )
-            .expect("limits without a node cap")
+            .expect("direct chunk writer")
             .unwrap();
             assert!(tree == direct, "lit {lit}, tables {}", tables.is_some());
             let direct_cached = super::encode_saved_bytes(
@@ -5104,7 +5135,7 @@ fn direct_chunk_bytes_match_the_tree() {
                 Some(&cache),
                 limits,
             )
-            .expect("limits without a node cap")
+            .expect("direct chunk writer")
             .unwrap();
             let tree_cached = super::nbt::write_named(
                 &super::encode_saved(
@@ -5124,6 +5155,66 @@ fn direct_chunk_bytes_match_the_tree() {
                 "cached, lit {lit}, tables {}",
                 tables.is_some()
             );
+            for (limited, reason) in [
+                (
+                    super::Limits {
+                        max_nodes: 0,
+                        ..limits
+                    },
+                    "node limit exceeded",
+                ),
+                (
+                    super::Limits {
+                        max_nodes: 64,
+                        ..limits
+                    },
+                    "node limit exceeded",
+                ),
+                (
+                    super::Limits {
+                        max_bytes: 8,
+                        ..limits
+                    },
+                    "byte limit exceeded",
+                ),
+                (
+                    super::Limits {
+                        max_depth: 2,
+                        ..limits
+                    },
+                    "depth limit exceeded",
+                ),
+            ] {
+                for budget in [None, Some(&cache)] {
+                    let tree_error = super::nbt::write_named(
+                        &super::encode_saved(
+                            &chunk,
+                            assets.registry,
+                            &biomes,
+                            tables,
+                            shape,
+                            None,
+                            budget,
+                        ),
+                        limited,
+                    )
+                    .unwrap_err();
+                    assert_eq!(tree_error.reason, reason);
+                    let direct_error = super::encode_saved_bytes(
+                        &chunk,
+                        assets.registry,
+                        &biomes,
+                        tables,
+                        shape,
+                        None,
+                        budget,
+                        limited,
+                    )
+                    .expect("direct chunk writer under tight limits")
+                    .unwrap_err();
+                    assert_eq!(direct_error, tree_error);
+                }
+            }
             assert!(
                 direct
                     .windows(missing_name.len())
