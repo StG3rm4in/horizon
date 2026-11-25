@@ -234,6 +234,14 @@ pub struct NamedTag {
     pub tag: Tag,
 }
 
+/// The most tags a saved file or a structure template may hold. An element can take one byte
+/// of the file (an empty compound in a list) and deflate to a thousandth of that, while its
+/// [`Tag`] takes 32 bytes: without a cap, a 1 MiB chunk asked for 32 GiB and the process
+/// aborted. A file with this many tags is over 100 MiB of NBT, past anything a world holds.
+pub const MAX_SAVED_NODES: usize = 1 << 25;
+/// Most list slots reserved before the elements are read.
+const LIST_PREALLOCATION: usize = 1 << 12;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_bytes: usize,
@@ -275,11 +283,11 @@ impl Limits {
     /// Chunks, entities, POI and the world's `.dat` files: vanilla reads and
     /// writes them with `NbtAccounter.unlimitedHeap()` (`NbtIo.read`), so a
     /// chunk past the default node cap (a few thousand full containers) still
-    /// loads. The byte cap stays as the only guard on the decompressed data.
+    /// loads. Past the byte cap, [`MAX_SAVED_NODES`] bounds what the tree takes in memory.
     pub fn saved() -> Self {
         Self {
             max_bytes: 1 << 30,
-            max_nodes: usize::MAX,
+            max_nodes: MAX_SAVED_NODES,
             max_depth: 512,
         }
     }
@@ -288,11 +296,11 @@ impl Limits {
     /// `NbtAccounter.unlimitedHeap()` (TemplateSource.readStructure), and
     /// mods ship templates past the default node cap (YUNG's Better Ocean
     /// Monuments' start piece, 115x64x126 blocks, holds millions of tags).
-    /// The byte cap stays as the only guard on the decompressed file.
+    /// [`MAX_SAVED_NODES`] is far past those and bounds the memory of the tree.
     pub fn templates() -> Self {
         Self {
             max_bytes: 1 << 28,
-            max_nodes: usize::MAX,
+            max_nodes: MAX_SAVED_NODES,
             max_depth: 512,
         }
     }
@@ -507,7 +515,10 @@ impl<'a> Reader<'a, '_> {
     fn list_payload(&mut self, depth: usize) -> Result<Tag, Error> {
         let (element_id, len) = self.list_header()?;
         self.charge(4 * len as u64)?;
-        let mut values = Vec::with_capacity(len);
+        // The declared length is only checked against the budget, so nested lists could each
+        // reserve all of it before reading an element: reserve a bounded share and let the
+        // vector grow with the elements actually read.
+        let mut values = Vec::with_capacity(len.min(LIST_PREALLOCATION));
         for _ in 0..len {
             let mut value = self.payload(element_id, depth + 1)?;
             if let Tag::Compound(map) = &mut value
@@ -1090,17 +1101,25 @@ fn write_named_parts(name: &JavaString, tag: &Tag, limits: Limits) -> Result<Vec
     Ok(out)
 }
 
-/// A file root written as [`write_named`] writes its tree, entry by entry: a caller writes large
-/// values (a chunk's sections) straight into the bytes instead of building their tags first. Every
-/// byte goes through the same [`Writer`] (modified UTF-8, an overlong string written empty, canonical
-/// NaN, the byte limit). What is written directly is not counted as nodes, so it exists only under
-/// limits without a node cap ([`Limits::saved`]).
+/// A file root written as [`write_named`] writes its tree, entry by entry.
+/// The caller supplies the depth of directly written containers and shares the
+/// byte and node budgets with the tree payloads.
 pub struct RootWriter {
     bytes: Vec<u8>,
     limits: Limits,
+    nodes: usize,
 }
+
+/// Disk payload bytes and the node charge measured by the tree writer.
+/// Depth validation applies at the recorded depth and under an equal or looser cap.
+pub struct CachedPayload {
+    bytes: Vec<u8>,
+    nodes: usize,
+    depth: usize,
+    max_depth: usize,
+}
+
 impl RootWriter {
-    /// The [`Writer`] over the root's bytes, under the root's limits.
     fn writer(&mut self) -> Writer<'_> {
         Writer {
             bytes: &mut self.bytes,
@@ -1108,73 +1127,118 @@ impl RootWriter {
             max_len: self.limits.max_bytes,
             max_nodes: self.limits.max_nodes,
             max_depth: self.limits.max_depth,
-            nodes: 1,
+            nodes: self.nodes,
             empty_long_strings: true,
             canonical_nan: true,
         }
     }
-    /// The root compound named `name`, whose entries follow; None under limits with a node cap.
-    pub fn compound(name: &JavaString, limits: Limits) -> Result<Option<Self>, Error> {
-        if limits.max_nodes != usize::MAX {
-            return Ok(None);
+
+    fn node(&mut self) -> Result<(), Error> {
+        if self.nodes >= self.limits.max_nodes {
+            return Err(self.writer().error("node limit exceeded"));
         }
+        self.nodes += 1;
+        Ok(())
+    }
+
+    fn check_depth(&mut self, depth: usize) -> Result<(), Error> {
+        if depth >= self.limits.max_depth {
+            return Err(self.writer().error("depth limit exceeded"));
+        }
+        Ok(())
+    }
+
+    /// The root compound named `name`, whose entries follow.
+    pub fn compound(name: &JavaString, limits: Limits) -> Result<Self, Error> {
         let mut root = Self {
             bytes: Vec::with_capacity(1 << 16),
             limits,
+            nodes: 0,
         };
-        let mut writer = root.writer();
-        writer.put(&[10])?;
-        writer.string(name)?;
-        Ok(Some(root))
+        root.named_java(10, name)?;
+        root.begin_compound(0)?;
+        Ok(root)
     }
-    /// An entry of the root: `tag` under `key`, as the root compound writes it.
+
+    /// Begin a compound payload after its name, if any.
+    pub fn begin_compound(&mut self, depth: usize) -> Result<(), Error> {
+        self.node()?;
+        self.check_depth(depth)
+    }
+
+    /// An entry of the root, in the root compound's key order.
     pub fn entry(&mut self, key: &JavaString, tag: &Tag) -> Result<(), Error> {
-        let mut writer = self.writer();
         if matches!(tag, Tag::End) {
-            return Err(writer.error("End cannot be a named value"));
+            return Err(self.writer().error("End cannot be a named value"));
         }
-        writer.put(&[tag.id()])?;
-        writer.string(key)?;
-        writer.payload(tag, 1)
+        self.named_java(tag.id(), key)?;
+        self.payload(tag, 1)
     }
-    /// The id and the name of a named value, its payload to follow.
+
+    /// A subtree written against the root's remaining budgets.
+    pub fn payload(&mut self, tag: &Tag, depth: usize) -> Result<(), Error> {
+        let mut writer = self.writer();
+        let result = writer.payload(tag, depth);
+        self.nodes = writer.nodes;
+        result
+    }
+
+    /// The id and name of a named value, whose payload follows.
     pub fn named(&mut self, id: u8, key: &str) -> Result<(), Error> {
         self.writer().put(&[id])?;
-        self.str(key)
+        self.string(key)
     }
+
     /// [`named`](Self::named) for a key held as a [`JavaString`].
     pub fn named_java(&mut self, id: u8, key: &JavaString) -> Result<(), Error> {
         let mut writer = self.writer();
         writer.put(&[id])?;
         writer.string(key)
     }
-    /// A string payload, as `Tag::String(s.into())` writes: ASCII without NUL at once, the rest
-    /// through the UTF-16 units.
-    pub fn str(&mut self, s: &str) -> Result<(), Error> {
+
+    fn string(&mut self, s: &str) -> Result<(), Error> {
         let bytes = s.as_bytes();
         let mut writer = self.writer();
-        if bytes.len() <= usize::from(u16::MAX) && bytes.iter().all(|&c| (1..=127).contains(&c)) {
+        // When only part of an ASCII string fits, Writer::string advances to
+        // the first byte that fails, just as it does for a tree payload.
+        if bytes.len() <= usize::from(u16::MAX)
+            && bytes.len() + 2 <= writer.max_len - writer.bytes.len()
+            && bytes.iter().all(|&c| (1..=127).contains(&c))
+        {
             writer.put(&(bytes.len() as u16).to_be_bytes())?;
             return writer.put(bytes);
         }
         writer.string(&JavaString::from(s))
     }
+
+    pub fn str(&mut self, value: &str) -> Result<(), Error> {
+        self.node()?;
+        self.string(value)
+    }
+
     pub fn byte(&mut self, value: i8) -> Result<(), Error> {
+        self.node()?;
         self.writer().put(&[value as u8])
     }
+
     pub fn int(&mut self, value: i32) -> Result<(), Error> {
+        self.node()?;
         self.writer().put(&value.to_be_bytes())
     }
+
     /// A `ByteArray` payload.
     pub fn byte_array(&mut self, values: &[u8]) -> Result<(), Error> {
+        self.node()?;
         let mut writer = self.writer();
         writer.count(values.len())?;
         writer.put(values)
     }
+
     /// A `LongArray` payload of `words`, as a `Tag::LongArray` holds them.
     pub fn long_array(&mut self, words: &[i64]) -> Result<(), Error> {
+        self.node()?;
         self.writer().count(words.len())?;
-        if words.len().saturating_mul(8) <= self.limits.max_bytes.saturating_sub(self.bytes.len()) {
+        if words.len().saturating_mul(8) <= self.limits.max_bytes - self.bytes.len() {
             self.bytes.reserve(words.len() * 8);
             for &word in words {
                 self.bytes.extend_from_slice(&word.to_be_bytes());
@@ -1187,66 +1251,74 @@ impl RootWriter {
         }
         Ok(())
     }
-    /// A list payload's header: the element id (0 for an empty list) and the count.
-    pub fn list(&mut self, id: u8, len: usize) -> Result<(), Error> {
+
+    /// Begin a list whose elements are known to be valid and non-End.
+    pub fn list(&mut self, id: u8, len: usize, depth: usize) -> Result<(), Error> {
+        self.node()?;
+        self.check_depth(depth)?;
         let mut writer = self.writer();
         writer.put(&[id])?;
         writer.count(len)
     }
-    /// Bytes [`payload_bytes`] made, as they are.
-    pub fn raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.writer().put(bytes)
+
+    /// Prepare a reusable subtree. A preparation failure is only a cache miss.
+    pub fn cache_payload(&self, tag: &Tag, depth: usize) -> Option<CachedPayload> {
+        let mut bytes = Vec::new();
+        let mut writer = Writer {
+            bytes: &mut bytes,
+            start: 0,
+            max_len: self.limits.max_bytes,
+            max_nodes: self.limits.max_nodes,
+            max_depth: self.limits.max_depth,
+            nodes: 0,
+            empty_long_strings: true,
+            canonical_nan: true,
+        };
+        writer.payload(tag, depth).ok()?;
+        let nodes = writer.nodes;
+        Some(CachedPayload {
+            bytes,
+            nodes,
+            depth,
+            max_depth: self.limits.max_depth,
+        })
     }
-    /// An element of a list that mixes types, wrapped as the writer wraps it: a one-entry compound
-    /// whose key is the empty string. `payload` is the element's payload.
-    pub fn wrapped(&mut self, id: u8, payload: &[u8]) -> Result<(), Error> {
-        let mut writer = self.writer();
-        writer.put(&[id])?;
-        writer.string(&JavaString::default())?;
-        writer.put(payload)?;
-        writer.put(&[0])
-    }
-    /// [`wrapped`](Self::wrapped) for a string element.
-    pub fn wrapped_str(&mut self, s: &str) -> Result<(), Error> {
+
+    /// Append a validated subtree when all of it fits. On a miss the caller
+    /// writes the live payload to get the tree writer's first failure and offset.
+    pub fn try_cached_payload(&mut self, payload: &CachedPayload, depth: usize) -> bool {
+        if depth != payload.depth
+            || self.limits.max_depth < payload.max_depth
+            || payload.nodes > self.limits.max_nodes - self.nodes
+            || payload.bytes.len() > self.limits.max_bytes - self.bytes.len()
         {
-            let mut writer = self.writer();
-            writer.put(&[8])?;
-            writer.string(&JavaString::default())?;
+            return false;
         }
-        self.str(s)?;
-        self.writer().put(&[0])
+        self.bytes.extend_from_slice(&payload.bytes);
+        self.nodes += payload.nodes;
+        true
     }
+
+    /// A string in a mixed list, in a synthetic compound at `depth`.
+    pub fn wrapped_str(&mut self, value: &str, depth: usize) -> Result<(), Error> {
+        // Writer::payload checks a synthetic wrapper's depth before its node.
+        self.check_depth(depth)?;
+        self.node()?;
+        self.named(8, "")?;
+        self.str(value)?;
+        self.end()
+    }
+
     /// The end of a compound payload.
     pub fn end(&mut self) -> Result<(), Error> {
         self.writer().put(&[0])
     }
+
     /// The root's end, and the bytes.
     pub fn finish(mut self) -> Result<Vec<u8>, Error> {
-        self.writer().put(&[0])?;
+        self.end()?;
         Ok(self.bytes)
     }
-}
-/// The payload of `tag` as a file root writes it, for a value [`RootWriter::raw`] writes again and
-/// again (a block state of a palette).
-pub fn payload_bytes(tag: &Tag, limits: Limits) -> Result<Vec<u8>, Error> {
-    let mut bytes = Vec::new();
-    Writer {
-        bytes: &mut bytes,
-        start: 0,
-        max_len: limits.max_bytes,
-        max_nodes: limits.max_nodes,
-        max_depth: limits.max_depth,
-        nodes: 0,
-        empty_long_strings: true,
-        canonical_nan: true,
-    }
-    .payload(tag, 2)?;
-    Ok(bytes)
-}
-/// Whether a list that mixes types wraps `tag` even though it is a compound: one whose only key is
-/// the empty string, which reading would take for a wrapper.
-pub fn wrapped_in_mixed_list(tag: &Tag) -> bool {
-    matches!(tag, Tag::Compound(c) if c.len() == 1 && c.contains_key(&JavaString::default()))
 }
 
 pub fn write_network(tag: &Tag, limits: Limits) -> Result<Vec<u8>, Error> {
@@ -1678,6 +1750,21 @@ mod tests {
         let bytes = write_named(&root, Limits::templates()).unwrap();
         assert!(read_named(&bytes, Limits::default()).is_err());
         assert_eq!(read_named(&bytes, Limits::templates()).unwrap().0, root);
+    }
+    #[test]
+    fn a_saved_list_of_more_tags_than_the_cap_is_refused() {
+        // `{a: [{}, {}, ...]}`: each empty compound is one byte of the file.
+        let bytes = |count: usize| {
+            let mut bytes = vec![10, 0, 0, 9, 0, 1, b'a', 10];
+            bytes.extend_from_slice(&(count as u32).to_be_bytes());
+            bytes.resize(bytes.len() + count + 1, 0);
+            bytes
+        };
+        for limits in [Limits::saved(), Limits::templates()] {
+            let error = read_named(&bytes(MAX_SAVED_NODES), limits).unwrap_err();
+            assert_eq!(error.reason, "node limit exceeded");
+        }
+        assert!(read_named(&bytes(1_000_001), Limits::saved()).is_ok());
     }
     #[test]
     fn depth_boundary_and_every_truncated_prefix() {

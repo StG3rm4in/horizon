@@ -193,7 +193,9 @@ impl OreFeature {
         let blob = self.blob(random, origin)?;
         let found = column_under(world, blob.start, blob.size_xz)?;
         if found {
-            self.spheres(random, &blob, spheres);
+            let start = spheres.len();
+            spheres.resize(start + self.size as usize, [0f64; 4]);
+            self.spheres(random, &blob, &mut spheres[start..]);
         }
         Ok(OreAttempt {
             start: blob.start,
@@ -324,12 +326,12 @@ impl OreFeature {
         })
     }
     /// `do_place`'s spheres `[x, y, z, r]` before pruning, one `next_double` each.
-    fn spheres(&self, random: &mut impl RandomSource, blob: &Blob, data: &mut Vec<[f64; 4]>) {
+    fn spheres(&self, random: &mut impl RandomSource, blob: &Blob, data: &mut [[f64; 4]]) {
         // The blob's ends, needed only once a column under it is found
         // (most attempts high in To The Max's tall range find none).
         let [x0, x1, z0, z1] = blob.ends();
         let [y0, y1] = blob.y;
-        for i in 0..self.size as usize {
+        for (i, entry) in data.iter_mut().enumerate() {
             let step = i as f32 / self.size as f32;
             let step64 = f64::from(step);
             let xx = x0 + step64 * (x1 - x0);
@@ -338,7 +340,7 @@ impl OreFeature {
             let ss = random.next_double() * f64::from(self.size) / 16.0;
             let sine = horizon_core::geometry::trig::sin(f64::from(std::f32::consts::PI * step));
             let r = (f64::from(sine + 1.0) * ss + 1.0) / 2.0;
-            data.push([xx, yy, zz, r]);
+            *entry = [xx, yy, zz, r];
         }
     }
     fn do_place<W: FeatureWorld + PlacementContext>(
@@ -347,17 +349,34 @@ impl OreFeature {
         random: &mut impl RandomSource,
         blob: &Blob,
     ) -> Result<bool, FeatureExecutionError<W::Error>> {
-        let mut data = Vec::with_capacity(self.size as usize);
-        self.spheres(random, blob, &mut data);
-        prune_spheres(&mut data);
+        let size = self.size as usize;
+        // Vanilla ore sizes are <= 64 and their bitsets fit in <= 64 words.
+        let mut data_stack = [[0f64; 4]; 64];
+        let mut data_heap = Vec::new();
+        let data: &mut [[f64; 4]] = if size <= data_stack.len() {
+            &mut data_stack[..size]
+        } else {
+            data_heap.resize(size, [0f64; 4]);
+            &mut data_heap
+        };
+        self.spheres(random, blob, data);
+        prune_spheres(data);
         let [x_start, y_start, z_start] = blob.start;
         let (size_xz, size_y) = (blob.size_xz, blob.size_y);
         let tested_len = (size_xz as usize) * (size_y as usize) * (size_xz as usize);
-        let mut tested = vec![0u64; tested_len.div_ceil(64)];
+        let tested_words = tested_len.div_ceil(64);
+        let mut tested_stack = [0u64; 64];
+        let mut tested_heap = Vec::new();
+        let tested: &mut [u64] = if tested_words <= tested_stack.len() {
+            &mut tested_stack[..tested_words]
+        } else {
+            tested_heap.resize(tested_words, 0u64);
+            &mut tested_heap
+        };
         let mut placed = 0;
         let mut matches = TargetMemo::default();
         let mut squares = SphereSquares::default();
-        for sphere in data {
+        for &sphere in &*data {
             if sphere[3] < 0.0 {
                 continue;
             }

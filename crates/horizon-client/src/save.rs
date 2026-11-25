@@ -1469,11 +1469,11 @@ fn put_calculated_blending(root: &mut NamedTag, data: &BlendingData) {
 /// [`encode_saved`]'s bytes as `nbt::write_named` writes its tree, without the tags of its largest
 /// parts. The root's other entries go through the tree writer, in the root's key order; the sections
 /// ([`write_sections`]) and the scheduled ticks ([`write_ticks`]) are written as they are read from
-/// the chunk, in the order their compounds would sort them. None under limits with a node cap, which
-/// only the tree writer counts. The palettes go through `palette_cache` as [`encode_saved`]'s do.
+/// the chunk, in the order their compounds would sort them and under the same limits.
+/// The palettes go through `palette_cache` as [`encode_saved`]'s do.
 fn encode_saved_bytes(
     chunk: &Chunk,
-    registry: &BlockRegistry,
+    registry: &'static BlockRegistry,
     biomes: &Biomes,
     tables: Option<&SaveTables>,
     shape: LevelShape,
@@ -1489,8 +1489,7 @@ fn encode_saved_bytes(
         return None;
     };
     let mut out = match nbt::RootWriter::compound(&root.name, limits) {
-        Ok(Some(out)) => out,
-        Ok(None) => return None,
+        Ok(out) => out,
         Err(e) => return Some(Err(e)),
     };
     let extras = chunk.saved.as_deref();
@@ -1509,7 +1508,6 @@ fn encode_saved_bytes(
                     tables,
                     shape,
                     palette_cache,
-                    limits,
                 )?;
             } else if let Some(t) = tables
                 && is_key(key, "block_ticks")
@@ -1549,12 +1547,11 @@ fn fluid_str(kind: u32) -> Option<&'static str> {
 fn write_sections(
     out: &mut nbt::RootWriter,
     chunk: &Chunk,
-    registry: &BlockRegistry,
+    registry: &'static BlockRegistry,
     biomes: &Biomes,
     tables: Option<&SaveTables>,
     shape: LevelShape,
     palette_cache: Option<&Arc<SavedPaletteBudget>>,
-    limits: Limits,
 ) -> std::result::Result<(), nbt::Error> {
     let sky_light = shape.sky_light;
     let top_sky = chunk
@@ -1564,8 +1561,9 @@ fn write_sections(
     let written: Vec<usize> = (0..chunk.sections.len())
         .filter(|&si| shape.has_section((chunk.min_y() >> 4) + si as i32))
         .collect();
-    out.list(if written.is_empty() { 0 } else { 10 }, written.len())?;
+    out.list(if written.is_empty() { 0 } else { 10 }, written.len(), 1)?;
     for si in written {
+        out.begin_compound(2)?;
         let section = &chunk.sections[si];
         let y = (chunk.min_y() >> 4) + si as i32;
         if chunk.lit {
@@ -1585,44 +1583,44 @@ fn write_sections(
         let (states, states_data) = section.blocks.pack_saved(palette_cache);
         let (biome_palette, biome_data) = section.biomes.pack_saved(palette_cache);
         out.named(10, "biomes")?;
+        out.begin_compound(3)?;
         if let Some(data) = &biome_data {
             out.named(12, "data")?;
             out.long_array(data)?;
         }
         out.named(9, "palette")?;
         let n = biome_palette.len();
-        out.list(if n == 0 { 0 } else { 8 }, n)?;
+        out.list(if n == 0 { 0 } else { 8 }, n, 4)?;
         for &b in biome_palette.iter() {
             out.str(&biomes.saved_name(b as u16))?;
         }
         out.end()?;
         out.named(10, "block_states")?;
+        out.begin_compound(3)?;
         if let Some(data) = &states_data {
             out.named(12, "data")?;
             out.long_array(data)?;
         }
         out.named(9, "palette")?;
-        write_state_palette(out, &states, registry, tables, limits)?;
+        write_state_palette(out, &states, registry, tables)?;
         out.end()?;
         out.end()?;
     }
     Ok(())
 }
 thread_local! {
-    /// Per block state that a palette writes as its compound (not a default state): the tag's id,
-    /// whether a mixed list wraps it anyway, and its payload, for the registry at the address kept.
-    static STATE_PAYLOADS: std::cell::RefCell<(usize, HashMap<u32, (u8, bool, Vec<u8>)>)> =
+    /// Per-state disk payloads for the static registry at the stored address.
+    static STATE_PAYLOADS: std::cell::RefCell<(usize, HashMap<u32, nbt::CachedPayload>)> =
         Default::default();
 }
-/// A section's block state palette as [`encode_with`] builds it: the name of a default state (or of
-/// air for an unknown id), the compound of any other, in a list that wraps its strings in one-entry
-/// compounds when it mixes the two, as the tree writer does.
+
+/// A section's block state palette as [`encode_with`] builds it. `BlockState::to_nbt`
+/// yields a compound with an `id` key, so only strings need wrappers in a mixed list.
 fn write_state_palette(
     out: &mut nbt::RootWriter,
     palette: &[u32],
-    registry: &BlockRegistry,
+    registry: &'static BlockRegistry,
     tables: Option<&SaveTables>,
-    limits: Limits,
 ) -> std::result::Result<(), nbt::Error> {
     enum Entry<'a> {
         Name(&'a str),
@@ -1638,44 +1636,45 @@ fn write_state_palette(
             None => Entry::Name("minecraft:air"),
         })
         .collect();
+    let list_id = if entries.is_empty() {
+        0
+    } else if entries.iter().any(|entry| matches!(entry, Entry::State(_))) {
+        10
+    } else {
+        8
+    };
+    out.list(list_id, entries.len(), 4)?;
     STATE_PAYLOADS.with_borrow_mut(|(owner, cache)| {
         let address = registry as *const BlockRegistry as usize;
         if *owner != address || cache.len() > 1 << 16 {
             cache.clear();
             *owner = address;
         }
-        for entry in &entries {
-            if let Entry::State(id) = entry
-                && !cache.contains_key(id)
-                && let Some(state) = registry.state(BlockStateId(*id))
-            {
-                let tag = state.to_nbt();
-                let payload = nbt::payload_bytes(&tag, limits)?;
-                cache.insert(*id, (tag.id(), nbt::wrapped_in_mixed_list(&tag), payload));
-            }
-        }
-        let id_of = |entry: &Entry| match entry {
-            Entry::Name(_) => 8,
-            Entry::State(id) => cache[id].0,
-        };
-        let first = entries.first().map_or(0, id_of);
-        let list = if entries.iter().any(|e| id_of(e) != first) {
-            10
-        } else {
-            first
-        };
-        out.list(list, entries.len())?;
-        for entry in &entries {
+        for entry in entries {
             match entry {
-                Entry::Name(name) if list == 10 => out.wrapped_str(name)?,
+                Entry::Name(name) if list_id == 10 => out.wrapped_str(name, 5)?,
                 Entry::Name(name) => out.str(name)?,
                 Entry::State(id) => {
-                    let (tag_id, wrapper, payload) = &cache[id];
-                    if list == 10 && (*tag_id != 10 || *wrapper) {
-                        out.wrapped(*tag_id, payload)?;
-                    } else {
-                        out.raw(payload)?;
+                    if cache
+                        .get(&id)
+                        .is_some_and(|payload| out.try_cached_payload(payload, 5))
+                    {
+                        continue;
                     }
+                    let tag = registry
+                        .state(BlockStateId(id))
+                        .expect("known palette state")
+                        .to_nbt();
+                    if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(id)
+                        && let Some(payload) = out.cache_payload(&tag, 5)
+                    {
+                        let written = out.try_cached_payload(&payload, 5);
+                        slot.insert(payload);
+                        if written {
+                            continue;
+                        }
+                    }
+                    out.payload(&tag, 5)?;
                 }
             }
         }
@@ -1689,11 +1688,12 @@ fn write_ticks<'a>(
     name: impl Fn(u32) -> Option<&'a str>,
 ) -> std::result::Result<(), nbt::Error> {
     let count = ticks.iter().filter(|t| name(t.kind.0).is_some()).count();
-    out.list(if count == 0 { 0 } else { 10 }, count)?;
+    out.list(if count == 0 { 0 } else { 10 }, count, 1)?;
     for t in ticks {
         let Some(id) = name(t.kind.0) else {
             continue;
         };
+        out.begin_compound(2)?;
         out.named(8, "i")?;
         out.str(id)?;
         out.named(3, "p")?;
@@ -2427,13 +2427,21 @@ impl RegionFiles {
     /// Close the least recently used regions until there is room for one
     /// more, as `RegionFileStorage.getRegionFile` does. A region a reader or
     /// the writer still holds stays: closing it under them would let a
-    /// second handle read a header older than its sectors.
+    /// second handle read a header older than its sectors. So does one with
+    /// changes a failed sync left staged: opened again, it would take the
+    /// header in the file, maybe not the one on the disk, and reuse sectors
+    /// that header on the disk still names.
     fn make_room(&mut self) {
         while self.regions.len() >= MAX_OPEN_REGIONS {
             let oldest = self
                 .regions
                 .iter()
-                .filter(|(_, (r, _))| r.as_ref().is_none_or(|r| Arc::strong_count(r) == 1))
+                .filter(|(_, (r, _))| {
+                    r.as_ref().is_none_or(|r| {
+                        Arc::strong_count(r) == 1
+                            && r.try_lock().is_ok_and(|r| !r.has_staged_changes())
+                    })
+                })
                 .min_by_key(|(_, (_, used))| *used)
                 .map(|(key, _)| *key);
             let Some(key) = oldest else {
@@ -2463,9 +2471,8 @@ fn cached_region(
         return Ok(cached.clone());
     }
     cache.make_room();
-    if create && let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    // `open_writable` makes the missing folders, and the region's first
+    // sync makes their names durable with the file's.
     // A file this process can't write (a read-only world) is still read.
     let region = match RegionFile::open_writable(path, create) {
         Err(e) if !create && e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -2524,7 +2531,10 @@ fn write_region_records(
                 None => changed |= region.clear(*pos, timestamp)?,
             }
         }
-        if changed {
+        // A clear retried after a failed sync changes nothing: the header in
+        // memory has the chunk gone already, but only a sync puts it on the
+        // disk.
+        if changed || region.has_staged_changes() {
             region.sync()?;
         }
     }
@@ -2654,7 +2664,13 @@ impl Record {
             if mode == NbtMode::Test {
                 let reference = tree(self);
                 let n = NBT_TESTS.fetch_add(1, Ordering::Relaxed) + 1;
-                let same = matches!((&direct, &reference), (Ok(a), Some(Ok(b))) if a == b);
+                let same = match (&direct, &reference) {
+                    (Ok(a), Some(Ok(b))) => a == b,
+                    (Err(a), Some(Err(b))) => {
+                        a.kind() == b.kind() && a.to_string() == b.to_string()
+                    }
+                    _ => false,
+                };
                 if !same {
                     let m = NBT_MISMATCHES.fetch_add(1, Ordering::Relaxed) + 1;
                     if m <= 8 {
