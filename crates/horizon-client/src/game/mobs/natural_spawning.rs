@@ -501,6 +501,11 @@ const PLAYERS_SCANNED: usize = 8;
 /// What a level reads of the game beyond its world view, for the serial pass (`&Game`, which also
 /// answers the server mods) and for a lane of the parallel one ([`NoGame`]).
 pub(super) trait LevelHost: Sized {
+    /// Whether this host can dispatch the spawn-list callback.
+    fn potential_spawns_listened() -> bool {
+        false
+    }
+
     /// The game's mobs, scanned for a box query before the grid is built.
     fn mobs(&self) -> &[Mob];
     fn potential_spawns(&self, category: Category, pos: [i32; 3], entries: &mut Vec<SpawnEntry>);
@@ -526,6 +531,10 @@ pub(super) trait LevelHost: Sized {
     }
 }
 impl LevelHost for &Game<'_> {
+    fn potential_spawns_listened() -> bool {
+        mod_api::__private::listened(mod_api::HookId::PotentialSpawns)
+    }
+
     fn mobs(&self) -> &[Mob] {
         &self.mobs
     }
@@ -1141,7 +1150,7 @@ fn structure_at(reach: super::structures::Reach) -> StructureAt {
 }
 impl<H: LevelHost> NaturalLevel for Level<'_, H> {
     fn spawn_hooks(&self) -> bool {
-        !mod_api::__private::mods().is_empty()
+        H::potential_spawns_listened()
     }
     fn position_check(
         &self,
@@ -1756,8 +1765,7 @@ impl<'a> Game<'a> {
             // The chunks' attempts in lanes, committed in the pass's order, where the parallel tick
             // is on and nothing keeps the draws on this thread (`parallel::lanes_for`).
             #[cfg(feature = "upstream-parallel-mobs")]
-            let lanes =
-                parallel::lanes_for(&level, scratch.candidates.len(), !categories.is_empty());
+            let lanes = parallel::lanes_for(scratch.candidates.len(), &categories);
             #[cfg(not(feature = "upstream-parallel-mobs"))]
             let lanes: Option<usize> = None;
             #[cfg(feature = "upstream-parallel-mobs")]
@@ -1766,7 +1774,7 @@ impl<'a> Game<'a> {
                     let proposed =
                         parallel::propose(&level, &state, &categories, &scratch.candidates, lanes);
                     laps.lap("sn_propose");
-                    parallel::commit(&level, &mut state, proposed, &mut pending);
+                    parallel::commit(&level, &mut state, &categories, proposed, &mut pending);
                     scratch.candidates.clear();
                 }
             }
@@ -2377,6 +2385,23 @@ mod tests {
                 assert_eq!(found, index(nearest_player(&players, x, y, z)), "({x}, {y}, {z})");
             }
         }
+    }
+
+    #[test]
+    fn spawn_list_gate_requires_a_potential_spawns_listener() {
+        let game_listens = <&Game<'_> as LevelHost>::potential_spawns_listened;
+        mod_platform::testing::with_mods(Vec::<mod_api::ModEntry>::new().into(), || {
+            assert!(!game_listens());
+        });
+        let checks = mod_api::ModEntry::new("checks", Box::new(ChecksMod(SpawnCheck::Default)));
+        mod_platform::testing::with_mods(vec![checks].into(), || {
+            assert!(!game_listens());
+        });
+        let lists = mod_api::ModEntry::new("lists", Box::new(SulfurCubesOnly));
+        mod_platform::testing::with_mods(vec![lists].into(), || {
+            assert!(game_listens());
+            assert!(!<NoGame as LevelHost>::potential_spawns_listened());
+        });
     }
 
     /// Answers both spawn checks with one fixed result.

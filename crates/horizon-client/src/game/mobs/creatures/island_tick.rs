@@ -36,7 +36,7 @@ impl Game<'_> {
             base.section_writer = None;
             base.passenger_objects = state.passenger_objects;
             let host = HostSerial {
-                hooks: !mod_api::__private::mods().is_empty()
+                hooks: super::mob_islands::listens_to_mob_turn()
                     || round.sections()
                     || mod_api::__private::listened(mod_api::HookId::MobDespawn)
                     || mod_api::__private::listened(mod_api::HookId::LivingChangeTarget)

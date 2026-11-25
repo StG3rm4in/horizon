@@ -194,20 +194,20 @@ fn on_helpers(lanes: usize) -> usize {
     lanes.min(horizon_client::parallel::helpers() + 1)
 }
 
-/// Whether a native mod can run in a mob's turn, as the build found it (`HORIZON_MOB_TURN`, from
-/// `horizon_mod_api_gen::mob_turn`): then the loop stays serial. Without that finding, any trait
-/// mod counts.
+/// Staged code can run in a turn independently of runtime subscriptions.
 fn mods_hook_turns() -> bool {
-    match option_env!("HORIZON_MOB_TURN") {
-        Some(found) => found == "hooked",
-        None => !mod_api::__private::mods().is_empty(),
-    }
+    option_env!("HORIZON_MOB_TURN") == Some("hooked")
 }
 
-/// Whether native mods are loaded at all: grouped turns keep the hooks that hand nothing back
-/// for the join, and skip the others (no mod hooks them while the islands run).
-fn defers() -> bool {
+const MOB_TURN_HOOKS: &[mod_api::HookId] =
+    include!(concat!(env!("OUT_DIR"), "/mob_turn_hooks.rs"));
+
+/// Both global subscribers and scoped parts can run in a turn.
+pub(super) fn listens_to_mob_turn() -> bool {
     !mod_api::__private::mods().is_empty()
+        && MOB_TURN_HOOKS.iter().copied().any(|hook| {
+            mod_api::__private::listened(hook) || mod_api::__private::has_part_hook(hook)
+        })
 }
 
 /// The mobs of each group, by their place in the list, ascending.
@@ -247,7 +247,7 @@ pub(super) struct Islands<'t> {
 /// into the game for it, in a turn or between two, which no group can do.
 #[derive(Default)]
 pub(super) struct HostSerial {
-    /// A native mod is loaded, or the mobs' world calls into the game in a turn: its mod hooks
+    /// A listener can run in a turn, or the mobs' world calls into the game: its mod hooks
     /// and goal host, the asked events, the `MobDespawn` and `LivingChangeTarget` listeners, the
     /// entity section observers.
     pub hooks: bool,
@@ -298,7 +298,7 @@ impl Islands<'_> {
         }
         // A content mod's effect ticks through the native mods (`ModEffectTicks`), which run
         // only on the server thread.
-        if defers()
+        if !mod_api::__private::mods().is_empty()
             && mobs.iter().any(|m| {
                 m.extra
                     .effects
@@ -1528,7 +1528,7 @@ fn islands_in_cells(
         }
     }
     horizon_client::spans::time("islands_plan_spatial", || {
-        let workers = if columns.len() >= MIN_PARALLEL_COLUMNS && !defers() {
+        let workers = if columns.len() >= MIN_PARALLEL_COLUMNS && !listens_to_mob_turn() {
             on_helpers(lanes)
         } else {
             1
@@ -1804,6 +1804,39 @@ fn report_check(difference: Option<String>, groups: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TurnSubscriptions(&'static [Option<mod_api::HookId>]);
+
+    impl mod_api::Hooks for TurnSubscriptions {
+        fn subscribed(&self) -> &'static [Option<mod_api::HookId>] {
+            self.0
+        }
+    }
+
+    #[test]
+    fn mob_turn_gate_uses_loaded_subscriptions() {
+        use mod_api::HookId;
+
+        let cases: &[(&[Option<HookId>], bool)] = &[
+            (&[], false),
+            (&[Some(HookId::ServerTick)], false),
+            (&[Some(HookId::LivingHeal)], true),
+            (&[Some(HookId::LivingJump)], true),
+            (&[Some(HookId::LivingDamagePost)], true),
+            (&[Some(HookId::EntityInvulnerabilityCheck)], true),
+            (&[Some(HookId::LivingShieldBlock)], true),
+            (&[Some(HookId::LivingUseTotem)], true),
+            (&[Some(HookId::LivingHealCause)], true),
+            (&[Some(HookId::FarmlandTrample)], true),
+        ];
+        for &(subscriptions, expected) in cases {
+            let entry = mod_api::ModEntry::new("turn-probe", Box::new(TurnSubscriptions(subscriptions)));
+            mod_platform::testing::with_mods(vec![entry].into(), || {
+                assert_eq!(listens_to_mob_turn(), expected);
+            });
+        }
+        assert!(MOB_TURN_HOOKS.iter().any(|id| matches!(id, HookId::EntityInside)));
+    }
 
     #[test]
     fn requested_workers_never_exceed_available_hardware() {

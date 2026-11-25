@@ -33,16 +33,21 @@ pub fn staged_mods(root: &Path) -> Vec<String> {
 const MOB_TURN: &[&str] = &[
     "living_change_target",
     "living_heal",
+    "living_heal_cause",
     "living_death_message",
     "living_breathe",
     "living_drown",
     "living_fall",
+    "entity_invulnerability_check",
     "living_incoming_damage",
+    "living_shield_block",
+    "living_use_totem",
     "living_damage_pre",
     "living_knockback",
     // Called from a mob's move: farmland it falls on, a content mod's blocks it touches, the block
     // it lands on, the one it bounces off, and the ones its sweep crosses.
     "trample",
+    "farmland_trample",
     "block_step_on",
     "fall_on",
     "bounce_on",
@@ -73,6 +78,21 @@ const MOB_TURN: &[&str] = &[
 /// The hooks a mob's turn calls without waiting: a trait mod hears them after the loop, but a
 /// mixin into them still runs in the turn.
 const MOB_TURN_QUEUED: &[&str] = &["living_jump", "living_damage_post"];
+
+/// The runtime hook IDs for the same turns the staged-code check examines.
+/// Historical names without a current hook ID are only relevant to staging.
+pub fn mob_turn_hook_ids(root: &Path) -> Result<String, String> {
+    let mut source = String::from("&[\n");
+    for hook in super::hook_points(root)? {
+        let name = hook.name.as_str();
+        if MOB_TURN.contains(&name) || MOB_TURN_QUEUED.contains(&name) {
+            let id = super::hook_id(name);
+            source.push_str(&format!("    mod_api::HookId::{id},\n"));
+        }
+    }
+    source.push_str("]\n");
+    Ok(source)
+}
 
 /// The path prefixes of the modules a mob's turn never runs, so that a mixin into one of them
 /// leaves the parallel tick on. A target is outside the turn when it names a module inside one of
@@ -148,6 +168,54 @@ pub fn mob_turn(root: &Path) -> Option<&'static str> {
         .windows(2)
         .any(|w| w[0] == "fn" && MOB_TURN.contains(&w[1]));
     Some(if hooked { "hooked" } else { "quiet" })
+}
+
+/// Catalog names for hooks reached by the ordinary host during spawn selection.
+/// A lane has no game host, so it needs a veto when omitting these calls would matter.
+const SPAWN_PROPOSAL: &[&str] = &[
+    "potential_spawns",
+    "mob_spawn_placement_check",
+    "mob_spawn_position_check",
+];
+
+/// The runtime hook table and staged-injection verdict for natural spawning.
+pub fn spawn_proposal_gate(root: &Path) -> Result<(String, Option<&'static str>), String> {
+    let catalog = super::hook_points(root)?;
+    let mut table = String::from("&[\n");
+    for &name in SPAWN_PROPOSAL {
+        let hook = catalog
+            .iter()
+            .find(|hook| hook.name == name)
+            .ok_or_else(|| format!("missing natural spawn proposal hook {name}"))?;
+        let id = super::hook_id(&hook.name);
+        table.push_str(&format!("    (mod_api::HookId::{id}, {name:?}),\n"));
+    }
+    table.push_str("]\n");
+
+    let text = match std::fs::read_to_string(root.join(MODS_STAGE)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((table, None)),
+        Err(_) => return Ok((table, Some("proposal"))),
+    };
+    let record: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let Some(injections) = record["injections"].as_array() else {
+        return Ok((table, Some("proposal")));
+    };
+    let mut verdict = None;
+    for injection in injections {
+        let target = injection["target"].as_str().unwrap_or_default();
+        match catalog.iter().find(|hook| hook.target == target) {
+            Some(hook) if SPAWN_PROPOSAL.contains(&hook.name.as_str()) => {
+                return Ok((table, Some("proposal")));
+            }
+            Some(hook) if hook.name == "finalize_spawn" => verdict = Some("finalize"),
+            Some(_) => {}
+            // Ordinary Rust injection targets can bypass the hook registry.
+            // Require the serial path when the staged target cannot be classified.
+            None => return Ok((table, Some("proposal"))),
+        }
+    }
+    Ok((table, verdict))
 }
 
 /// Appends every `.rs` file under `dir` to `out`.

@@ -44,6 +44,25 @@ fn main() {
     if let Some(found) = horizon_mod_api_gen::mob_turn(&root) {
         println!("cargo:rustc-env=HORIZON_MOB_TURN={found}");
     }
+    if std::env::var_os("CARGO_FEATURE_UPSTREAM_PARALLEL_MOB_ISLANDS").is_some() {
+        let hooks =
+            horizon_mod_api_gen::mob_turn_hook_ids(&root).expect("resolving mob-turn hook IDs");
+        std::fs::write(out_dir.join("mob_turn_hooks.rs"), hooks)
+            .expect("writing mob-turn hook IDs");
+    }
+    if std::env::var_os("CARGO_FEATURE_UPSTREAM_PARALLEL_MOBS").is_some() {
+        println!(
+            "cargo:rerun-if-changed={}",
+            root.join(horizon_mod_api_gen::MODS_STAGE).display()
+        );
+        let (hooks, staged) = horizon_mod_api_gen::spawn_proposal_gate(&root)
+            .expect("resolving natural spawn proposal hooks");
+        std::fs::write(out_dir.join("spawn_proposal_hooks.rs"), hooks)
+            .expect("writing natural spawn proposal hooks");
+        if let Some(staged) = staged {
+            println!("cargo:rustc-env=HORIZON_SPAWN_PROPOSAL_STAGE={staged}");
+        }
+    }
     // The SDK builds this library, not the platform executable. Carry the same executable
     // policy without asking Cargo to link a binary this package no longer owns.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").expect("Cargo must provide the target OS");

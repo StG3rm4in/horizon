@@ -18,5 +18,6 @@ horizon-client game::creatures::mob_islands::tests::verification_detects_snapsho
 horizon-client game::creatures::mob_islands::tests::villagers_on_their_own_random_tick_in_groups_as_serial by-hand manual # compiled only with --features upstream-parallel-mob-islands; needs prepared resources
 horizon-client game::creatures::mob_islands::tests::zombies_read_the_villages_by_night_only by-hand manual # compiled only with --features upstream-parallel-mob-islands; needs prepared resources
 horizon-client game::creatures::prep::tests::the_nearest_player_is_asked_again_after_a_move by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
+horizon-client game::natural_spawning::parallel::tests::spawn_proposal_finalization_can_cancel_on_the_server_thread by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
 horizon-client game::natural_spawning::parallel::tests::the_second_of_two_proposals_over_a_players_cap_is_dropped by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
 horizon-client game::natural_spawning::parallel::tests::the_spawns_are_the_same_in_any_number_of_lanes by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources

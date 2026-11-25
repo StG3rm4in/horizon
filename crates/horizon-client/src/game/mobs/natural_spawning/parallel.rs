@@ -25,13 +25,8 @@ thread_local! {
 
 /// The lanes the pass runs in, or none for the serial pass: the parallel tick is on (not under
 /// `HORIZON_PARALLEL_TICK=exact`: the lanes count against the caps as the pass found them) with two
-/// lanes or more, the chunks are many, nothing keeps the draws on one thread (a replayed seed
-/// sequence) and no mod hears the spawns (its hooks run on the server thread).
-pub(super) fn lanes_for<H: LevelHost>(
-    level: &Level<'_, H>,
-    chunks: usize,
-    spawning: bool,
-) -> Option<usize> {
+/// lanes or more, enough chunks, no proposal hook listeners and no native entity parts.
+pub(super) fn lanes_for(chunks: usize, categories: &[Category]) -> Option<usize> {
     #[cfg(test)]
     let tested = LANES.with(std::cell::Cell::get);
     #[cfg(not(test))]
@@ -43,11 +38,25 @@ pub(super) fn lanes_for<H: LevelHost>(
         }
         None => return None,
     };
-    let serial = !spawning
+    // Entity parts veto lanes without a resident-world scan.
+    // Provisional mobs can register goals and behaviors during construction, and
+    // the lane has no game host to ask parts for the spawn cluster size.
+    let serial = categories.is_empty()
         || (tested.is_none() && lanes < 2)
-        || level.spawn_hooks()
+        || option_env!("HORIZON_SPAWN_PROPOSAL_STAGE") == Some("proposal")
+        || (!mod_api::__private::mods().is_empty()
+            && (proposal_hooks_listened() || mod_api::__private::has_entity_parts()))
         || horizon_client::random_source::repeating_per_thread();
     (!serial).then_some(lanes)
+}
+
+const SPAWN_PROPOSAL_HOOKS: &[(mod_api::HookId, &str)] =
+    include!(concat!(env!("OUT_DIR"), "/spawn_proposal_hooks.rs"));
+
+fn proposal_hooks_listened() -> bool {
+    SPAWN_PROPOSAL_HOOKS.iter().any(|&(hook, _)| {
+        mod_api::__private::listened(hook) || mod_api::__private::has_part_hook(hook)
+    })
 }
 
 /// A chunk's own random: the same whichever lane takes the chunk, and a new one every tick.
@@ -71,8 +80,8 @@ pub(super) struct Made {
 }
 
 /// A lane's [`FinalizeLevel`]: what finalizeSpawn reads of the level from the lane's own world
-/// view and the shared borrows, with no `Game`. A lane runs only with no mod loaded, so the
-/// finalizeSpawn event has no listener to ask.
+/// view and shared borrows. The worker runs only the built-in finalizer. When a listener
+/// needs the mutable finalization event, the server handles its chunk at commit.
 struct LaneFinalize<'a, 'g> {
     l: &'a Level<'g, NoGame>,
     rides: Vec<(u32, u32)>,
@@ -316,6 +325,49 @@ pub(super) fn propose(
     packs
 }
 
+/// A listener can change group data, collision bounds and the number of random draws, or
+/// cancel altogether. Replay a hit chunk with the original chunk seed and the
+/// live commit state so that the callback's answer feeds the remaining attempts.
+fn commit_with_finalizers(
+    level: &GameLevel<'_, '_>,
+    state: &mut SpawnState,
+    categories: &[Category],
+    packs: Vec<Pack<Made>>,
+    pending: &mut Vec<Mob>,
+) {
+    if packs.is_empty() {
+        return;
+    }
+    level.build_boxes(MobBoxes::new(LevelHost::mobs(&level.game)));
+    let mut previous = None;
+    for pack in packs {
+        let chunk = pack.chunk;
+        if previous == Some(chunk) {
+            continue;
+        }
+        previous = Some(chunk);
+        horizon_threads::work::set_chunk(chunk.0, chunk.1);
+        let mut random = chunk_random(chunk, level.w.game_time);
+        let mut spawn = |l: &GameLevel, request: &SpawnRequest, rng: &mut LegacyRandom| {
+            let spawned = l.finalize_spawned(request, pending, rng);
+            if let Some(s) = &spawned {
+                l.pending.borrow_mut().push(s.bounds);
+            }
+            spawned
+        };
+        spawn_selection::spawn_for_chunk(
+            level,
+            &mut random,
+            state,
+            categories,
+            chunk,
+            &mut spawn,
+            &mut |_| {},
+        );
+    }
+    horizon_threads::work::clear_work();
+}
+
 /// Gives a lane's mob, and what it created, ids from the pass's own provisional run (every lane
 /// counts from its own start), and rewrites the mount and rider links and the chicken rides that
 /// name them, as [`Game::resolve_spawn_ids`] expects them.
@@ -351,9 +403,17 @@ fn renumber(level: &GameLevel<'_, '_>, made: &mut Made) {
 pub(super) fn commit(
     level: &GameLevel<'_, '_>,
     state: &mut SpawnState,
+    categories: &[Category],
     packs: Vec<Pack<Made>>,
     pending: &mut Vec<Mob>,
 ) {
+    if option_env!("HORIZON_SPAWN_PROPOSAL_STAGE") == Some("finalize")
+        || (!mod_api::__private::mods().is_empty()
+            && mod_api::__private::listened(mod_api::HookId::FinalizeSpawn))
+    {
+        commit_with_finalizers(level, state, categories, packs, pending);
+        return;
+    }
     let mut accepted = Vec::new();
     spawn_selection::commit(state, level, packs, &mut accepted, |mut made| {
         renumber(level, &mut made);
@@ -366,6 +426,130 @@ pub(super) fn commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+        text.split_once(start).unwrap().1.split_once(end).unwrap().0
+    }
+
+    #[test]
+    fn spawn_proposal_hooks_cover_dispatch_sites() {
+        use std::collections::BTreeSet;
+
+        let natural = include_str!("../natural_spawning.rs");
+        let worker = between(include_str!("parallel.rs"), "pub(super) struct Made", "fn commit_with_finalizers");
+        let adapter = between(natural, "impl LevelHost for &Game<'_>", "pub(super) struct NoGame");
+        let level = between(natural, "impl<H: LevelHost> SpawnLevel", "impl horizon_client::mobs::spawner::SpawnerLevel");
+        let finalize = include_str!("../../../mobs/finalize.rs");
+        let sources = [
+            worker,
+            adapter,
+            level,
+            include_str!("../../../mobs/spawn_selection.rs"),
+            include_str!("../../../mobs/spawn_selection/parallel.rs"),
+            include_str!("../../../mobs/spawn_rules.rs"),
+            finalize,
+            include_str!("../../../mobs/part_goals.rs"),
+            include_str!("../../../mobs/mod_behaviors.rs"),
+            include_str!("../../creatures/prep.rs"),
+        ];
+        let mut discovered = BTreeSet::new();
+        for source in sources {
+            for line in source.lines() {
+                let line = line.split("//").next().unwrap();
+                for (at, _) in line.match_indices('(') {
+                    let name = line[..at].trim_end().rsplit(|c: char| {
+                        !(c.is_ascii_alphanumeric() || c == '_')
+                    }).next().unwrap();
+                    if let Some(hook) = name.strip_prefix("native_") {
+                        discovered.insert(hook);
+                    }
+                }
+            }
+        }
+        let gated: BTreeSet<_> = SPAWN_PROPOSAL_HOOKS.iter().map(|&(_, name)| name).collect();
+        assert_eq!(discovered, gated);
+        assert!(!worker.contains("fn spawn_event("));
+    }
+
+    struct ProposalSubscriptions(&'static [Option<mod_api::HookId>]);
+
+    impl mod_api::Hooks for ProposalSubscriptions {
+        fn subscribed(&self) -> &'static [Option<mod_api::HookId>] {
+            self.0
+        }
+    }
+
+    #[test]
+    fn spawn_proposal_subscription_gate() {
+        use mod_api::HookId;
+        let cases: &[(&[Option<HookId>], bool)] = &[
+            (&[], false),
+            (&[Some(HookId::ServerTick)], false),
+            (&[Some(HookId::FinalizeSpawn)], false),
+            (&[Some(HookId::EntityJoinLevel)], false),
+            (&[Some(HookId::MobSpawned)], false),
+            (&[Some(HookId::ItemSpawn)], false),
+            (&[Some(HookId::PotentialSpawns)], true),
+            (&[Some(HookId::MobSpawnPlacementCheck)], true),
+            (&[Some(HookId::MobSpawnPositionCheck)], true),
+        ];
+        for &(subscriptions, expected) in cases {
+            let entry = mod_api::ModEntry::new(
+                "spawn-proposal-probe",
+                Box::new(ProposalSubscriptions(subscriptions)),
+            );
+            mod_platform::testing::with_mods(vec![entry].into(), || {
+                assert_eq!(proposal_hooks_listened(), expected);
+            });
+        }
+    }
+
+    struct CancelFinalization {
+        server: std::thread::ThreadId,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[mod_api::__subscriptions]
+    impl mod_api::Hooks for CancelFinalization {
+        fn finalize_spawn(
+            &self,
+            _: &dyn mod_api::Host,
+            event: &mut mod_api::FinalizeSpawnEvent<'_>,
+        ) -> mod_api::Flow {
+            assert_eq!(std::thread::current().id(), self.server);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            event.spawn_cancelled = true;
+            mod_api::Flow::Continue
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the upstream-parallel-mobs feature and prepared resources"]
+    fn spawn_proposal_finalization_can_cancel_on_the_server_thread() {
+        with_game(|game| {
+            let _reset = Reset;
+            plain(game);
+            LANES.with(|lanes| lanes.set(Some(3)));
+            let count = game.mobs.len();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let entry = mod_api::ModEntry::new(
+                "spawn-finalize-probe",
+                Box::new(CancelFinalization {
+                    server: std::thread::current().id(),
+                    calls: calls.clone(),
+                }),
+            );
+            mod_platform::testing::with_mods(vec![entry].into(), || {
+                assert_eq!(lanes_for(MIN_CHUNKS, &[Category::Creature]), Some(3));
+                for tick in 1..=6 {
+                    game.world.game_time = 400 * tick;
+                    game.spawn_natural();
+                }
+            });
+            assert!(calls.load(Ordering::Relaxed) > 0);
+            assert_eq!(game.mobs.len(), count);
+        });
+    }
     use crate::game::native_entity_refs::tests::with_game;
     use horizon_client::{chunk::Chunk, mobs::spawn_selection::Member};
 
