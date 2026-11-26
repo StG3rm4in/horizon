@@ -22,10 +22,14 @@ impl Game<'_> {
             .find(|b| b.uuid == bar.fields().uuid)
     }
 
+    /// Apply `edit` to a live bar. Only a change is published: `ServerBossEvent`'s
+    /// setters and `addPlayer` send nothing when the value, flag or player set
+    /// stays the same, and republishing costs every viewer.
     fn boss_bar_edit(&mut self, bar: BossBarRef, edit: impl FnOnce(&mut BossBar)) -> bool {
         if self.boss_bar_state(bar).is_none() {
             return false;
         }
+        let mut changed = false;
         if let Some(state) = self
             .bosses
             .bars
@@ -33,9 +37,13 @@ impl Game<'_> {
             .iter_mut()
             .find(|b| b.uuid == bar.fields().uuid)
         {
+            let before = state.clone();
             edit(state);
+            changed = *state != before;
         }
-        self.bossbars_changed();
+        if changed {
+            self.bossbars_changed();
+        }
         true
     }
 
