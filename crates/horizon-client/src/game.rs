@@ -3287,7 +3287,18 @@ impl Game<'_> {
         let events = std::mem::take(&mut self.level_events);
         self.lan_record_events(&events);
         dispense_fixture::record_events(&events);
+        // Consecutive `Block.pushEntitiesUp` events share their bodies' bounds.
+        let mut push_up = None;
         for event in events {
+            if !matches!(
+                event,
+                LevelEvent::BlockEvent {
+                    kind: "push_entities_up",
+                    ..
+                }
+            ) {
+                push_up = None;
+            }
             match event {
                 LevelEvent::LevelEvent {
                     id: 2001,
@@ -3869,7 +3880,7 @@ impl Game<'_> {
                     pos,
                     state,
                     kind: "push_entities_up",
-                } => self.push_entities_up(pos, state),
+                } => self.push_entities_up(pos, state, &mut push_up),
                 LevelEvent::GrowTree { .. }
                 | LevelEvent::PlaceFeature { .. }
                 | LevelEvent::BlockEvent { .. } => {}
