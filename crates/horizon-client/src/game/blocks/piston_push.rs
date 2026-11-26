@@ -74,6 +74,10 @@ struct PistonIndex {
     drawn: horizon_client::fast_hash::FxHashMap<[i32; 3], usize>,
 }
 
+/// The bodies a batch of `Block.pushEntitiesUp` walks, in `push_targets`
+/// order, with the bounds read when the batch began (`None`: not pushed).
+pub(super) type PushUpTargets = Vec<(MoveWho, Option<Aabb>)>;
+
 /// `Entity.getStepHeight` of each body, read before the push.
 struct StepHeights {
     player: f32,
@@ -755,10 +759,17 @@ impl Game<'_> {
     /// (`FarmlandBlock.turnToBaseBlock`, `PathBlock.turnToBaseBlock`): every body
     /// touching the collision that the new state adds over `old` is lifted
     /// onto it with `teleportRelative`, no collision scan.
+    ///
+    /// `targets` keeps the bodies and their bounds from one push to the next
+    /// in a batch of level events (the caller drops it at any other event):
+    /// nothing moves a body between two pushes unless one lifts it, and then
+    /// the rest of the walk reads the bodies afresh and the list is dropped.
+    /// A snowfall thickening its layers emits hundreds of these a tick.
     pub(super) fn push_entities_up(
         &mut self,
         pos: BlockPos,
         old: horizon_world::registry::BlockStateId,
+        targets: &mut Option<PushUpTargets>,
     ) {
         let new = self.world.block(pos.x, pos.y, pos.z);
         if new == old {
@@ -787,8 +798,21 @@ impl Game<'_> {
         let Some(bounds) = added.bounds() else {
             return;
         };
-        let steps = self.push_step_heights();
-        for target in self.push_targets() {
+        // This push reads no `Entity.getStepHeight`: no attribute lookups.
+        let steps = StepHeights {
+            player: 0.6,
+            guests: std::collections::HashMap::new(),
+        };
+        let list = targets.get_or_insert_with(|| {
+            self.push_targets()
+                .map(|t| (t, self.push_body(t, None, &steps).map(|b| b.bounds)))
+                .collect()
+        });
+        let mut lifted = false;
+        for &(target, kept) in list.iter() {
+            if !lifted && !kept.is_some_and(|b| b.intersects(bounds)) {
+                continue;
+            }
             let Some(body) = self.push_body(target, Some(pos), &steps) else {
                 continue;
             };
@@ -799,6 +823,11 @@ impl Game<'_> {
             // `teleportRelative`, a position assignment the design excludes
             // from `entity_move` (arismoko/horizon#2414): a pending gate, never armed.
             self.apply_push(&mut MoveGate::new(), target, Vec3::new(0.0, 1.0 + dy, 0.0));
+            // A lifted body can carry others (its passengers): read the rest afresh.
+            lifted = true;
+        }
+        if lifted {
+            *targets = None;
         }
     }
 
