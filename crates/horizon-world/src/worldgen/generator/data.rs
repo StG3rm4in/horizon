@@ -27,6 +27,7 @@ type RegistryCache = BTreeMap<&'static str, (OnceLock<Option<RegistryNames>>, Re
 pub struct GeneratorData {
     /// Geode offload requires the bundled worldgen registries and tags.
     pub(super) geode_base_bundle: bool,
+    pub(super) cpu_only: bool,
     pub(super) registry: &'static BlockRegistry,
     pub(super) states: GenBlockStates,
     pub(super) integers: BTreeSet<(String, String)>,
@@ -307,6 +308,17 @@ impl GeneratorData {
                     .or_insert(quantize_parameter_report(&fs::read_to_string(&path)?)?);
             }
         }
+        for (id, json) in ov.entries(overrides::BIOME_PARAMETER_LISTS) {
+            match quantize_parameter_report(json) {
+                Ok(table) => {
+                    presets.insert(id.to_owned(), table);
+                }
+                Err(e) => {
+                    presets.remove(id);
+                    warnings.push(format!("biome parameter list {id}: {e}"));
+                }
+            }
+        }
         let source_catalog =
             BiomeSourceCatalog::new(&biome_set, &biome_tags, &presets.keys().cloned().collect())?;
         let carvers = CarverCatalog::from_json(&read_bundle(dir, ov, "carvers")?)?;
@@ -372,6 +384,7 @@ impl GeneratorData {
         let behaviours = joined(behaviours);
         Ok(Arc::new(Self {
             geode_base_bundle: ov.is_empty(),
+            cpu_only: ov.cpu_only(),
             behaviours,
             structure_resources,
             structures,

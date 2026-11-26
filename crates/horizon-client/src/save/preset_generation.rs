@@ -13,7 +13,7 @@ fn valid_dimension_key(id: &str) -> bool {
 }
 
 /// Structural boundary checks; generator-specific codecs run on world loading.
-pub(crate) fn valid_world_gen_dimensions(dimensions: &Tag) -> bool {
+pub fn valid_world_gen_dimensions(dimensions: &Tag) -> bool {
     use horizon_core::identifier::Identifier;
     let Tag::Compound(stems) = dimensions else {
         return false;
@@ -69,7 +69,7 @@ pub fn write_world_gen_settings_with(
     )
 }
 
-pub(crate) fn write_world_gen_settings_for_preset(
+pub fn write_world_gen_settings_for_preset(
     dir: &Path,
     seed: i64,
     options: WorldGen,
@@ -95,7 +95,17 @@ pub(crate) fn write_world_gen_settings_for_preset(
     write_saved_data(dir, "world_gen_settings", settings)
 }
 
-pub(crate) fn read_saved_preset(dir: &Path) -> Option<(Option<String>, Tag)> {
+/// A saved registry preset outside the built-in set needs the passive mod
+/// worldgen data and uses CPU generation until its GPU paths are proven.
+pub fn uses_custom_world_preset(dir: &Path) -> bool {
+    world_gen_settings(dir)
+        .and_then(|settings| text(settings.get("horizon:world_preset")))
+        .is_some_and(|id| {
+            horizon_core::level_id::valid_level_id(&id) && WorldPreset::of_id(&id).is_none()
+        })
+}
+
+pub fn read_saved_preset(dir: &Path) -> Option<(Option<String>, Tag)> {
     let settings = world_gen_settings(dir)?;
     let preset = text(settings.get("horizon:world_preset"))
         .filter(|id| horizon_core::level_id::valid_level_id(id));
