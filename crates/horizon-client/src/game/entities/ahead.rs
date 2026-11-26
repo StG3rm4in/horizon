@@ -5,8 +5,8 @@
 //! obstacle boxes and the border, and the item loop changes none of them: so an item's move worked
 //! out on a copy before the loop is the move its turn would make. Its escape from inside a block
 //! draws the item's own random, which the copy carries. A merge before its turn can change its
-//! count, age and pickup delay: such an item moves at its turn instead. With a native mod loaded
-//! (its hooks see every item) or a mod listening to the round, every item moves at its turn.
+//! count, age and pickup delay: such an item moves at its turn instead. Item-turn listeners
+//! and staged code keep movement on the tick thread.
 use super::*;
 use super::{entity::Entity as _, native_ticks};
 use horizon_client::{
@@ -56,6 +56,19 @@ impl ItemTables<'_> {
         entity_boxes: &[Aabb],
         splash: &mut impl FnMut(ItemSplash),
     ) -> (ItemStep, Landed) {
+        let (mut step, splashed) =
+            self.move_before_fall(item, escape_speed, entity_boxes, splash);
+        let landed = self.check_fall(item, &mut step, splashed);
+        (step, landed)
+    }
+
+    fn move_before_fall(
+        &self,
+        item: &mut ItemEntity,
+        escape_speed: Option<f32>,
+        entity_boxes: &[Aabb],
+        splash: &mut impl FnMut(ItemSplash),
+    ) -> (ItemStep, usize) {
         // Entity.baseTick splashes before moving, except on the first tick, at
         // the motion before the currents push it.
         let before = item.velocity;
@@ -66,7 +79,7 @@ impl ItemTables<'_> {
             splash(s);
         });
         item.lava_fall(heights.1 > 0.0);
-        let mut step = item.tick_move_before_block_effects(
+        let step = item.tick_move_before_block_effects(
             self.world,
             self.facts,
             self.collision,
@@ -78,24 +91,26 @@ impl ItemTables<'_> {
             Some(&self.motion.blocks),
             self.context,
         );
-        let landed = item
-            .check_fall(&mut step, |fall, from, moved| {
-                if fall == 0.0 || moved.length_squared() < 1.0 {
-                    return fall;
-                }
-                let reset = &self.motion.fall_reset;
-                let hit = horizon_client::entities::fall_reset_hit(
-                    self.context,
-                    self.world,
-                    &self.motion.fluids,
-                    |p| reset.contains(&*self.facts.get(self.world.block(p.x, p.y, p.z)).name),
-                    from,
-                    moved,
-                );
-                if hit { 0.0 } else { fall }
-            })
-            .map(|fall| (fall, item.position, item.bounds(), splashed));
-        (step, landed)
+        (step, splashed)
+    }
+
+    fn check_fall(&self, item: &mut ItemEntity, step: &mut ItemStep, splashed: usize) -> Landed {
+        item.check_fall(step, |fall, from, moved| {
+            if fall == 0.0 || moved.length_squared() < 1.0 {
+                return fall;
+            }
+            let reset = &self.motion.fall_reset;
+            let hit = horizon_client::entities::fall_reset_hit(
+                self.context,
+                self.world,
+                &self.motion.fluids,
+                |p| reset.contains(&*self.facts.get(self.world.block(p.x, p.y, p.z)).name),
+                from,
+                moved,
+            );
+            if hit { 0.0 } else { fall }
+        })
+        .map(|fall| (fall, item.position, item.bounds(), splashed))
     }
     /// The rest of the move after its vertical contact: block effects, bubble columns, settling
     /// and the water entry. Whether the item lives on.
@@ -154,39 +169,57 @@ fn started(item: &ItemEntity) -> (u32, i32, i64) {
     (item.stack.count, item.age, item.pickup_delay)
 }
 
-/// `item`'s whole move on a server with no native mod, from the tables alone.
+/// `item`'s whole move from the tables alone, if its turn need not do the fall ray.
 fn move_alone(
     tables: &ItemTables,
     obstacles: &ObstacleGrid,
     item: &mut ItemEntity,
     found: &mut Vec<u32>,
     near: &mut Vec<Aabb>,
-) -> Moved {
+    keep_fall_rays_at_turn: bool,
+) -> Option<Moved> {
     obstacles.near_shared(reach(item), found, near);
     let no_physics = item.inside_block(tables.world, tables.collision, near, Some(tables.border));
     // `moveTowardsClosestSpace` draws the speed from the item's own random.
     let escape_speed = no_physics.then(|| item.random.next_float() * 0.2 + 0.1);
     let mut splashes = Vec::new();
-    let (step, landed) = tables.move_item(item, escape_speed, near, &mut |s| splashes.push(s));
+    let (mut step, splashed) =
+        tables.move_before_fall(item, escape_speed, near, &mut |s| splashes.push(s));
+    // A fall ray can populate the shared first-query fluid shape cache. Keep
+    // those queries in turn order when enabling work-ahead for loaded mods.
+    if keep_fall_rays_at_turn
+        && step
+            .fall_move
+            .is_some_and(|(_, delta, applied)| {
+                applied
+                    && !matches!(
+                        delta.length_squared().partial_cmp(&1.0),
+                        Some(std::cmp::Ordering::Less)
+                    )
+            })
+    {
+        return None;
+    }
+    let landed = tables.check_fall(item, &mut step, splashed);
     if step.vertical_contact.is_some() && item.stack.count == 0 {
-        return (
+        return Some((
             no_physics,
             false,
             true,
             splashes,
             landed,
             step.original_movement(),
-        );
+        ));
     }
     let alive = tables.settle_item(item, no_physics, step, &mut |s| splashes.push(s));
-    (
+    Some((
         no_physics,
         alive,
         false,
         splashes,
         landed,
         step.original_movement(),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -206,6 +239,40 @@ fn ahead() -> bool {
     horizon_client::parallel::lanes() > 1
 }
 
+/// Installed callbacks that can run while preparing or consuming item moves.
+fn item_turn_listened() -> bool {
+    use mod_api::{HookId, __private::{has_part_hook, listened}};
+
+    // At preparation, or at turn boundaries that can expose or change the
+    // world while there are still prepared moves waiting to be used.
+    [
+        HookId::EntityMove,
+        HookId::FluidFlow,
+        HookId::Friction,
+        HookId::BlockSpeedFactor,
+        HookId::BlockStepOn,
+        HookId::FallOn,
+        HookId::EntityInside,
+        HookId::ItemAfterVerticalCollision,
+        HookId::OnEntityItemUpdate,
+        HookId::EntityTickListened,
+        HookId::EntityTickPre,
+        HookId::EntityTickPost,
+        HookId::EntityEnteringSection,
+        HookId::EntityInvulnerabilityCheck,
+        HookId::ItemExpire,
+        HookId::ItemDespawn,
+        HookId::VanillaGameEvent,
+        // An item's damage or landing event can reach a calibrated sensor.
+        HookId::BlockSignal,
+        HookId::ShouldCheckWeakPower,
+        HookId::IsSignalSource,
+        HookId::ShouldRedstoneWireConnectTo,
+    ]
+    .into_iter()
+    .any(|hook| listened(hook) || has_part_hook(hook))
+}
+
 /// The moves worked out ahead, by the item's place in the loop.
 pub(super) struct Moves(Vec<Option<Ahead>>);
 
@@ -223,17 +290,31 @@ impl Moves {
             || items.len() < MIN_ITEMS
             || game.remote.is_some()
             || round.listening()
-            || !mod_api::__private::mods().is_empty()
+            || option_env!("HORIZON_ITEM_TURN_STAGED").is_some()
         {
             return Self(Vec::new());
         }
-        let todo: Vec<usize> = (0..items.len()).filter(|&i| ticks(&items[i])).collect();
+        let modded = !mod_api::__private::mods().is_empty();
+        if modded && item_turn_listened() {
+            return Self(Vec::new());
+        }
+        let todo: Vec<usize> = (0..items.len())
+            .filter(|&i| {
+                let item = &items[i];
+                // Cloning deliberately detaches the authoritative registration.
+                (!modded || !item.attachment_lifetime.is_bound()) && ticks(item)
+            })
+            .collect();
         let tables = game.item_tables();
         let done = horizon_client::parallel::par_map(&todo, MIN_ITEMS / 4, |part, out| {
             let (mut found, mut near) = (Vec::new(), Vec::new());
             for &i in part {
                 let mut moved = items[i].clone();
-                let result = move_alone(&tables, obstacles, &mut moved, &mut found, &mut near);
+                let Some(result) =
+                    move_alone(&tables, obstacles, &mut moved, &mut found, &mut near, modded)
+                else {
+                    continue;
+                };
                 let started = started(&items[i]);
                 out.push((
                     i,
@@ -302,6 +383,39 @@ fn check(id: u32, serial: &ItemEntity, expected: &Moved, ahead: &ItemEntity, got
 mod tests {
     use super::{AHEAD, TAKEN};
     use crate::game::game_tests::tests::server_game;
+    use mod_api::HookId;
+
+    struct Subscriptions(&'static [Option<HookId>]);
+
+    impl mod_api::Hooks for Subscriptions {
+        fn subscribed(&self) -> &'static [Option<HookId>] {
+            self.0
+        }
+    }
+
+    fn with_subscriptions<R>(subscriptions: &'static [Option<HookId>], run: impl FnOnce() -> R) -> R {
+        let entry = mod_api::ModEntry::new("item-turn-probe", Box::new(Subscriptions(subscriptions)));
+        mod_platform::testing::with_mods(vec![entry].into(), run)
+    }
+
+    #[test]
+    fn item_turn_gate_uses_installed_subscriptions() {
+        let cases: &[(&'static [Option<HookId>], bool)] = &[
+            (&[], false),
+            (&[Some(HookId::ServerTick), Some(HookId::EntityJoinLevel)], false),
+            (&[Some(HookId::EntityMove)], true),
+            (&[Some(HookId::FluidFlow)], true),
+            (&[Some(HookId::EntityEnteringSection)], true),
+            (&[Some(HookId::EntityInvulnerabilityCheck)], true),
+            (&[Some(HookId::ItemExpire)], true),
+            (&[Some(HookId::VanillaGameEvent)], true),
+        ];
+        for (case, &(installed, expected)) in cases.iter().enumerate() {
+            with_subscriptions(installed, || {
+                assert_eq!(super::item_turn_listened(), expected, "case {case}");
+            });
+        }
+    }
     use horizon_client::{chunk::Chunk, items::ItemStack};
     use horizon_core::{geometry::Vec3, random::RandomSource};
     use std::sync::Arc;
@@ -439,14 +553,49 @@ mod tests {
             assert_eq!(format!("{item:?}"), before);
         }
         let mut runs = Vec::new();
-        // First use the real environment switch, then serial/ahead/serial
-        // overrides. This also checks switch-off behavior above the threshold.
-        for ahead in [None, Some(false), Some(true), Some(false)] {
+        // Use the real switch, then serial and ahead both with and without an
+        // unrelated subscriber. The modded runs also exercise a live attachment.
+        for (ahead, modded) in [
+            (None, false),
+            (Some(false), false),
+            (Some(true), false),
+            (Some(false), true),
+            (Some(true), true),
+        ] {
             game.dropped = items.clone();
             game.world.random = random.clone();
             AHEAD.with(|a| a.set(ahead));
             TAKEN.with(|t| t.set((0, 0)));
-            game.tick_items();
+            if modded {
+                use horizon_mod_runtime::attachments::{
+                    AttachmentType, Attachments, Holder, index::AttachmentIndex,
+                };
+                use std::sync::Mutex;
+                static VALUE: AttachmentType<i32> = AttachmentType {
+                    namespace: "test",
+                    name: "item_ahead_owner",
+                    default: || 0,
+                    codec: None,
+                    copy_on_death: false,
+                    sync: false,
+                };
+                let mut map = Attachments::default();
+                VALUE.set(&mut map, Holder::Level, 1).unwrap();
+                let index = Arc::new(Mutex::new(AttachmentIndex::default()));
+                game.dropped
+                    .iter_mut()
+                    .find(|item| item.id == landing)
+                    .unwrap()
+                    .attachment_lifetime
+                    .bind(&mut map, &index, landing);
+                with_subscriptions(&[Some(HookId::ServerTick)], || {
+                    game.tick_items();
+                });
+                let key = ("test".into(), "item_ahead_owner".into());
+                assert_eq!(index.lock().unwrap().snapshot(&key).len(), 1);
+            } else {
+                game.tick_items();
+            }
             // Independently advance just the escaping items' starting randoms.
             // The helper copy must consume exactly one float and return that
             // state at the turn; ordinary moves must consume none of it.
@@ -484,6 +633,9 @@ mod tests {
         assert_eq!(runs[0].1, runs[3].1);
         assert_eq!(runs[1].2, (0, 0));
         assert_eq!(runs[3].2, (0, 0));
+        assert_eq!(runs[0].0, runs[4].0);
+        assert_eq!(runs[0].1, runs[4].1);
+        assert!(runs[4].2.0 >= 200 && runs[4].2.1 > 0, "{:?}", runs[4].2);
         if horizon_client::parallel::lanes() > 1 {
             assert_eq!(runs[0].2, runs[2].2);
         } else {

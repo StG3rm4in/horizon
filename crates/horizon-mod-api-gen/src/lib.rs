@@ -670,7 +670,10 @@ pub mod surface;
 pub use build::{generate, generate_api_snapshot, generate_render, write_if_changed};
 pub use notes::generate as generate_hook_notes;
 mod staged;
-pub use staged::{MODS_STAGE, mob_turn, mob_turn_hook_ids, spawn_proposal_gate, staged_mods};
+pub use staged::{
+    MODS_STAGE, item_turn_has_staged_code, mob_turn, mob_turn_hook_ids, spawn_proposal_gate,
+    staged_mods,
+};
 
 /// Generate the dispatch test fixture without preventing xtask from filling new placeholders.
 #[doc(hidden)]

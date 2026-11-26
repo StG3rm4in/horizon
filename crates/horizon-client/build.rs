@@ -50,11 +50,14 @@ fn main() {
         std::fs::write(out_dir.join("mob_turn_hooks.rs"), hooks)
             .expect("writing mob-turn hook IDs");
     }
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join(horizon_mod_api_gen::MODS_STAGE).display()
+    );
+    if horizon_mod_api_gen::item_turn_has_staged_code(&root) {
+        println!("cargo:rustc-env=HORIZON_ITEM_TURN_STAGED=1");
+    }
     if std::env::var_os("CARGO_FEATURE_UPSTREAM_PARALLEL_MOBS").is_some() {
-        println!(
-            "cargo:rerun-if-changed={}",
-            root.join(horizon_mod_api_gen::MODS_STAGE).display()
-        );
         let (hooks, staged) = horizon_mod_api_gen::spawn_proposal_gate(&root)
             .expect("resolving natural spawn proposal hooks");
         std::fs::write(out_dir.join("spawn_proposal_hooks.rs"), hooks)

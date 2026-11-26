@@ -218,6 +218,23 @@ pub fn spawn_proposal_gate(root: &Path) -> Result<(String, Option<&'static str>)
     Ok((table, verdict))
 }
 
+/// Item turns include non-catalog calls. Staged code can bypass the runtime hook
+/// registry, so only a missing record or a record with no applied code is quiet.
+pub fn item_turn_has_staged_code(root: &Path) -> bool {
+    let source = match std::fs::read_to_string(root.join(MODS_STAGE)) {
+        Ok(source) => source,
+        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+    };
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(&source) else {
+        return true;
+    };
+    ["injections", "modules"].iter().any(|key| {
+        record[*key]
+            .as_array()
+            .is_none_or(|entries| !entries.is_empty())
+    })
+}
+
 /// Appends every `.rs` file under `dir` to `out`.
 fn read_rust(dir: &Path, out: &mut String) {
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
