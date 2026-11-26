@@ -20,7 +20,9 @@ pub const NOISE_SETTINGS: &str = "settings";
 
 /// Pack folders (`data/<ns>/<kind>/`) the chunk generator reads, and the
 /// bundle each joins.
-const KINDS: [(&str, &str); 16] = [
+pub const BIOME_PARAMETER_LISTS: &str = "biome_parameter_lists";
+
+const KINDS: [(&str, &str); 17] = [
     ("dimension", DIMENSIONS),
     ("dimension_type", DIMENSION_TYPES),
     ("worldgen/biome", "biomes"),
@@ -33,6 +35,10 @@ const KINDS: [(&str, &str); 16] = [
     ("worldgen/material_rule", "rules"),
     ("worldgen/noise", "noises"),
     ("worldgen/noise_settings", NOISE_SETTINGS),
+    (
+        "worldgen/multi_noise_biome_source_parameter_list",
+        BIOME_PARAMETER_LISTS,
+    ),
     ("worldgen/placed_feature", "placed_features"),
     ("worldgen/processor_list", "processor_lists"),
     ("worldgen/structure", "structures"),
@@ -203,6 +209,7 @@ impl LevelHeight {
 /// Replacement and added bundle entries, and tag files, from data packs.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct WorldgenOverrides {
+    cpu_only: bool,
     templates: BTreeMap<String, horizon_assets::resource_source::Resource>,
     /// Bundle name → id → the highest pack's JSON text for it.
     entries: BTreeMap<String, BTreeMap<String, String>>,
@@ -210,6 +217,15 @@ pub struct WorldgenOverrides {
     tags: BTreeMap<String, Vec<(String, String, String)>>,
 }
 impl WorldgenOverrides {
+    /// Disable GPU world generation for the world using this bundle.
+    pub fn require_cpu(&mut self) {
+        self.cpu_only = true;
+    }
+
+    pub fn cpu_only(&self) -> bool {
+        self.cpu_only
+    }
+
     /// Lazy gzip NBT entries, retaining their source generation for cache identity.
     pub fn templates(&self) -> &BTreeMap<String, horizon_assets::resource_source::Resource> {
         &self.templates

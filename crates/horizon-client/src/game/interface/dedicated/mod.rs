@@ -831,54 +831,117 @@ fn parse_identifier(text: &str) -> Option<String> {
     (valid(namespace, &[]) && valid(path, &['/'])).then(|| format!("{namespace}:{path}"))
 }
 
+/// Look up an additional WORLD_PRESET entry in the creation pack stack.
+fn pack_world_preset(
+    dir: &std::path::Path,
+    resources: &std::path::Path,
+    passive: &horizon_assets::resource_source::ResourceSource,
+    additional: &[Arc<horizon_client::datapack::DataPack>],
+    id: &str,
+) -> Result<Option<Tag>> {
+    use horizon_client::datapack::{DataPack, enabled_ids};
+
+    if !horizon_core::level_id::valid_level_id(id) {
+        return Ok(None);
+    }
+    let (namespace, path) = id.split_once(':').expect("validated preset id");
+    let file = format!("data/{namespace}/worldgen/world_preset/{path}.json");
+    let packs = super::pack_finders::data_repository(dir, resources, additional);
+    // Dedicated creation starts with the default feature configuration.
+    let enabled = enabled_ids(dir, &packs, &[]);
+    let bytes = enabled
+        .iter()
+        .rev()
+        .filter_map(|id| packs.iter().find(|pack| &pack.id == id))
+        .find_map(|pack| pack.read(&file))
+        .or_else(|| DataPack::from_source("horizon-content".into(), passive.clone()).read(&file));
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let json: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("Invalid world preset {id}: {e}"))?;
+    let dimensions = horizon_client::save::json_tag(&json["dimensions"]);
+    if !horizon_client::save::valid_world_gen_dimensions(&dimensions) {
+        return Err(format!("Invalid dimensions in world preset {id}").into());
+    }
+    Ok(Some(dimensions))
+}
+
+fn write_level_type(
+    dir: &std::path::Path,
+    seed: i64,
+    structures: bool,
+    level_type: &str,
+    lookup: impl FnOnce(&str) -> Result<Option<Tag>>,
+    flat_settings: impl FnOnce() -> Option<Tag>,
+) -> Result<()> {
+    use horizon_client::save::{self, WorldGen, WorldPreset};
+
+    let id = parse_identifier(level_type);
+    let builtin = id.as_deref().and_then(WorldPreset::of_id).or_else(|| {
+        LEGACY_PRESET_NAMES
+            .iter()
+            .find(|(name, _)| *name == level_type)
+            .map(|(_, preset)| *preset)
+    });
+    let (preset, custom) = if let Some(preset) = builtin {
+        (preset, None)
+    } else if let Some(id) = id
+        && let Some(dimensions) = lookup(&id)?
+    {
+        (WorldPreset::Normal, Some((id, dimensions)))
+    } else {
+        log_from(
+            "Worker-Main-1",
+            "WARN",
+            &format!("Failed to parse level-type {level_type}, defaulting to minecraft:normal"),
+        );
+        (WorldPreset::Normal, None)
+    };
+    let options = WorldGen {
+        preset,
+        structures,
+        bonus_chest: false,
+    };
+    if let Some((id, dimensions)) = custom {
+        save::write_world_gen_settings_for_preset(
+            dir, seed, options, None, None, Some(dimensions), Some(&id),
+        )
+    } else {
+        let settings = (preset == WorldPreset::Flat).then(flat_settings).flatten();
+        save::write_world_gen_settings_with(dir, seed, options, settings, None, None)
+    }
+}
+
 impl Game<'_> {
-    /// DedicatedServerProperties.createDimensions for a world that doesn't
-    /// exist yet: `level-type`'s preset, a flat world's `generator-settings`
-    /// and `generate-structures`, written before the world opens so that
-    /// streaming reads them.
+    /// Resolve `level-type` and save the new world's settings before streaming opens it.
     fn write_world_gen(&self, dir: &std::path::Path, props: &ServerProperties) -> Result<()> {
-        let level_type = &props.level_type;
-        let preset = parse_identifier(level_type)
-            .as_deref()
-            .and_then(horizon_client::save::WorldPreset::of_id)
-            .or_else(|| {
-                LEGACY_PRESET_NAMES
-                    .iter()
-                    .find(|(name, _)| *name == level_type)
-                    .map(|(_, preset)| *preset)
-            })
-            .unwrap_or_else(|| {
-                log_from(
-                    "Worker-Main-1",
-                    "WARN",
-                    &format!(
-                        "Failed to parse level-type {level_type}, defaulting to minecraft:normal"
-                    ),
+        write_level_type(
+            dir,
+            props.seed,
+            props.generate_structures,
+            &props.level_type,
+            |id| {
+                pack_world_preset(
+                    dir,
+                    &self.options.resources,
+                    &self.pack.data_changes,
+                    &self.pack.additional_data,
+                    id,
+                )
+            },
+            || {
+                let biomes = world_biomes!(self);
+                let (settings, errors) = horizon_client::flatgen::settings_from_json(
+                    &props.generator_settings,
+                    |b| self.pack.assets.registry.default_state(b).is_some(),
+                    |b| biomes.get(biomes.id(b)).name == b,
                 );
-                horizon_client::save::WorldPreset::Normal
-            });
-        let flat = preset == horizon_client::save::WorldPreset::Flat;
-        let settings = if flat {
-            let biomes = world_biomes!(self);
-            let (settings, errors) = horizon_client::flatgen::settings_from_json(
-                &props.generator_settings,
-                |b| self.pack.assets.registry.default_state(b).is_some(),
-                |b| biomes.get(biomes.id(b)).name == b,
-            );
-            for e in errors {
-                log_from("Worker-Main-1", "ERROR", &e);
-            }
-            settings
-        } else {
-            None
-        };
-        let options = horizon_client::save::WorldGen {
-            preset,
-            structures: props.generate_structures,
-            bonus_chest: false,
-        };
-        horizon_client::save::write_world_gen_settings_with(
-            dir, props.seed, options, settings, None, None,
+                for e in errors {
+                    log_from("Worker-Main-1", "ERROR", &e);
+                }
+                settings
+            },
         )
     }
 }
@@ -1137,7 +1200,8 @@ impl Game<'_> {
         // Main's WorldLoader: a new world's dimensions come from
         // server.properties before the server starts.
         let world_dir = std::env::current_dir()?.join(&universe).join(&level_name);
-        let new_world = !world_dir.join("level.dat").exists();
+        let new_world =
+            !world_dir.join("level.dat").exists() && !world_dir.join("level.dat_old").exists();
         if new_world {
             self.write_world_gen(&world_dir, &props)?;
         } else {
@@ -3405,6 +3469,116 @@ mod tests {
         assert!(lists.bans.remove(&steve));
         assert!(lists.can_login(address, &steve).is_none());
         fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod level_type_tests {
+    use super::{pack_world_preset, write_level_type};
+    use horizon_assets::resource_source::ResourceSource;
+    use horizon_client::save::{self, WorldGen, WorldPreset};
+    use horizon_core::nbt::Tag;
+    use std::{fs, path::Path};
+
+    fn put(root: &Path, file: &str, value: &str) {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, value).unwrap();
+    }
+
+    #[test]
+    fn f20_level_type_persists_pack_dimensions() {
+        let temp = tempfile::tempdir().unwrap();
+        let world = temp.path().join("world");
+        let resources = temp.path().join("resources");
+        let mod_root = temp.path().join("mod");
+        let passive = ResourceSource::directory(mod_root.clone());
+        let pack = world.join("datapacks/fixture");
+        const FILE: &str = "data/example/worldgen/world_preset/terrain/fixture.json";
+        const PRESET: &str = r#"{"dimensions":{"minecraft:overworld":{
+            "type":"minecraft:overworld","generator":{"type":"minecraft:noise",
+            "settings":"example:settings","biome_source":{"type":"minecraft:multi_noise",
+            "preset":"example:climate"}}}}}"#;
+
+        put(&mod_root, FILE, &PRESET.replace("example:settings", "example:mod_settings"));
+        put(&pack, "pack.mcmeta", r#"{"pack":{"description":"fixture"}}"#);
+        put(&pack, FILE, PRESET);
+        let lookup = |id: &str| pack_world_preset(&world, &resources, &passive, &[], id);
+        let id = "example:terrain/fixture";
+        write_level_type(&world, 421, false, id, lookup, || panic!("noise world")).unwrap();
+
+        let settings = save::world_gen_settings(&world).unwrap();
+        assert_eq!(settings.get("seed"), Some(&Tag::Long(421)));
+        assert_eq!(settings.get("generate_structures"), Some(&Tag::Byte(0)));
+        assert_eq!(settings.get("bonus_chest"), Some(&Tag::Byte(0)));
+        let expected: serde_json::Value = serde_json::from_str(PRESET).unwrap();
+        assert_eq!(settings.get("dimensions"), Some(&save::json_tag(&expected["dimensions"])));
+        assert_eq!(save::read_saved_preset(&world).unwrap().0.as_deref(), Some(id));
+        assert!(save::uses_custom_world_preset(&world));
+
+        put(&world, "datapacks.json", r#"{"disabled":["file/fixture"]}"#);
+        let from_mod = lookup(id).unwrap().unwrap();
+        let generator = from_mod.get("minecraft:overworld").unwrap().get("generator").unwrap();
+        assert_eq!(generator.get("settings"), Some(&Tag::String("example:mod_settings".into())));
+    }
+
+    #[test]
+    fn f20_level_type_preserves_builtin_legacy_and_unknown_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let actual = temp.path().join("actual");
+        let expected = temp.path().join("expected");
+        let saved = "data/minecraft/world_gen_settings.dat";
+
+        for (level_type, preset, builtin) in [
+            ("minecraft:normal", WorldPreset::Normal, true),
+            ("normal", WorldPreset::Normal, true),
+            ("minecraft:flat", WorldPreset::Flat, true),
+            ("minecraft:large_biomes", WorldPreset::LargeBiomes, true),
+            ("minecraft:amplified", WorldPreset::Amplified, true),
+            ("minecraft:single_biome_surface", WorldPreset::SingleBiomeSurface, true),
+            ("minecraft:debug_all_block_states", WorldPreset::Debug, true),
+            ("default", WorldPreset::Normal, true),
+            ("largebiomes", WorldPreset::LargeBiomes, true),
+            ("example:missing", WorldPreset::Normal, false),
+            ("Example:Bad", WorldPreset::Normal, false),
+        ] {
+            let flat = || {
+                (preset == WorldPreset::Flat).then(|| {
+                    save::json_tag(&serde_json::json!({
+                        "biome": "minecraft:plains",
+                        "layers": [{"block": "minecraft:stone", "height": 7}],
+                    }))
+                })
+            };
+            write_level_type(
+                &actual,
+                421,
+                false,
+                level_type,
+                |id| {
+                    assert!(!builtin, "unexpected registry lookup for {level_type}");
+                    assert_eq!(id, "example:missing");
+                    Ok(None)
+                },
+                flat,
+            )
+            .unwrap();
+            save::write_world_gen_settings_with(
+                &expected,
+                421,
+                WorldGen { preset, structures: false, bonus_chest: false },
+                flat(),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(actual.join(saved)).unwrap(),
+                fs::read(expected.join(saved)).unwrap(),
+                "{level_type}"
+            );
+            assert!(!save::uses_custom_world_preset(&actual));
+        }
     }
 }
 

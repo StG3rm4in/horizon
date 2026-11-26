@@ -768,22 +768,27 @@ where
                 sea_level: settings.sea_level,
             }),
         };
-        let gpu_codes = gpu_aquifer.is_some();
-        let gpu = horizon_gpu::GpuFinalDensity::new(
-            library.compiler(),
-            final_density_id,
-            seed,
-            settings.legacy,
-            router.get(RouterField::FinalDensity).clone(),
-            settings.noise_min_y,
-            settings.noise_height,
-            &format!(
-                "noise y {}..{}",
+        let gpu_enabled = !data.cpu_only;
+        let gpu_codes = gpu_enabled && gpu_aquifer.is_some();
+        let gpu = if gpu_enabled {
+            horizon_gpu::GpuFinalDensity::new(
+                library.compiler(),
+                final_density_id,
+                seed,
+                settings.legacy,
+                router.get(RouterField::FinalDensity).clone(),
                 settings.noise_min_y,
-                settings.noise_min_y + settings.noise_height
-            ),
-            gpu_aquifer,
-        );
+                settings.noise_height,
+                &format!(
+                    "noise y {}..{}",
+                    settings.noise_min_y,
+                    settings.noise_min_y + settings.noise_height
+                ),
+                gpu_aquifer,
+            )
+        } else {
+            None
+        };
         let preliminary = router.get(RouterField::ChunkSurfaceLevel).clone();
         let mut source_json = generator["biome_source"].to_string();
         let definition = data.source_catalog.decode(&source_json)?;
@@ -859,9 +864,11 @@ where
         );
         let mut surface_gpu = None;
         // `1`, as the other stages' switches: `=0` used to turn the test on.
-        let surface_test = std::env::var("HORIZON_GPU_SURFACE_TEST").is_ok_and(|v| v == "1");
-        let surface_inline =
-            !surface_test && std::env::var("HORIZON_GPU_SURFACE").is_ok_and(|v| v == "1");
+        let surface_test =
+            gpu_enabled && std::env::var("HORIZON_GPU_SURFACE_TEST").is_ok_and(|v| v == "1");
+        let surface_inline = gpu_enabled
+            && !surface_test
+            && std::env::var("HORIZON_GPU_SURFACE").is_ok_and(|v| v == "1");
         if (surface_test || surface_inline) && gpu.is_some() {
             if surface_test {
                 surface_gpu_test(
@@ -1041,6 +1048,7 @@ where
             }
         }
         let geodes_gpu = match std::env::var("HORIZON_GPU_GEODES").as_deref() {
+            _ if !gpu_enabled => None,
             Ok("1" | "test") if !data.geode_base_bundle => {
                 eprintln!("GPU geodes: worldgen overrides present; using CPU");
                 None
@@ -1071,7 +1079,7 @@ where
             _ => None,
         };
         let ores_gpu = match std::env::var("HORIZON_GPU_ORES").as_deref() {
-            Ok("1" | "test") => match horizon_gpu::OreGpu::new() {
+            Ok("1" | "test") if gpu_enabled => match horizon_gpu::OreGpu::new() {
                 Ok(g) => Some(g),
                 Err(e) => {
                     eprintln!("GPU ores: no ores on the GPU: {e}");
@@ -1081,7 +1089,7 @@ where
             _ => None,
         };
         let (caves_gpu, caves_test) = match std::env::var("HORIZON_GPU_CAVES").as_deref() {
-            Ok(v @ ("1" | "test")) => {
+            Ok(v @ ("1" | "test")) if gpu_enabled => {
                 match horizon_gpu::CaveGpu::new(horizon_core::geometry::trig::sine_table()) {
                     Ok(g) => (Some(g), v == "test"),
                     Err(e) => {
@@ -1097,7 +1105,7 @@ where
         // against the CPU's.
         let (biomes_gpu, biomes_test) =
             match (std::env::var("HORIZON_GPU_BIOMES").as_deref(), &source) {
-                (Ok(v @ ("1" | "test")), ResolvedBiomeSource::MultiNoise(multi)) => {
+                (Ok(v @ ("1" | "test")), ResolvedBiomeSource::MultiNoise(multi)) if gpu_enabled => {
                     let index = multi.parameters();
                     let (spaces, links) = index.tree();
                     let entry_ids: Vec<u32> = index
@@ -1136,7 +1144,7 @@ where
         // HORIZON_GPU_BIOMES says; `test` checks each answer against the CPU's.
         let (locate_gpu, locate_test) =
             match (std::env::var("HORIZON_GPU_LOCATE").as_deref(), &source) {
-                (Ok(v @ ("1" | "test")), ResolvedBiomeSource::MultiNoise(multi)) => {
+                (Ok(v @ ("1" | "test")), ResolvedBiomeSource::MultiNoise(multi)) if gpu_enabled => {
                     let (spaces, links) = multi.parameters().tree();
                     match horizon_gpu::LocateGpu::new(
                         library.compiler(),
@@ -1194,8 +1202,8 @@ where
             caves_test,
             carver_plans: Mutex::new(HashMap::new()),
             gpu_sections: match std::env::var("HORIZON_GPU_SECTIONS").as_deref() {
-                Ok("1") => 1,
-                Ok("test") => 2,
+                Ok("1") if gpu_enabled => 1,
+                Ok("test") if gpu_enabled => 2,
                 _ => 0,
             },
             section_flags: OnceLock::new(),
