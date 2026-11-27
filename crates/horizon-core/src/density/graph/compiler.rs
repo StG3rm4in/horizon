@@ -51,6 +51,14 @@ impl DensityCompiler {
         compiler.context = Some(seeded::SeededContext::new(seed, use_legacy_random));
         compiler
     }
+    /// Validate the declaration seed against the one used to bind CPU samplers.
+    pub fn boxed_density_domain(&self, seed: i64) -> Result<BoxedDensityDomain, &'static str> {
+        let domain = self.graph.boxed_density_domain(seed)?;
+        if !domain.is_empty() && self.context.as_ref().map(|c| c.seed()) != Some(seed) {
+            return Err("boxed density seed differs from the compiler seed");
+        }
+        Ok(domain)
+    }
     pub fn graph(&self) -> &DensityGraph {
         &self.graph
     }

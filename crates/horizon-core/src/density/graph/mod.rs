@@ -389,6 +389,9 @@ impl std::error::Error for CompileError {}
 /// A density node whose sampler needs the world seed, which decoding doesn't have: a seeded
 /// compiler asks for it with its own seed (a mod's density function type).
 pub trait SeededDensity: std::fmt::Debug + Send + Sync {
+    fn constant_outside_xz(&self, _seed: i64) -> Option<([i32; 2], [i32; 2], f32)> {
+        None
+    }
     fn sampler(&self, seed: i64) -> Arc<dyn DensitySampler>;
 }
 
@@ -423,7 +426,105 @@ pub struct DensityGraph {
     holders: Vec<FunctionId>,
     function_names: HashMap<String, FunctionId>,
 }
+/// Conservative horizontal footprint of native density reads in one seeded graph.
+#[derive(Clone, Debug, Default)]
+pub struct BoxedDensityDomain {
+    boxes: Vec<([i32; 2], [i32; 2])>,
+    padding: i64,
+}
+
+impl BoxedDensityDomain {
+    pub fn is_empty(&self) -> bool {
+        self.boxes.is_empty()
+    }
+
+    /// True if the inclusive rectangle, expanded for graph-level reads, is disjoint
+    /// from every declaration. Reject possible block-coordinate wrapping.
+    pub fn permits(&self, low: [i64; 2], high: [i64; 2]) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        let low = low.map(|x| x - self.padding);
+        let high = high.map(|x| x + self.padding);
+        (0..2).all(|axis| {
+            low[axis] >= i64::from(i32::MIN)
+                && low[axis] <= high[axis]
+                && high[axis] <= i64::from(i32::MAX)
+        }) && self.boxes.iter().all(|(min, max)| {
+            (0..2).any(|axis| high[axis] < i64::from(min[axis]) || low[axis] > i64::from(max[axis]))
+        })
+    }
+}
+
 impl DensityGraph {
+    fn native_box(&self, id: FunctionId, seed: i64) -> Option<([i32; 2], [i32; 2], f32)> {
+        let Definition::Seeded { factory, range, .. } = &self.entries.get(id.0)?.definition else {
+            return None;
+        };
+        let (min, max, value) = factory.constant_outside_xz(seed)?;
+        (min[0] <= max[0] && min[1] <= max[1] && value.is_finite() && range.contains(value))
+            .then_some((min, max, value))
+    }
+
+    /// A GPU literal, usable only after checking the evaluation's horizontal footprint.
+    pub fn boxed_native_constant(&self, id: FunctionId, seed: i64) -> Option<f32> {
+        self.native_box(id, seed).map(|(_, _, value)| value)
+    }
+
+    /// Certify the graph shared by the router, aquifer and material library. Check every
+    /// entry, including unused declarations, so all stages have the same refusal policy.
+    pub fn boxed_density_domain(&self, seed: i64) -> Result<BoxedDensityDomain, &'static str> {
+        let mut domain = BoxedDensityDomain::default();
+        if !self
+            .entries
+            .iter()
+            .any(|entry| matches!(&entry.definition, Definition::Seeded { .. }))
+        {
+            return Ok(domain);
+        }
+
+        // Graph edges point to earlier entries. Some(0) denotes a read of a native leaf
+        // at the current point. None denotes a subgraph with no native reads.
+        let mut offsets: Vec<Option<i64>> = Vec::with_capacity(self.entries.len());
+        for (index, entry) in self.entries.iter().enumerate() {
+            let offset = match &entry.definition {
+                Definition::Seeded { .. } => {
+                    let (low, high, _) = self
+                        .native_box(FunctionId(index), seed)
+                        .ok_or("missing or invalid native density box")?;
+                    domain.boxes.push((low, high));
+                    Some(0)
+                }
+                Definition::Bound { .. } => None,
+                Definition::Node(node) => {
+                    let child = node
+                        .children()
+                        .into_iter()
+                        .filter_map(|id| offsets[id.0])
+                        .max();
+                    match (node, child) {
+                        (GraphNode::Slice { axis, .. }, Some(_)) if !matches!(*axis, Axis::Y) => {
+                            return Err("horizontal slice above a boxed native density");
+                        }
+                        (GraphNode::Interpolated { xz, .. }, Some(child)) => {
+                            // One cell for corners and up to one more cell when a
+                            // strided child volume is expanded to a dense volume.
+                            let offset = child + 2 * i64::from(*xz);
+                            if offset > i64::from(i32::MAX) {
+                                return Err("native density interpolation footprint overflows");
+                            }
+                            Some(offset)
+                        }
+                        (_, child) => child,
+                    }
+                }
+            };
+            domain.padding = domain.padding.max(offset.unwrap_or(0));
+            offsets.push(offset);
+        }
+        Ok(domain)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

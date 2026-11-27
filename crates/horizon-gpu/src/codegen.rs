@@ -158,6 +158,8 @@ struct Gen<'a> {
     /// a node with Y, computed once before the loop (`hK` variables).
     hoisted: Option<Vec<FunctionId>>,
     n_descents: usize,
+    seed: i64,
+    final_density_program: bool,
 }
 
 /// A precomputed layer: for each axis, cell (integer bits), position and smoothing.
@@ -166,8 +168,7 @@ fn layer_step(t: [i32; 3]) -> usize {
 }
 
 impl<'a> Gen<'a> {
-    /// `_seed`: the world seed, which the noises the graph holds already carry.
-    fn new(c: &'a DensityCompiler, main_grid: Grid, root: Option<FunctionId>, _seed: i64) -> Self {
+    fn new(c: &'a DensityCompiler, main_grid: Grid, root: Option<FunctionId>, seed: i64) -> Self {
         Self {
             axes: Vec::new(),
             index_axes: HashMap::new(),
@@ -191,6 +192,8 @@ impl<'a> Gen<'a> {
             point_functions: HashMap::new(),
             hoisted: None,
             n_descents: 0,
+            seed,
+            final_density_program: root.is_some(),
         }
     }
     /// `__device__ float sdN(int x, int z, float upper)`: FindTopSurfaceSampler's descent from the
@@ -332,6 +335,14 @@ impl<'a> Gen<'a> {
     fn pointwise(&self, id: FunctionId) -> R<bool> {
         let mut todo = vec![id];
         while let Some(id) = todo.pop() {
+            if self
+                .c
+                .graph()
+                .boxed_native_constant(id, self.seed)
+                .is_some()
+            {
+                continue;
+            }
             match self.c.graph().node(id).ok_or("missing node")? {
                 GraphNode::Constant(_)
                 | GraphNode::Gradient { .. }
@@ -667,6 +678,11 @@ impl<'a> Gen<'a> {
 
     /// Expression of the value of `id` in the current kernel (literal, variable or memory read).
     fn value(&mut self, ssa: &mut Ssa, id: FunctionId, g: usize, ctx_3d: bool) -> R<String> {
+        // Keep the original range, axes, and constant-folding decisions for the
+        // enclosing graph. Only the opaque leaf's value becomes a literal.
+        if let Some(v) = self.c.graph().boxed_native_constant(id, self.seed) {
+            return Ok(f32lit(v));
+        }
         if let Some(v) = self.constant(id) {
             return Ok(f32lit(v));
         }
@@ -731,6 +747,12 @@ impl<'a> Gen<'a> {
                 let v = self.value(ssa, input, g, d3)?;
                 ssa.vars.insert(id, v.clone());
                 return Ok(v);
+            }
+            GraphNode::WorldField(WorldField::Beardifier)
+                if !self.final_density_program
+                    && !self.c.boxed_density_domain(self.seed)?.is_empty() =>
+            {
+                return Err("boxed auxiliary GPU graph reads a contextual beardifier".into());
             }
             GraphNode::WorldField(f) => f32lit(if matches!(f, WorldField::BlendAlpha) {
                 1.0
@@ -1271,7 +1293,7 @@ pub(crate) struct Program {
 /// with no beardifier in `x`: vanilla's final_density. The GPU evaluates the beardifier as 0 and
 /// adds the structures' beard to the result, which is exact only for that shape; a datapack that
 /// puts the beardifier elsewhere keeps its chunks with structures on the CPU.
-pub(crate) fn beard_added_last(c: &DensityCompiler, root: FunctionId) -> bool {
+pub(crate) fn beard_added_last(c: &DensityCompiler, root: FunctionId, seed: i64) -> bool {
     let g = c.graph();
     let peel = |mut id: FunctionId| loop {
         match g.node(id) {
@@ -1285,11 +1307,15 @@ pub(crate) fn beard_added_last(c: &DensityCompiler, root: FunctionId) -> bool {
             Some(GraphNode::WorldField(WorldField::Beardifier))
         )
     };
-    // A bound sampler (no definition) may read anything: counted as a beardifier
+    // A certified native leaf emits a literal for this seed. Other opaque samplers
+    // may read a beardifier, so keep the conservative fallback for them.
     let reads_beard = |id: FunctionId| {
         let (mut todo, mut seen) = (vec![id], HashSet::new());
         while let Some(id) = todo.pop() {
             if !seen.insert(id) {
+                continue;
+            }
+            if g.boxed_native_constant(id, seed).is_some() {
                 continue;
             }
             match g.node(id) {
@@ -1394,7 +1420,7 @@ pub(crate) fn generate(
         edges: g.edges.iter().map(|b| b.len()).collect(),
         axes,
         lines,
-        beard_last: beard_added_last(c, root),
+        beard_last: beard_added_last(c, root, seed),
     })
 }
 
@@ -2137,4 +2163,56 @@ extern "C" __global__ void ksf_blocks(const signed char *CODES, const unsigned s
         level,
         veins_y: (vlo, vh),
     })
+}
+
+#[cfg(test)]
+mod f11_coverage_tests {
+    use super::*;
+    use horizon_core::density::{
+        ConstantSampler, DensitySampler, Interval,
+        graph::{DensityGraph, SeededDensity},
+    };
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct BoxedLeaf;
+
+    impl SeededDensity for BoxedLeaf {
+        fn sampler(&self, _: i64) -> Arc<dyn DensitySampler> {
+            Arc::new(ConstantSampler(0.0))
+        }
+
+        fn constant_outside_xz(&self, seed: i64) -> Option<([i32; 2], [i32; 2], f32)> {
+            (seed == 42).then_some(([0, 0], [15, 15], 0.0))
+        }
+    }
+
+    #[test]
+    fn f11_coverage_beard_uses_the_emitted_leaf_contract() {
+        let mut graph = DensityGraph::new();
+        let native = graph
+            .bind_seeded(Arc::new(BoxedLeaf), Interval::new(0.0, 1.0).unwrap(), 5)
+            .unwrap();
+        let terrain = graph.insert(GraphNode::Cache(native)).unwrap();
+        let beard = graph
+            .insert(GraphNode::WorldField(WorldField::Beardifier))
+            .unwrap();
+        let mut add = |left, right| {
+            graph
+                .insert(GraphNode::Binary {
+                    kind: GraphBinary::Add,
+                    left,
+                    right,
+                })
+                .unwrap()
+        };
+        let final_density = add(terrain, beard);
+        let two_beards = add(final_density, beard);
+        let compiler = DensityCompiler::new_seeded(graph, 42, false);
+
+        let program = generate(&compiler, final_density, 42, [16, 384, 16]).unwrap();
+        assert!(program.beard_last);
+        assert!(!beard_added_last(&compiler, final_density, 41));
+        assert!(!beard_added_last(&compiler, two_beards, 42));
+    }
 }

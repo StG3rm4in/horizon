@@ -49,6 +49,7 @@
 //! (`HORIZON_GPU_LOCATE`: `/locate biome`, `findClosestBiome3d`, the map previews) with the
 //! climate of the biome stage, for the CPU to replay in each search's order.
 mod biomes;
+pub mod boxed_density;
 mod caves;
 mod codegen;
 mod exposure;
@@ -82,7 +83,7 @@ use crate::cuda::driver::{
     PushKernelArg,
 };
 use crate::cuda::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
-use horizon_core::density::graph::{DensityCompiler, FunctionId};
+use horizon_core::density::graph::{BoxedDensityDomain, DensityCompiler, FunctionId};
 use horizon_core::density::{Beardifier, DensitySampler, SamplerContext, TerrainAdjustment};
 use horizon_core::noise::DensityVolume;
 use std::collections::HashMap;
@@ -236,15 +237,21 @@ impl GpuFinalDensity {
         aquifer: Option<AquiferSetup>,
     ) -> Option<Self> {
         let mode = std::env::var("HORIZON_GPU_DENSITY").ok()?;
-        // `1` or `wait`, as the other stages take `1` or `test`: `false` or `off` keep the CPU too.
-        if mode != "1" && mode != "wait" {
+        let test = mode == "test";
+        if mode != "1" && mode != "wait" && !test {
             if !mode.is_empty() && mode != "0" {
                 log::warn!(
-                    "HORIZON_GPU_DENSITY={mode}: neither 1 nor wait, final_density stays on the CPU"
+                    "HORIZON_GPU_DENSITY={mode}: expected 1, wait or test, final_density stays on the CPU"
                 );
             }
             return None;
         }
+        let domain = compiler
+            .boxed_density_domain(seed)
+            .map_err(|reason| {
+                log::info!("GPU final_density ({name}): {reason}");
+            })
+            .ok()?;
         let _ = legacy;
         let r = env_or("HORIZON_GPU_REGION", 8).clamp(1, 32);
         let capacity = env_or("HORIZON_GPU_REGIONS_MAX", 128).max(1) as usize;
@@ -291,8 +298,15 @@ impl GpuFinalDensity {
         let p = shared.clone();
         let work = move || {
             let t = Instant::now();
-            let m = Engine::start(prog, aquifer_prog, r, capacity, min_y, height)
-                .and_then(|m| m.auto_test(&*cpu).map(|()| m));
+            let m = Engine::start(prog, aquifer_prog, r, capacity, min_y, height, domain).and_then(
+                |mut m| {
+                    m.auto_test(&*cpu)?;
+                    if test {
+                        m.test_cpu = Some(cpu);
+                    }
+                    Ok(m)
+                },
+            );
             match m {
                 Ok(m) => {
                     let msg = format!(
@@ -322,7 +336,7 @@ impl GpuFinalDensity {
                 }
             }
         };
-        if mode == "wait" {
+        if mode == "wait" || test {
             work();
         } else if let Err(e) = std::thread::Builder::new()
             .name("horizon-gpu".into())
@@ -408,7 +422,8 @@ impl GpuFinalDensity {
             Some(b) => m.chunk_codes_beard(chunk_x, chunk_z, b, out, None, caves),
             None => m.chunk_codes(chunk_x, chunk_z, out, None, caves),
         };
-        if states.len() != out.len()
+        if !sg.eligible_chunk(chunk_x, chunk_z)
+            || states.len() != out.len()
             || out.len() != 256 * sg.height as usize
             || biomes.len() != sg.biome_count()
         {
@@ -455,6 +470,16 @@ impl GpuFinalDensity {
         (skip, surface)
     }
 
+    /// Completed density or block-code readbacks, and rejected aquifer limits.
+    #[doc(hidden)]
+    pub fn f11_density_counts(&self) -> Option<(u64, u64)> {
+        let engine = self.shared.engine.get()?.as_ref()?;
+        Some((
+            engine.stats.chunks.load(Relaxed),
+            engine.stats.mismatches.load(Relaxed),
+        ))
+    }
+
     /// A chunk whose blocks the CPU recomputed: the air limit of its aquifer differed from the GPU.
     pub fn note_aquifer_mismatch(&self) {
         if let Some(Some(m)) = self.shared.engine.get() {
@@ -467,6 +492,172 @@ impl GpuFinalDensity {
         if let Some(Some(m)) = self.shared.engine.get() {
             m.stats.fallbacks.fetch_add(1, Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod f11_runtime_tests {
+    use super::*;
+    use horizon_core::density::{
+        ConstantSampler, Interval, RigidPiece, StructureBounds, WorldField, WorldFields,
+        graph::{DensityGraph, GraphBinary, GraphNode, SeededDensity},
+    };
+
+    const SEED: i64 = 42;
+    const HEIGHT: i32 = 16;
+    const N: usize = 256 * HEIGHT as usize;
+    const BOX_EDGE: [i32; 2] = [16, 8];
+    const OUTSIDE: (i32, i32) = (2, 0);
+
+    #[derive(Debug)]
+    struct BoxedLeaf(f32);
+
+    impl SeededDensity for BoxedLeaf {
+        fn sampler(&self, _: i64) -> Arc<dyn DensitySampler> {
+            // ConstantSampler returns these same bits for both point and volume reads.
+            Arc::new(ConstantSampler(self.0))
+        }
+
+        fn constant_outside_xz(&self, _: i64) -> Option<([i32; 2], [i32; 2], f32)> {
+            Some((BOX_EDGE, BOX_EDGE, self.0))
+        }
+    }
+
+    fn bind_leaf(graph: &mut DensityGraph, value: f32) -> FunctionId {
+        graph
+            .bind_seeded(
+                Arc::new(BoxedLeaf(value)),
+                Interval::new(-1.0, 1.0).unwrap(),
+                5,
+            )
+            .unwrap()
+    }
+
+    fn signed_zero_graph() -> (DensityCompiler, FunctionId) {
+        let mut graph = DensityGraph::new();
+        let root = bind_leaf(&mut graph, -0.0);
+        (DensityCompiler::new_seeded(graph, SEED, false), root)
+    }
+
+    fn cpu_volume(
+        compiler: &DensityCompiler,
+        root: FunctionId,
+        (cx, cz): (i32, i32),
+        context: &mut SamplerContext,
+    ) -> Vec<f32> {
+        let volume = DensityVolume::new([16, HEIGHT, 16], [cx * 16, 0, cz * 16], [1; 3]).unwrap();
+        let mut out = vec![f32::NAN; N];
+        compiler
+            .compile_raw(root)
+            .unwrap()
+            .sample_volume(context, &mut out, volume)
+            .expect("CPU density volume");
+        assert!(out.iter().all(|value| value.is_finite()));
+        out
+    }
+
+    #[test]
+    fn f11_signed_zero_cuda_literal() {
+        let (compiler, root) = signed_zero_graph();
+        let program = codegen::generate(&compiler, root, SEED, [16, HEIGHT, 16]).unwrap();
+        assert!(
+            program
+                .src
+                .contains("MEM[OUTPUT_0 + gi] = __int_as_float((int)0x80000000u);"),
+            "the generated final-density store must use the negative-zero literal"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device and NVRTC; optional HORIZON_GPU_DEVICE selects the device"]
+    fn f11_signed_zero_gpu_density_bits() {
+        let (compiler, root) = signed_zero_graph();
+        let program = codegen::generate(&compiler, root, SEED, [16, HEIGHT, 16]).unwrap();
+        let domain = compiler.boxed_density_domain(SEED).unwrap();
+        let gpu = Engine::start(program, None, 1, 2, 0, HEIGHT, domain)
+            .expect("start the signed-zero CUDA engine");
+        let (cx, cz) = OUTSIDE;
+        assert!(gpu.eligible_chunk(cx, cz));
+        let mut actual = vec![f32::NAN; N];
+        assert!(
+            gpu.chunk(cx, cz, &mut actual),
+            "eligible GPU density readback"
+        );
+        let expected = cpu_volume(&compiler, root, OUTSIDE, &mut SamplerContext::cached());
+        for (i, (got, want)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(want.to_bits(), 0x8000_0000, "CPU slot {i}");
+            assert_eq!(got.to_bits(), want.to_bits(), "GPU density slot {i}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device and NVRTC; HORIZON_GPU_BEARD must not be 0; optional HORIZON_GPU_DEVICE"]
+    fn f11_boxed_gpu_beard_codes_and_touching_fallback() {
+        let mut graph = DensityGraph::new();
+        let terrain = bind_leaf(&mut graph, -0.125);
+        let field = graph
+            .insert(GraphNode::WorldField(WorldField::Beardifier))
+            .unwrap();
+        let root = graph
+            .insert(GraphNode::Binary {
+                kind: GraphBinary::Add,
+                left: terrain,
+                right: field,
+            })
+            .unwrap();
+        let compiler = DensityCompiler::new_seeded(graph, SEED, false);
+        let program = codegen::generate(&compiler, root, SEED, [16, HEIGHT, 16]).unwrap();
+        let domain = compiler.boxed_density_domain(SEED).unwrap();
+        // At Y >= 0 with sea level 0, the disabled aquifer maps nonpositive
+        // density to air. This isolates structure adaptation from fluid pressure.
+        let setup = AquiferSetup {
+            roots: None,
+            positional: (0, 0),
+            sea_level: 0,
+        };
+        let aquifer = codegen::generate_aquifer(&compiler, setup.roots, SEED).unwrap();
+        let gpu = Engine::start(program, Some((setup, aquifer)), 1, 2, 0, HEIGHT, domain)
+            .expect("start the CUDA engine with the beard kernel");
+
+        let (cx, cz) = OUTSIDE;
+        let piece = RigidPiece {
+            bounds: StructureBounds::new([38, 8, 6], [41, 11, 9]).unwrap(),
+            adjustment: TerrainAdjustment::BeardBox,
+            ground_level_delta: 0,
+        };
+        let zone = StructureBounds::new([32, 0, 0], [47, 15, 15]).unwrap();
+        let beard = Arc::new(Beardifier::new(vec![piece], Vec::new(), Some(zone)));
+        let fields = WorldFields::default().with_field(WorldField::Beardifier, beard.clone());
+        let mut context = SamplerContext::cached().with_world_fields(fields);
+        let expected: Vec<i8> = cpu_volume(&compiler, root, OUTSIDE, &mut context)
+            .into_iter()
+            .map(|density| if density > 0.0 { 0 } else { 1 })
+            .collect();
+        assert!(expected.contains(&0), "the piece must create solid blocks");
+        assert!(expected.contains(&1), "the CPU fill must also contain air");
+
+        assert!(gpu.eligible_chunk(cx, cz));
+        let mut actual = vec![i8::MIN; N];
+        assert_eq!(
+            gpu.chunk_codes_beard(cx, cz, &beard, &mut actual, None, None),
+            Some(i32::MIN),
+            "eligible chunk must return actual beard codes with the disabled-aquifer skip"
+        );
+        assert_eq!(gpu.stats.chunks_beard.load(Relaxed), 1);
+        for (i, (got, want)) in actual.iter().zip(&expected).enumerate() {
+            assert_eq!(got, want, "beard code at fill slot {i}");
+        }
+
+        // The closing X edge of chunk (0, 0) is 16, exactly the box's X.
+        let regions = gpu.stats.regions.load(Relaxed);
+        actual.fill(i8::MIN);
+        assert_eq!(
+            gpu.chunk_codes_beard(0, 0, &beard, &mut actual, None, None),
+            None
+        );
+        assert_eq!(gpu.stats.regions.load(Relaxed), regions);
+        assert_eq!(gpu.stats.chunks_beard.load(Relaxed), 1);
+        assert!(actual.iter().all(|&code| code == i8::MIN));
     }
 }
 
@@ -596,6 +787,8 @@ struct Aquifers {
 type Launch = (CudaFunction, usize, usize);
 
 struct Engine {
+    domain: BoxedDensityDomain,
+    test_cpu: Option<Arc<dyn DensitySampler>>,
     ctx: Arc<CudaContext>,
     /// Axis tables: (kernel, grid, threads)
     f_ax: Vec<Launch>,
@@ -737,6 +930,7 @@ impl Engine {
         capacity: usize,
         min_y: i32,
         height: i32,
+        domain: BoxedDensityDomain,
     ) -> Result<Self, String> {
         let ctx = context()?;
         // The region cache within a budget: HORIZON_GPU_MEMORY_MB, else half of the GPU memory free
@@ -807,6 +1001,8 @@ impl Engine {
         Ok(Self {
             f_chunk: f("kchunk")?,
             aq,
+            domain,
+            test_cpu: None,
             ctx,
             f_ax,
             f_cv,
@@ -829,34 +1025,88 @@ impl Engine {
         })
     }
 
-    /// Three chunks (some with negative coordinates) compared bit for bit with the CPU sampler.
-    fn auto_test(&self, cpu: &dyn DensitySampler) -> Result<(), String> {
+    // F1.1 review repair
+    fn eligible_chunk(&self, cx: i32, cz: i32) -> bool {
+        boxed_density::region(
+            &self.domain,
+            cx,
+            cz,
+            self.r,
+            self.aq.as_ref().is_some_and(|aq| !aq.disabled),
+        )
+    }
+
+    fn compare_density(
+        &self,
+        cpu: &dyn DensitySampler,
+        cx: i32,
+        cz: i32,
+        gpu: &[f32],
+    ) -> Result<(), String> {
         let h = (self.n_chunk / 256) as i32;
-        for (cx, cz) in [(0, 0), (self.r - 1, 1), (-1, -1)] {
-            let mut gpu = vec![0.0f32; self.n_chunk];
-            let mut reference = vec![0.0f32; self.n_chunk];
-            self.inner_chunk(cx, cz, &mut gpu)?;
-            let volume = DensityVolume::new([16, h, 16], [cx * 16, self.min_y, cz * 16], [1; 3])
-                .ctx("volume")?;
-            cpu.sample_volume(&mut SamplerContext::cached(), &mut reference, volume)
-                .ctx("reference CPU")?;
-            let diff = gpu
-                .iter()
-                .zip(&reference)
-                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                .count();
-            if diff > 0 {
-                let ex: Vec<String> = [0usize, 1, 100, 384, 50000]
-                    .iter()
-                    .map(|&i| format!("[{i}] gpu {} cpu {}", gpu[i], reference[i]))
-                    .collect();
-                return Err(format!(
-                    "self-test: {diff} densities differ from the CPU in chunk {cx} {cz} ({})",
-                    ex.join(", ")
-                ));
-            }
+        let mut reference = vec![0.0f32; self.n_chunk];
+        let volume = DensityVolume::new([16, h, 16], [cx * 16, self.min_y, cz * 16], [1; 3])
+            .ctx("volume")?;
+        cpu.sample_volume(&mut SamplerContext::cached(), &mut reference, volume)
+            .ctx("reference CPU")?;
+        let diff = gpu
+            .iter()
+            .zip(&reference)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        if diff != 0 {
+            return Err(format!(
+                "{diff} densities differ from CPU in chunk {cx} {cz}"
+            ));
+        }
+        log::debug!("GPU final_density: CPU comparison passed for chunk {cx} {cz}");
+        Ok(())
+    }
+
+    fn auto_test(&self, cpu: &dyn DensitySampler) -> Result<(), String> {
+        let candidates = [
+            (0, 0),
+            (self.r - 1, 1),
+            (-1, -1),
+            (256, 256),
+            (-256, -256),
+            (8192, -8192),
+            (-8192, 8192),
+            (1_800_000, 1_800_000),
+            (-1_800_000, -1_800_000),
+        ];
+        let mut verified = 0;
+        for (cx, cz) in candidates
+            .into_iter()
+            .filter(|&(x, z)| self.eligible_chunk(x, z))
+            .take(3)
+        {
+            let mut density = vec![0.0; self.n_chunk];
+            self.inner_chunk(cx, cz, &mut density)?;
+            self.compare_density(cpu, cx, cz, &density)?;
+            verified += 1;
+        }
+        if verified == 0 {
+            return Err("no eligible startup comparison chunk".into());
         }
         Ok(())
+    }
+
+    fn allow_codes(&self, cx: i32, cz: i32) -> bool {
+        if !self.eligible_chunk(cx, cz) {
+            return false;
+        }
+        if let Some(cpu) = &self.test_cpu {
+            let mut gpu = vec![0.0; self.n_chunk];
+            let result = self
+                .inner_chunk(cx, cz, &mut gpu)
+                .and_then(|()| self.compare_density(&**cpu, cx, cz, &gpu));
+            if let Err(e) = result {
+                self.failed(&e, (cx.div_euclid(self.r), cz.div_euclid(self.r)));
+                return false;
+            }
+        }
+        true
     }
 
     fn chunk(&self, cx: i32, cz: i32, out: &mut [f32]) -> bool {
@@ -868,7 +1118,17 @@ impl Engine {
         {
             return false;
         }
-        match self.inner_chunk(cx, cz, out) {
+        if !self.eligible_chunk(cx, cz) {
+            self.stats.fallbacks.fetch_add(1, Relaxed);
+            return false;
+        }
+        let result = self.inner_chunk(cx, cz, out).and_then(|()| {
+            if let Some(cpu) = &self.test_cpu {
+                self.compare_density(&**cpu, cx, cz, out)?;
+            }
+            Ok(())
+        });
+        match result {
             Ok(()) => {
                 let n = self.stats.chunks.load(Relaxed);
                 if n.is_power_of_two() && n >= 1024 || n.is_multiple_of(65536) {
@@ -1043,6 +1303,9 @@ impl Engine {
         let r = self.r;
         let (rx, rz) = (cx.div_euclid(r), cz.div_euclid(r));
         let (lx, lz) = (cx - rx * r, cz - rz * r);
+        if !self.allow_codes(cx, cz) {
+            return None;
+        }
         let region = self.region((rx, rz));
         let result = self.resource().and_then(|mut res| {
             let rr = self.copy_codes(&region, rx, rz, lx, lz, &mut res, out, follow_up.take());
@@ -1098,6 +1361,9 @@ impl Engine {
             || cx.unsigned_abs() > 1_875_000
             || cz.unsigned_abs() > 1_875_000
         {
+            return None;
+        }
+        if !self.allow_codes(cx, cz) {
             return None;
         }
         let pc: Vec<i32> = pieces
@@ -1580,6 +1846,15 @@ pub fn evaluate_points(
     roots: &[FunctionId],
     points: &[[i32; 3]],
 ) -> Result<Vec<Vec<f32>>, String> {
+    let domain = compiler.boxed_density_domain(seed)?;
+    if !domain.is_empty()
+        && points.iter().any(|p| {
+            let xz = [i64::from(p[0]), i64::from(p[2])];
+            !domain.permits(xz, xz)
+        })
+    {
+        return Err("density points intersect a native density box".into());
+    }
     let src = codegen::generate_points(compiler, roots, seed).map_err(|e| e.to_string())?;
     if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP") {
         let _ = std::fs::write(f, &src);
@@ -1633,6 +1908,9 @@ pub fn aquifer_blocks(
     seed: i64,
     b: &AquiferBatch,
 ) -> Result<(Vec<i8>, Vec<i32>), String> {
+    if !compiler.boxed_density_domain(seed)?.is_empty() {
+        return Err("the standalone aquifer diagnostic requires an unboxed graph".into());
+    }
     let src =
         codegen::generate_aquifer(compiler, Some(b.roots), seed).map_err(|e| e.to_string())?;
     if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP") {
@@ -2133,6 +2411,7 @@ struct SurfaceStats {
 
 /// A world's surface on the GPU: final states of a chunk after filling and surface.
 pub struct SurfaceGpu {
+    domain: BoxedDensityDomain,
     ctx: Arc<CudaContext>,
     _module: Arc<crate::cuda::driver::CudaModule>,
     k_heads: CudaFunction,
@@ -2201,6 +2480,7 @@ impl SurfaceGpu {
         setup: &SurfaceSetup,
         seed: i64,
     ) -> Result<Self, String> {
+        let domain = compiler.boxed_density_domain(seed)?;
         let prog = codegen::generate_surface(compiler, setup, seed).map_err(|e| e.to_string())?;
         if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP_SURFACE") {
             let f = std::path::PathBuf::from(f);
@@ -2227,6 +2507,7 @@ impl SurfaceGpu {
             .and_then(|v| v.parse().ok())
             .unwrap_or(48);
         Ok(Self {
+            domain,
             ctx,
             _module: module,
             k_heads,
@@ -2343,10 +2624,25 @@ impl SurfaceGpu {
         })
         .clone()
     }
+    pub fn eligible_chunk(&self, cx: i32, cz: i32) -> bool {
+        self.domain.is_empty()
+            || (boxed_density::region(&self.domain, cx, cz, codegen::LEVEL_R, false)
+                && boxed_density::chunk_neighbours(&self.domain, cx, cz))
+    }
+
     /// Number of biomes `chunk_states` expects: the quarts of the 3 x 3 chunks around the chunk.
     pub fn biome_count(&self) -> usize {
         9 * 16 * (self.biome_height as usize / 4)
     }
+    /// Completed surface readbacks and inline surface fallbacks.
+    #[doc(hidden)]
+    pub fn f11_surface_counts(&self) -> (u64, u64) {
+        (
+            self.stats.chunks.load(Relaxed),
+            self.stats.fallbacks.load(Relaxed),
+        )
+    }
+
     /// The chunk went through the CPU.
     pub fn note_cpu_fallback(&self) {
         self.stats.fallbacks.fetch_add(1, Relaxed);
@@ -2431,6 +2727,9 @@ impl SurfaceGpu {
         biomes: &[u16],
         sections: bool,
     ) -> Result<Arc<RegionSurface>, String> {
+        if !self.eligible_chunk(chunk_x, chunk_z) {
+            return Err("surface footprint intersects a native density box".into());
+        }
         let n = 256 * self.height as usize;
         let profile = cd.is_none() && std::env::var_os("HORIZON_GPU_SURFACE_PROFILE").is_some();
         let mut t = Instant::now();

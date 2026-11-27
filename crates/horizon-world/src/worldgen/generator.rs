@@ -397,6 +397,7 @@ struct Pipeline<R: RandomSource> {
     mod_terrain: Option<mod_terrain::ModTerrain>,
     /// final_density on the GPU, for chunks without structures or blending.
     gpu: Option<horizon_gpu::GpuFinalDensity>,
+    gpu_domain: horizon_core::density::graph::BoxedDensityDomain,
     /// The surface on the GPU: HORIZON_GPU_SURFACE=1 writes its final states (`surface_inline`),
     /// HORIZON_GPU_SURFACE_TEST checks them against the CPU surface.
     surface_gpu: Option<horizon_gpu::SurfaceGpu>,
@@ -768,7 +769,17 @@ where
                 sea_level: settings.sea_level,
             }),
         };
-        let gpu_enabled = !data.cpu_only;
+        let domain = library.compiler().boxed_density_domain(seed);
+        if let Err(reason) = domain.as_ref() {
+            log::info!("GPU worldgen: {reason}; using CPU");
+        }
+        // A custom preset keeps its conservative default unless its decoded native
+        // density nodes supply a spatial contract. The CUDA translators still decide
+        // independently which stages support the surrounding graph and settings.
+        let gpu_enabled = domain
+            .as_ref()
+            .is_ok_and(|d| !data.cpu_only || !d.is_empty());
+        let gpu_domain = domain.unwrap_or_default();
         let gpu_codes = gpu_enabled && gpu_aquifer.is_some();
         let gpu = if gpu_enabled {
             horizon_gpu::GpuFinalDensity::new(
@@ -1172,6 +1183,7 @@ where
             climate,
             aquifer,
             gpu_codes,
+            gpu_domain,
             rule,
             preliminary,
             source,
@@ -1416,6 +1428,9 @@ where
     ) -> Option<Option<BiomeChunk<BiomeId>>> {
         let r = bg.region_side();
         let key = (pos.x.div_euclid(r), pos.z.div_euclid(r));
+        if !bg.eligible_region(key.0.wrapping_mul(r), key.1.wrapping_mul(r)) {
+            return Some(None);
+        }
         let slot = {
             let mut regions = self.biome_regions.lock().unwrap();
             let regions = &mut *regions;
@@ -2025,8 +2040,11 @@ where
         let run_surface = stages.is_none_or(|stages| stages.surface);
         let run_carvers = stages.is_none_or(|stages| stages.carvers);
         // HORIZON_GPU_CAVES: the carving mask is traced on the GPU while the chunk fills.
+        let caves_eligible = horizon_gpu::boxed_density::carvers(&self.gpu_domain, pos.x, pos.z);
         let mut caves_job = match &self.caves_gpu {
-            Some(cg) if run_carvers => self.submit_caves(cg, worker, pos, self.generation()),
+            Some(cg) if run_carvers && caves_eligible => {
+                self.submit_caves(cg, worker, pos, self.generation())
+            }
             _ => None,
         };
         worker.timings.carvers += lap(&mut clock);
@@ -2056,8 +2074,11 @@ where
         // With the carvers' cells on the GPU too, the CPU aquifer is only built for a chunk that
         // needs it (CPU fill or carving). Its air limit then is the GPU's: the fluid picker is the
         // same at every x/z, at sea level.
-        let lazy_aquifer =
-            self.caves_gpu.is_some() && !self.caves_test && self.aquifer.is_some() && {
+        let lazy_aquifer = caves_eligible
+            && self.caves_gpu.is_some()
+            && !self.caves_test
+            && self.aquifer.is_some()
+            && {
                 let levels = [
                     [0, i32::MAX, 0],
                     [i32::MAX; 3],
@@ -2103,7 +2124,13 @@ where
                     // HORIZON_GPU_SURFACE=1: the chunk's surface runs on the GPU stream of its codes,
                     // which do not come back to the GPU; its final states are written below.
                     let surface = self.surface_gpu.as_ref().filter(|_| {
-                        self.surface_inline && run_surface && !self.identity_end_surface(pos)
+                        self.surface_inline
+                            && run_surface
+                            && !self.identity_end_surface(pos)
+                            && self
+                                .surface_gpu
+                                .as_ref()
+                                .is_some_and(|sg| sg.eligible_chunk(pos.x, pos.z))
                     });
                     let quarters = surface.and_then(|sg| surface_quarters(sg, pos, &biomes));
                     let skip = match (surface, &quarters) {
@@ -2242,7 +2269,13 @@ where
             };
             context.clear_lattice();
             filled.map_err(stage("noise"))?;
-            if from_codes && self.surface_test && self.surface_gpu.is_some() {
+            if from_codes
+                && self.surface_test
+                && self
+                    .surface_gpu
+                    .as_ref()
+                    .is_some_and(|sg| sg.eligible_chunk(pos.x, pos.z))
+            {
                 codes_gpu = Some(std::mem::take(&mut codes));
             }
         }
@@ -4345,7 +4378,13 @@ where
     ) -> Result<DecorateStats, GeneratorError> {
         match &self.decoration {
             Some(decoration) => {
-                let mut random = self.region_random_at(region[4].position());
+                let center = region[4].position();
+                let gpu_eligible = horizon_gpu::boxed_density::chunk_neighbours(
+                    &self.gpu_domain,
+                    center.x,
+                    center.z,
+                );
+                let mut random = self.region_random_at(center);
                 decoration.decorate(
                     &self.data,
                     self.seed,
@@ -4354,8 +4393,8 @@ where
                     region,
                     &mut random,
                     self.structures.as_ref(),
-                    self.ores_gpu.as_ref(),
-                    self.geodes_gpu.as_ref(),
+                    self.ores_gpu.as_ref().filter(|_| gpu_eligible),
+                    self.geodes_gpu.as_ref().filter(|_| gpu_eligible),
                 )
             }
             // A mod's level that asks for neither structures nor features has nothing to place.
@@ -7311,13 +7350,13 @@ mod tests {
         assert_ne!(normal, surface("minecraft:large_biomes"));
     }
 
-    struct ProtoSnapshot {
+    struct ProtoSnapshot<S = horizon_core::nbt::Tag> {
         position: ChunkPos,
         stage: PreLightChunkStage,
         decorated: bool,
         min_y: i32,
         height: i32,
-        sections: Vec<horizon_core::nbt::Tag>,
+        sections: Vec<S>,
         biomes: Vec<[BiomeId; 64]>,
         heightmaps: Vec<Option<Vec<u64>>>,
         postprocessing: Vec<Vec<u16>>,
@@ -7330,6 +7369,14 @@ mod tests {
 
     impl ProtoSnapshot {
         fn of(chunk: &ProtoChunk) -> Self {
+            Self::with_sections(chunk, |idx| {
+                chunk.terrain.section(idx).unwrap().to_nbt().unwrap()
+            })
+        }
+    }
+
+    impl<S> ProtoSnapshot<S> {
+        fn with_sections(chunk: &ProtoChunk, mut section: impl FnMut(usize) -> S) -> Self {
             let section_count = (chunk.terrain.height() / 16) as usize;
             assert!(
                 chunk.terrain.section(section_count).is_none(),
@@ -7338,7 +7385,7 @@ mod tests {
             let mut sections = Vec::with_capacity(section_count);
             let mut biomes = Vec::with_capacity(section_count);
             for idx in 0..section_count {
-                sections.push(chunk.terrain.section(idx).unwrap().to_nbt().unwrap());
+                sections.push(section(idx));
                 biomes.push(*chunk.biomes.section(idx).unwrap());
             }
             let heightmaps = HeightmapType::ALL
@@ -7364,7 +7411,11 @@ mod tests {
         }
     }
 
-    fn assert_proto_snapshot_equal(a: &ProtoSnapshot, b: &ProtoSnapshot, label: &str) {
+    fn assert_proto_snapshot_equal<S: std::fmt::Debug + PartialEq>(
+        a: &ProtoSnapshot<S>,
+        b: &ProtoSnapshot<S>,
+        label: &str,
+    ) {
         assert_eq!(a.position, b.position, "{label}: chunk position");
         assert_eq!(a.stage, b.stage, "{label}: generation stage");
         assert_eq!(a.decorated, b.decorated, "{label}: decorated flag");
@@ -7378,7 +7429,7 @@ mod tests {
             .zip(a.biomes.iter().zip(&b.biomes))
             .enumerate()
         {
-            assert_eq!(sa, sb, "{label}: section {idx} NBT");
+            assert_eq!(sa, sb, "{label}: block section {idx}");
             assert_eq!(ba, bb, "{label}: biome section {idx}");
         }
         for ((ha, hb), kind) in a
@@ -7404,6 +7455,195 @@ mod tests {
             a.structure_starts_len, b.structure_starts_len,
             "{label}: structure starts count"
         );
+    }
+
+    #[test]
+    #[ignore = "requires CUDA, NVRTC, and prepared 26.3 resources (HORIZON_TEST_RESOURCES or HORIZON_RESOURCES); HORIZON_GPU_DENSITY=wait; optional HORIZON_GPU_BIOMES, HORIZON_GPU_SURFACE and HORIZON_GPU_SURFACE_TEST"]
+    fn f11_boxed_preset_chunks() {
+        use serde_json::json;
+
+        assert_eq!(
+            std::env::var("HORIZON_GPU_DENSITY").as_deref(),
+            Ok("wait"),
+            "use synchronous density with one readback per generated GPU chunk"
+        );
+
+        super::mod_density_tests::install();
+
+        let root = test_root();
+        let registry = Box::leak(Box::new(crate::level::data::load_registry(&root).unwrap()));
+        let bundle = root.join("worldgen");
+        let vanilla = GeneratorData::load(&bundle, registry).unwrap();
+        let mut preset: Value =
+            serde_json::from_str(&vanilla.world_presets["minecraft:normal"]).unwrap();
+        let generator = &mut preset["dimensions"]["minecraft:overworld"]["generator"];
+        let settings_id = generator["settings"].as_str().unwrap();
+        let mut settings: Value = serde_json::from_str(&vanilla.settings[settings_id]).unwrap();
+        for (field, interpolated) in [("final_density", true), ("temperature", false)] {
+            let original = settings["noise_router"][field].take();
+            let leaf = json!({"type":"f11:box"});
+            let right = if interpolated {
+                json!({"type":"minecraft:interpolated","input":leaf,"cell_size_xz":4,"cell_size_y":8})
+            } else {
+                leaf
+            };
+            settings["noise_router"][field] =
+                json!({"type":"minecraft:add","left":original,"right":right});
+        }
+        let climates: Vec<_> = [(-1.0, "minecraft:plains"), (1.0, "minecraft:desert")]
+            .into_iter().map(|(temperature, biome)| json!({
+                "biome": biome,
+                "parameters": {
+                    "temperature":temperature, "humidity":[-2.0,2.0], "continentalness":[-2.0,2.0],
+                    "erosion":[-2.0,2.0], "depth":[-2.0,2.0], "weirdness":[-2.0,2.0], "offset":0.0
+                }
+            })).collect();
+        generator["settings"] = json!("f11:settings");
+        generator["biome_source"] = json!({"type":"minecraft:multi_noise","biomes":climates});
+        let mut overlays = WorldgenOverrides::default();
+        overlays.require_cpu();
+        overlays.set("world_presets", "f11:preset", preset.to_string());
+        overlays.set(
+            overrides::NOISE_SETTINGS,
+            "f11:settings",
+            settings.to_string(),
+        );
+        let data = GeneratorData::load_with(&bundle, registry, &overlays).unwrap();
+        let preset: Value = serde_json::from_str(&data.world_presets["f11:preset"]).unwrap();
+        let generator = &preset["dimensions"]["minecraft:overworld"]["generator"];
+        let settings: Value = serde_json::from_str(&data.settings["f11:settings"]).unwrap();
+        let mut pipeline = Arc::new(
+            Pipeline::new(
+                data,
+                12345,
+                XoroshiroRandom::new(12345),
+                generator,
+                &settings,
+                false,
+                Some((-64, 384)),
+                None,
+            )
+            .unwrap(),
+        );
+        let worker_for = |pipeline: Arc<Pipeline<XoroshiroRandom>>| {
+            OverworldGenerator {
+                pipeline,
+                noise_clamped: None,
+            }
+            .worker()
+        };
+
+        // A far chunk, a chunk whose east face touches X=16, and the boxed chunk.
+        let positions = [
+            ChunkPos::new(96, -96),
+            ChunkPos::new(0, 1),
+            ChunkPos::new(1, 1),
+        ];
+        let gpu = pipeline
+            .gpu
+            .as_ref()
+            .expect("fixture must compile its GPU density graph");
+        let mut density = vec![0.0; 256 * pipeline.settings.noise_height as usize];
+        for (i, pos) in positions.iter().enumerate() {
+            assert_eq!(
+                gpu.fill_chunk(pos.x, pos.z, &mut density),
+                i == 0,
+                "GPU must answer the outside chunk and refuse the touching and inside chunks",
+            );
+        }
+
+        let mut worker = worker_for(pipeline.clone());
+        let biomes_requested = matches!(
+            std::env::var("HORIZON_GPU_BIOMES").as_deref(),
+            Ok("1" | "test")
+        );
+        let surface_requested = std::env::var("HORIZON_GPU_SURFACE").as_deref() == Ok("1")
+            || std::env::var("HORIZON_GPU_SURFACE_TEST").as_deref() == Ok("1");
+
+        let biomes = biomes_requested.then(|| {
+            pipeline
+                .biomes_gpu
+                .as_ref()
+                .expect("fixture must initialize requested GPU biomes")
+        });
+        let surface = surface_requested.then(|| {
+            pipeline
+                .surface_gpu
+                .as_ref()
+                .expect("fixture must initialize requested GPU surface")
+        });
+
+        // Snapshot after the standalone probes and measure only the first,
+        // far chunk's normal generation. Its nine biome chunks are uncached.
+        let (density_before, mismatches_before) = gpu
+            .f11_density_counts()
+            .expect("fixture GPU density engine is ready");
+        let biomes_before = biomes.map(|bg| bg.f11_biome_counts());
+        let surface_before = surface.map(|sg| sg.f11_surface_counts());
+        let far = pipeline.generate(&mut worker.state, positions[0]).unwrap();
+
+        assert_eq!(
+            gpu.f11_density_counts(),
+            Some((density_before + 1, mismatches_before)),
+            "far chunk must use GPU density or GPU codes accepted by the CPU aquifer check"
+        );
+        if let (Some(bg), Some((chunks, compared, mismatches))) = (biomes, biomes_before) {
+            let expected_comparisons = if pipeline.biomes_test { 9 } else { 0 };
+            assert_eq!(
+                bg.f11_biome_counts(),
+                (chunks + 9, compared + expected_comparisons, mismatches),
+                "the center and all eight neighbor biome chunks must receive GPU results"
+            );
+        }
+        if let (Some(sg), Some((chunks, fallbacks))) = (surface, surface_before) {
+            assert_eq!(
+                sg.f11_surface_counts(),
+                (chunks + 1, fallbacks),
+                "far chunk must complete GPU surface without an inline surface fallback"
+            );
+        }
+
+        let actual = [
+            far,
+            pipeline.generate(&mut worker.state, positions[1]).unwrap(),
+            pipeline.generate(&mut worker.state, positions[2]).unwrap(),
+        ];
+        drop(worker);
+        let cpu = Arc::get_mut(&mut pipeline).expect("fixture owns its pipeline");
+        cpu.release_caches();
+        cpu.gpu = None;
+        cpu.surface_gpu = None;
+        cpu.biomes_gpu = None;
+        cpu.locate_gpu = None;
+        cpu.caves_gpu = None;
+        cpu.ores_gpu = None;
+        cpu.geodes_gpu = None;
+        let mut worker = worker_for(pipeline.clone());
+        let strategy = horizon_core::paletted::Strategy::blocks(horizon_core::paletted::ceil_log2(
+            registry.len(),
+        ));
+        let snapshot = |chunk: &ProtoChunk| {
+            ProtoSnapshot::with_sections(chunk, |idx| {
+                let section = chunk.terrain.section(idx).unwrap();
+                let mut states = [0; 4096];
+                section.fill_states(&mut states);
+
+                // Inline surface writes final states in one pass. Compare the
+                // saved representation and the cells, independent of dead slots.
+                let container = section.to_container(strategy);
+                let (ids, words) = container.pack_saved(None);
+                (
+                    ids.into_owned(),
+                    words.map(|words| words.into_owned()),
+                    states,
+                )
+            })
+        };
+        for (pos, got) in positions.into_iter().zip(&actual) {
+            let want = pipeline.generate(&mut worker.state, pos).unwrap();
+            let label = format!("F1.1 chunk {},{}", pos.x, pos.z);
+            assert_proto_snapshot_equal(&snapshot(&want), &snapshot(got), &label);
+        }
     }
 
     fn assert_proto_chunk_byte_equal(a: &ProtoChunk, b: &ProtoChunk, label: &str) {

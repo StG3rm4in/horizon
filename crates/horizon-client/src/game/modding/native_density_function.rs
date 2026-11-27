@@ -58,6 +58,11 @@ impl ModDensityFunction for FunctionAdapter {
         let _call = self.owner.enter("varies_with_y");
         self.function.varies_with_y()
     }
+    fn constant_outside_xz(&self, seed: i64) -> Option<([i32; 2], [i32; 2], f32)> {
+        let _call = self.owner.enter("constant_outside_xz");
+        self.function.constant_outside_xz(seed)
+    }
+
     fn sample(&self, position: [i32; 3], seed: i64) -> f32 {
         let _call = self.owner.enter("sample");
         self.function.sample(position, seed)

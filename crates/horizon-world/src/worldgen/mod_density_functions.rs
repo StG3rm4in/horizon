@@ -27,6 +27,9 @@ pub trait ModDensityFunction: Send + Sync {
     fn range(&self) -> [f32; 2];
     /// `false`: the value never depends on y.
     fn varies_with_y(&self) -> bool;
+    fn constant_outside_xz(&self, _seed: i64) -> Option<([i32; 2], [i32; 2], f32)> {
+        None
+    }
     fn sample(&self, position: [i32; 3], seed: i64) -> f32;
     /// `count` positions from `origin`, `step` apart, into `out` (exactly that many values, y
     /// fastest, then x, then z).
@@ -67,6 +70,10 @@ pub(super) struct ModDensity {
     pub(super) function: Arc<dyn ModDensityFunction>,
 }
 impl SeededDensity for ModDensity {
+    fn constant_outside_xz(&self, seed: i64) -> Option<([i32; 2], [i32; 2], f32)> {
+        self.function.constant_outside_xz(seed)
+    }
+
     fn sampler(&self, seed: i64) -> Arc<dyn DensitySampler> {
         Arc::new(ModDensitySampler {
             id: self.id.clone(),

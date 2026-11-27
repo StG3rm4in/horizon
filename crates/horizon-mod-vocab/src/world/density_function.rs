@@ -37,6 +37,15 @@ pub trait DensityFunction: Send + Sync + 'static {
     fn varies_with_y(&self) -> bool {
         true
     }
+    /// Optional GPU substitution for this seed. Returns inclusive lower and upper corners
+    /// in `[x, z]` order and the exact `f32` value outside that rectangle, for every Y.
+    /// Both `sample` and every slot written by `fill` must return the same bits there,
+    /// including the sign of zero. The value must be finite and lie in `range`.
+    /// The declaration must be deterministic for the decoded instance and seed.
+    /// `None` keeps native density evaluation on the CPU.
+    fn constant_outside_xz(&self, _seed: i64) -> Option<([i32; 2], [i32; 2], f32)> {
+        None
+    }
     /// The value at block position `[x, y, z]` of a world with `seed`. Asked where the reader
     /// samples single points: spawn finding and `/locate biome`, and inside the volume readers
     /// too (aquifers, `find_top_surface`, `interpolated` off the cell lattice). Chunk fill, far

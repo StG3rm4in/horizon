@@ -146,8 +146,61 @@ static RAMP_VOLUMES: AtomicUsize = AtomicUsize::new(0);
 static COUNTED_POINTS: AtomicUsize = AtomicUsize::new(0);
 static COUNTED_VOLUMES: AtomicUsize = AtomicUsize::new(0);
 
+struct BoxLeaf;
+impl ModDensityFunctionType for BoxLeaf {
+    fn owner(&self) -> &str {
+        "f11"
+    }
+
+    fn decode(&self, _: &str) -> Result<Arc<dyn ModDensityFunction>, String> {
+        Ok(Arc::new(BoxLeaf))
+    }
+}
+impl ModDensityFunction for BoxLeaf {
+    fn range(&self) -> [f32; 2] {
+        [0.0, 3.0]
+    }
+    fn varies_with_y(&self) -> bool {
+        false
+    }
+
+    fn constant_outside_xz(&self, _: i64) -> Option<([i32; 2], [i32; 2], f32)> {
+        Some(([16, 16], [31, 31], 0.0))
+    }
+
+    fn sample(&self, [x, _, z]: [i32; 3], _: i64) -> f32 {
+        if (16..=31).contains(&x) && (16..=31).contains(&z) {
+            3.0
+        } else {
+            0.0
+        }
+    }
+
+    fn fill(
+        &self,
+        origin: [i32; 3],
+        step: [i32; 3],
+        count: [usize; 3],
+        seed: i64,
+        out: &mut [f32],
+    ) {
+        let [nx, ny, nz] = count;
+        for z in 0..nz {
+            for x in 0..nx {
+                let position = [
+                    origin[0].wrapping_add((x as i32).wrapping_mul(step[0])),
+                    origin[1],
+                    origin[2].wrapping_add((z as i32).wrapping_mul(step[2])),
+                ];
+                let start = (z * nx + x) * ny;
+                out[start..start + ny].fill(self.sample(position, seed));
+            }
+        }
+    }
+}
+
 /// Every test's types, installed by whichever test runs first.
-fn install() {
+pub(super) fn install() {
     let _ = install_mod_density_function_types(ModDensityFunctionTypes::from([
         (
             "worldgen_test:ramp".to_owned(),
@@ -165,6 +218,7 @@ fn install() {
         ),
         ("worldgen_test:flat".to_owned(), Arc::new(Flat) as _),
         ("worldgen_test:panics".to_owned(), Arc::new(Panics) as _),
+        ("f11:box".to_owned(), Arc::new(BoxLeaf) as _),
     ]));
 }
 

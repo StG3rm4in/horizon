@@ -14,7 +14,7 @@ use crate::cuda::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
     PushKernelArg,
 };
-use horizon_core::density::graph::{DensityCompiler, FunctionId};
+use horizon_core::density::graph::{BoxedDensityDomain, DensityCompiler, FunctionId};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -65,6 +65,7 @@ struct Stats {
 }
 
 pub struct LocateGpu {
+    domain: BoxedDensityDomain,
     ctx: Arc<CudaContext>,
     _module: Arc<CudaModule>,
     k_climate: CudaFunction,
@@ -132,6 +133,7 @@ impl LocateGpu {
         {
             return Err("climate tree links".into());
         }
+        let domain = compiler.boxed_density_domain(seed)?;
         let src = codegen::generate_locate(compiler, roots, seed).map_err(|e| e.to_string())?;
         if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP_LOCATE") {
             let _ = std::fs::write(f, &src);
@@ -149,6 +151,7 @@ impl LocateGpu {
         let l = st.clone_htod(&flat).ctx("tree links")?;
         st.synchronize().ctx("climate tree")?;
         Ok(Self {
+            domain,
             ctx,
             _module: module,
             k_climate,
@@ -241,6 +244,14 @@ impl LocateGpu {
         }
         if n > LOCATE_BATCH || layers.len() > LOCATE_BATCH {
             return Err(format!("{n} quarts in one batch"));
+        }
+        if !self.domain.is_empty()
+            && columns.iter().any(|&quart| {
+                let xz = quart.map(|q| i64::from(q.wrapping_shl(2)));
+                !self.domain.permits(xz, xz)
+            })
+        {
+            return Err("locate batch intersects a native density box".into());
         }
         let t = Instant::now();
         let mut res = self.resource()?;

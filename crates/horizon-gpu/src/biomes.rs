@@ -9,7 +9,7 @@ use crate::cuda::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PinnedHostSlice,
     PushKernelArg,
 };
-use horizon_core::density::graph::{DensityCompiler, FunctionId};
+use horizon_core::density::graph::{BoxedDensityDomain, DensityCompiler, FunctionId};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -59,6 +59,7 @@ struct Stats {
 }
 
 pub struct BiomeGpu {
+    domain: BoxedDensityDomain,
     ctx: Arc<CudaContext>,
     _module: Arc<CudaModule>,
     k_climate: CudaFunction,
@@ -137,6 +138,7 @@ impl BiomeGpu {
         if min_y % 16 != 0 || height <= 0 || height % 16 != 0 || !(1..=32).contains(&region) {
             return Err("chunk height or region side".into());
         }
+        let domain = compiler.boxed_density_domain(seed)?;
         let src = codegen::generate_biomes(compiler, roots, seed).map_err(|e| e.to_string())?;
         if let Some(f) = std::env::var_os("HORIZON_GPU_DUMP_BIOMES") {
             let _ = std::fs::write(f, &src);
@@ -156,6 +158,7 @@ impl BiomeGpu {
         let ids = st.clone_htod(tree.entry_ids).ctx("biome ids")?;
         st.synchronize().ctx("climate tree")?;
         Ok(Self {
+            domain,
             ctx,
             _module: module,
             k_climate,
@@ -196,6 +199,16 @@ impl BiomeGpu {
         self.stats.compared.fetch_add(1, Relaxed) + 1
     }
     /// Mismatches with the CPU seen in test mode.
+    /// GPU biome chunks, comparisons with the CPU, and mismatches.
+    #[doc(hidden)]
+    pub fn f11_biome_counts(&self) -> (u64, u64, u64) {
+        (
+            self.stats.chunks.load(Relaxed),
+            self.stats.compared.load(Relaxed),
+            self.stats.mismatches.load(Relaxed),
+        )
+    }
+
     pub fn mismatches(&self) -> u64 {
         self.stats.mismatches.load(Relaxed)
     }
@@ -216,9 +229,20 @@ impl BiomeGpu {
             st,
         })
     }
+    pub fn eligible_region(&self, cx0: i32, cz0: i32) -> bool {
+        super::boxed_density::chunk_square(
+            &self.domain,
+            [i64::from(cx0), i64::from(cz0)],
+            i64::from(self.r),
+        )
+    }
+
     /// The biomes of the R x R chunks from chunk (`cx0`, `cz0`): for each chunk (z * R + x), the id
     /// of its quarts in `BiomeChunk::fill` order (`u32::MAX`: entry without an id). Blocking.
     pub fn region(&self, cx0: i32, cz0: i32) -> Result<Vec<u32>, String> {
+        if !self.eligible_region(cx0, cz0) {
+            return Err("biome region intersects a native density box".into());
+        }
         let t = Instant::now();
         let n = (self.r * self.r) as usize * self.quarters_per_chunk();
         let mut res = self.resource(n)?;

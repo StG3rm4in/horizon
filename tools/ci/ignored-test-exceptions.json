@@ -1310,5 +1310,29 @@
     "path": "crates/horizon-client/src/game/creatures/mob_islands.rs",
     "reason": "needs prepared resources and multiple helpers to exercise grouping",
     "rationale": "Compiled only with --features upstream-parallel-mob-islands. Run by hand with prepared resources and multiple helpers as listed in tools/ci/ignored-tests/manual-horizon-client-parallel-mobs.txt."
+  },
+  {
+    "package": "horizon-gpu",
+    "target": "lib",
+    "test": "f11_runtime_tests::f11_signed_zero_gpu_density_bits",
+    "path": "crates/horizon-gpu/src/lib.rs",
+    "reason": "requires a CUDA device and NVRTC; optional HORIZON_GPU_DEVICE selects the device",
+    "rationale": "Run by hand on a CUDA device with NVRTC: cargo test -p horizon-gpu --lib --features cuda -- --ignored --exact f11_runtime_tests::f11_signed_zero_gpu_density_bits. Listed in tools/ci/ignored-tests/gpu.txt."
+  },
+  {
+    "package": "horizon-gpu",
+    "target": "lib",
+    "test": "f11_runtime_tests::f11_boxed_gpu_beard_codes_and_touching_fallback",
+    "path": "crates/horizon-gpu/src/lib.rs",
+    "reason": "requires a CUDA device and NVRTC; HORIZON_GPU_BEARD must not be 0; optional HORIZON_GPU_DEVICE",
+    "rationale": "Run by hand on a CUDA device with NVRTC: cargo test -p horizon-gpu --lib --features cuda -- --ignored --exact f11_runtime_tests::f11_boxed_gpu_beard_codes_and_touching_fallback. Listed in tools/ci/ignored-tests/gpu.txt."
+  },
+  {
+    "package": "horizon-world",
+    "target": "lib",
+    "test": "worldgen::generator::tests::f11_boxed_preset_chunks",
+    "path": "crates/horizon-world/src/worldgen/generator.rs",
+    "reason": "requires CUDA, NVRTC, and prepared 26.3 resources (HORIZON_TEST_RESOURCES or HORIZON_RESOURCES); HORIZON_GPU_DENSITY=wait; optional HORIZON_GPU_BIOMES, HORIZON_GPU_SURFACE and HORIZON_GPU_SURFACE_TEST",
+    "rationale": "Run by hand on a CUDA device with NVRTC: cargo test -p horizon-world --lib --features cuda -- --ignored --exact worldgen::generator::tests::f11_boxed_preset_chunks. Set the resource path and HORIZON_GPU_DENSITY=wait. The manual row excludes it from the ordinary world shard."
   }
 ]
