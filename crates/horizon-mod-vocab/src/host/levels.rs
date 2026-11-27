@@ -1195,6 +1195,12 @@ pub trait LevelsBackendMut {
     #[access(WorldOnly)]
     fn level_set_weather_levels(&mut self, level: LevelRef, rain: f32, thunder: f32) -> bool;
     /// Side: server.
+    /// Sets whether bees ignore precipitation on this level. Night and other hive and
+    /// pollination rules still apply. Lives until the level closes. False for a stale
+    /// handle or a client.
+    #[access(WorldOnly)]
+    fn level_set_bees_ignore_weather(&mut self, level: LevelRef, ignore: bool) -> bool;
+    /// Side: server.
     /// Random-tick `pos` now, as `ServerLevel.tickChunk` does for a position it picked: the
     /// block's `randomTick` when it ticks randomly (its part first), then lava's fluid random
     /// tick, with the same random draws and level events. False as for `block_tick`.

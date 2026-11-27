@@ -537,6 +537,11 @@ fn biome_modifiers_change_mob_spawns_and_spawn_costs() {
                 r##"{"type":"neoforge:remove_spawn_costs","biomes":"minecraft:plains",
                     "entity_types":"#minecraft:skeletons"}"##,
             ),
+            (
+                "a_scale_rabbits",
+                r##"{"type":"horizon:scale_spawn_weights","biomes":"#minecraft:is_overworld",
+                    "entity_types":"minecraft:rabbit","multiplier":1.5}"##,
+            ),
             // Single spawner object (`minCount == maxCount` -> integer `count`)
             // on a biome that had no `attributes` at all (`desert`), and on `plains`.
             (
@@ -592,11 +597,11 @@ fn biome_modifiers_change_mob_spawns_and_spawn_costs() {
                 }
             ],
             "creature": [
-                {"type": "minecraft:rabbit", "count": 3, "weight": 12}
+                {"type": "minecraft:rabbit", "count": 3, "weight": 18}
             ]
         })
     );
-    // `skeleton` and `stray` costs were removed on `plains`; `zombie` cost remains.
+    // `skeleton` and `stray` costs were removed on `plains`. The zombie cost remains.
     assert_eq!(
         plains_spawns["spawn_costs"],
         serde_json::json!({
@@ -610,7 +615,7 @@ fn biome_modifiers_change_mob_spawns_and_spawn_costs() {
         desert_spawns["spawns_by_category"],
         serde_json::json!({
             "creature": [
-                {"type": "minecraft:rabbit", "count": 3, "weight": 12}
+                {"type": "minecraft:rabbit", "count": 3, "weight": 18}
             ]
         })
     );

@@ -68,6 +68,11 @@ enum Action {
     AddSpawns(Vec<Spawner>),
     /// Takes these entity types out of every spawn category.
     RemoveSpawns(Value),
+    /// Scales existing entries in the MODIFY phase, preserving category and group size.
+    ScaleSpawnWeights {
+        entity_types: Value,
+        multiplier: f64,
+    },
     /// Sets `spawn_costs` for these entity types.
     AddSpawnCosts {
         entity_types: Value,
@@ -287,7 +292,7 @@ impl Changes {
 
 impl Action {
     fn is_modify(&self) -> bool {
-        matches!(self, Self::Modify(_))
+        matches!(self, Self::Modify(_) | Self::ScaleSpawnWeights { .. })
     }
 
     fn is_add(&self) -> bool {
@@ -412,6 +417,19 @@ impl Modifier {
                 Action::AddSpawns(spawners)
             }
             "remove_spawns" => Action::RemoveSpawns(field("entity_types")?),
+            "horizon:scale_spawn_weights" => {
+                let Some(multiplier) = doc["multiplier"]
+                    .as_f64()
+                    .filter(|n| n.is_finite() && *n > 0.0)
+                else {
+                    warnings.push(at("multiplier must be finite and positive: skipped".into()));
+                    return Ok(None);
+                };
+                Action::ScaleSpawnWeights {
+                    entity_types: field("entity_types")?,
+                    multiplier,
+                }
+            }
             "add_spawn_costs" => {
                 let entity_types = field("entity_types")?;
                 let cost = field("spawn_cost")?;
@@ -444,7 +462,7 @@ impl Modifier {
             other => {
                 warnings.push(at(format!(
                     "biome modifier type {other:?} skipped: only feature, spawn, carver, \
-                     horizon:modify_biome and none modifiers are read"
+                     horizon:modify_biome, horizon:scale_spawn_weights and none modifiers are read"
                 )));
                 return Ok(None);
             }
@@ -856,6 +874,7 @@ pub(super) fn apply(
                         Vec::new()
                     }
                     Action::RemoveSpawns(entity_types)
+                    | Action::ScaleSpawnWeights { entity_types, .. }
                     | Action::AddSpawnCosts { entity_types, .. }
                     | Action::RemoveSpawnCosts(entity_types) => entity_reg.resolve(entity_types)?,
                 };
@@ -914,6 +933,9 @@ fn edit(
         Action::RemoveFeatures { steps, .. } => edit_features(biome, steps, false, ids),
         Action::AddSpawns(spawners) => add_spawns(biome, spawners, entity_categories),
         Action::RemoveSpawns(_) => remove_spawns(biome, ids),
+        Action::ScaleSpawnWeights { multiplier, .. } => {
+            scale_spawn_weights(biome, ids, *multiplier)
+        }
         Action::AddSpawnCosts {
             energy_budget,
             charge,
@@ -1168,6 +1190,108 @@ fn remove_spawns(biome: &mut J, entities: &[String]) -> std::result::Result<(), 
         remove_entities(entries, entities);
     }
     Ok(())
+}
+
+fn scale_spawn_weights(
+    biome: &mut J,
+    entities: &[String],
+    multiplier: f64,
+) -> std::result::Result<(), String> {
+    let Some(nat) = biome
+        .get_mut("attributes")
+        .and_then(|a| a.get_mut("minecraft:gameplay/natural_mob_spawns"))
+    else {
+        return Ok(());
+    };
+    let nat = if nat.get("argument").is_some() {
+        nat.get_mut("argument").unwrap()
+    } else {
+        nat
+    };
+    let Some(by_cat) = nat.get_mut("spawns_by_category") else {
+        return Ok(());
+    };
+    let J::Obj(categories) = by_cat else {
+        return Err("spawns_by_category: not an object".into());
+    };
+    for (category, list) in categories {
+        let J::Arr(entries) = list else {
+            return Err(format!("spawns_by_category.{category}: not a list"));
+        };
+        let mut total = 0_i32;
+        for entry in entries {
+            let Some(J::Num(weight)) = entry.get("weight") else {
+                return Err(format!("spawns_by_category.{category}: missing weight"));
+            };
+            let weight = weight
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| format!("spawns_by_category.{category}: invalid weight"))?;
+            let scaled = entry
+                .get("type")
+                .and_then(J::as_str)
+                .is_some_and(|id| entities.contains(&full(id)));
+            let weight = if scaled {
+                let result = (f64::from(weight) * multiplier).round().max(1.0);
+                if result > f64::from(i32::MAX) {
+                    return Err(format!("spawns_by_category.{category}: weight overflow"));
+                }
+                let weight = result as i32;
+                entry.set("weight", J::Num(weight.into()));
+                weight
+            } else {
+                weight
+            };
+            total = total
+                .checked_add(weight)
+                .ok_or_else(|| format!("spawns_by_category.{category}: total weight overflow"))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn scaling_spawn_weights_rounds_half_up_and_reports_overflow() {
+    let mut biome: J = serde_json::from_str(
+        r#"{"attributes":{"minecraft:gameplay/natural_mob_spawns":{"spawns_by_category":{
+            "creature":[{"type":"rabbit","count":2,"weight":3},
+                        {"type":"fox","count":1,"weight":5}]
+        }}}}"#,
+    )
+    .unwrap();
+    let rabbits = ["minecraft:rabbit".to_owned()];
+    scale_spawn_weights(&mut biome, &rabbits, 1.5).unwrap();
+    let value = serde_json::to_value(&biome).unwrap();
+    let creatures = &value["attributes"]["minecraft:gameplay/natural_mob_spawns"]["spawns_by_category"]
+        ["creature"];
+    assert_eq!(
+        creatures,
+        &serde_json::json!([
+            {"type": "rabbit", "count": 2, "weight": 5},
+            {"type": "fox", "count": 1, "weight": 5}
+        ])
+    );
+    assert!(scale_spawn_weights(&mut biome, &rabbits, 1.0e20).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn scaling_spawn_weights_keeps_weight_one_at_point_four() {
+    let mut biome: J = serde_json::from_str(
+        r#"{"attributes":{"minecraft:gameplay/natural_mob_spawns":{"spawns_by_category":{
+            "creature":[{"type":"rabbit","count":2,"weight":1}]
+        }}}}"#,
+    )
+    .unwrap();
+    let rabbits = ["minecraft:rabbit".to_owned()];
+    scale_spawn_weights(&mut biome, &rabbits, 0.4).unwrap();
+    let value = serde_json::to_value(&biome).unwrap();
+    assert_eq!(
+        value["attributes"]["minecraft:gameplay/natural_mob_spawns"]["spawns_by_category"]["creature"],
+        serde_json::json!([{"type": "rabbit", "count": 2, "weight": 1}])
+    );
 }
 
 fn add_spawn_costs(

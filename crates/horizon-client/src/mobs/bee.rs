@@ -468,11 +468,15 @@ fn hive_near_fire(m: &Mob, w: &MobWorld) -> bool {
         })
     })
 }
+fn weather_blocks_bees(w: &MobWorld) -> bool {
+    w.raining && !w.world.bees_ignore_weather
+}
+
 /// `EnvironmentAttributes.BEES_STAY_IN_HIVE`: the overworld's night, or rain.
 pub fn bees_stay_in_hive(w: &MobWorld) -> bool {
     let night = w.dimension_type.has_timeline("minecraft:day")
         && (12542..23460).contains(&w.day_time.rem_euclid(24000));
-    night || w.raining
+    night || weather_blocks_bees(w)
 }
 fn tired_of_looking_for_nectar(m: &Mob) -> bool {
     get(m).is_some_and(|b| b.ticks_without_nectar > 3600)
@@ -810,27 +814,32 @@ impl Goal for Pollinate {
         MOVE
     }
     fn can_use(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
-        let usable =
-            if get(m).is_some_and(|b| b.flower_cooldown > 0) || has_nectar(m) || cx.w.raining {
-                false
-            } else if let Some(p) = self.find_flower(m, cx.w) {
-                st(m).flower = Some(p);
-                let at = [
-                    f64::from(p[0]) + 0.5,
-                    f64::from(p[1]) + 0.5,
-                    f64::from(p[2]) + 0.5,
-                ];
-                m.nav_move_to(cx.w, at, f64::from(1.2_f32));
-                true
-            } else {
-                let cooldown = next_int(m, 20, 60);
-                st(m).flower_cooldown = cooldown;
-                false
-            };
+        let usable = if get(m).is_some_and(|b| b.flower_cooldown > 0)
+            || has_nectar(m)
+            || weather_blocks_bees(cx.w)
+        {
+            false
+        } else if let Some(p) = self.find_flower(m, cx.w) {
+            st(m).flower = Some(p);
+            let at = [
+                f64::from(p[0]) + 0.5,
+                f64::from(p[1]) + 0.5,
+                f64::from(p[2]) + 0.5,
+            ];
+            m.nav_move_to(cx.w, at, f64::from(1.2_f32));
+            true
+        } else {
+            let cooldown = next_int(m, 20, 60);
+            st(m).flower_cooldown = cooldown;
+            false
+        };
         usable && calm(m, cx.w)
     }
     fn can_continue(&mut self, m: &mut Mob, cx: &mut Cx) -> bool {
-        let go = if !pollinating(m) || get(m).is_none_or(|b| b.flower.is_none()) || cx.w.raining {
+        let go = if !pollinating(m)
+            || get(m).is_none_or(|b| b.flower.is_none())
+            || weather_blocks_bees(cx.w)
+        {
             false
         } else if self.long_enough() {
             m.random.next_float() < 0.2

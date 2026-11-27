@@ -88,6 +88,8 @@ pub struct World {
     pub infiniburn: Option<Arc<horizon_world::level::data::BlockSet>>,
     /// Server-owned mod data attached to this dimension.
     pub attachments: horizon_mod_runtime::attachments::Attachments,
+    /// Whether bees ignore precipitation on this live level.
+    pub bees_ignore_weather: bool,
     /// Mod-owned watered areas; never serialized with the world.
     pub water_tickets: horizon_mod_runtime::water_tickets::WaterTickets,
     /// The holders lent to mods since the last flush, whose synced changes
@@ -390,6 +392,7 @@ impl World {
             day_time: 1000,
             end_clock: 0,
             weather: Weather::default(),
+            bees_ignore_weather: false,
             block_log: None,
             block_log_held: Vec::new(),
             block_previous: None,

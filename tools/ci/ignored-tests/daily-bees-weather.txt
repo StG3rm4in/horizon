@@ -1,0 +1,1 @@
+horizon-client game::native_level_weather::tests::bees_ignore_precipitation_when_enabled_but_still_stay_inside_at_night lib daily resources

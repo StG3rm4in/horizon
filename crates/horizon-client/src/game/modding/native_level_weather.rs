@@ -54,6 +54,22 @@ impl Game<'_> {
             }
         }
     }
+    pub(super) fn level_set_bees_ignore_weather(&mut self, level: LevelRef, ignore: bool) -> bool {
+        if self.native_level_world(level).is_none() {
+            return false;
+        }
+        let world = if self.level_in_place(level) {
+            &mut self.world
+        } else {
+            let Some(world) = self.levels.parked_world_mut_of(level.dimension_id()) else {
+                return false;
+            };
+            world
+        };
+        world.bees_ignore_weather = ignore;
+        true
+    }
+
     /// `set_weather_parameters` through a handle of the level in place. False for a negative
     /// time, inside the `weather_change` or `thunder_change` hook, a parked level, a stale
     /// handle or a client.
@@ -98,6 +114,28 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use mod_api::{LevelRef, WorldEpoch};
+
+    #[test]
+    #[ignore = "daily"]
+    fn bees_ignore_precipitation_when_enabled_but_still_stay_inside_at_night() {
+        use horizon_client::mobs::bee::bees_stay_in_hive;
+
+        super::super::native_entity_refs::tests::with_game(|game| {
+            let level = game.level(game.dim.id()).unwrap();
+            let stay = |game: &super::Game<'_>, time| {
+                let mut view = game.mob_world_base(&[]);
+                view.raining = true;
+                view.day_time = time;
+                bees_stay_in_hive(&view)
+            };
+            assert!(stay(game, 6000));
+            assert!(level.set_bees_ignore_weather(game, true));
+            assert!(!stay(game, 6000));
+            assert!(stay(game, 18000));
+            assert!(level.set_bees_ignore_weather(game, false));
+            assert!(stay(game, 6000));
+        });
+    }
 
     #[test]
     #[ignore = "daily"]
