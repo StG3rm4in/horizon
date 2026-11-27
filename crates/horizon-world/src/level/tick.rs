@@ -1630,6 +1630,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             let to = b.default_of(b.named.ice);
             // A water template's freezing is its own, as below a cauldron's filling.
             if !self.level.template_suppressed(from)
+                && self.level.allow_block_freeze(below_pos, from, to)
                 && self.level.allow_block_form(below_pos, from, to)
             {
                 self.set_block_and_update(below_pos, to);
@@ -2000,6 +2001,18 @@ impl Behaviours {
             ticks.blocks.finish_tick()
         };
     }
+    /// Run the live precipitation tick for a sampled column.
+    pub fn tick_precipitation_column<L: LevelAccess + ?Sized>(
+        &self,
+        level: &mut L,
+        ticks: &mut Ticks,
+        pos: BlockPos,
+    ) {
+        if let Some(info) = level.precipitation(pos) {
+            self.sim(level, ticks).precipitation_tick(info);
+        }
+    }
+
     /// Random-tick one chunk (`ServerLevel.tickChunk` block part). Visits the
     /// sections from the bottom up and draws `randomTickSpeed` positions in
     /// each randomly ticking one (`LevelChunkSection.isRandomlyTicking`: it
@@ -2046,9 +2059,7 @@ impl Behaviours {
         for _ in 0..speed {
             if level.random().next_int_bound(48).unwrap_or(1) == 0 {
                 let pos = ticks.block_random_pos(min_x, 0, min_z, 15);
-                if let Some(info) = level.precipitation(pos) {
-                    self.sim(level, ticks).precipitation_tick(info);
-                }
+                self.tick_precipitation_column(level, ticks, pos);
             }
         }
         let mut from = level.min_y();

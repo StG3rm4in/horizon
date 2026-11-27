@@ -64,10 +64,18 @@ impl Behaviours {
         let top = self.motion_blocking_top(level, pos);
         let below = BlockPos::new(top.x, top.y - 1, top.z);
         let settings = self.biome_settings(level, top)?;
+        let force_snow = level.force_snow();
         let sea = sea_level(level);
+        let kind_at = |pos| {
+            if force_snow {
+                BiomePrecipitation::Snow
+            } else {
+                Self::precipitation_kind(settings, pos, sea)
+            }
+        };
         let inside = |p: BlockPos| p.y >= level.min_y() && p.y < level.max_y();
         // Biome.shouldFreeze(level, below, true)
-        let freezes_below = settings.height_adjusted(below, sea) < 0.15
+        let freezes_below = (force_snow || settings.height_adjusted(below, sea) < 0.15)
             && inside(below)
             && level.block_light(below) < 10
             && {
@@ -86,7 +94,7 @@ impl Behaviours {
                 !self.is_water_fluid(self.fluid(level.block_state(n)).kind())
             });
         // Biome.shouldSnow(level, top)
-        let snows_at_top = Self::precipitation_kind(settings, top, sea) == BiomePrecipitation::Snow
+        let snows_at_top = kind_at(top) == BiomePrecipitation::Snow
             && inside(top)
             && level.block_light(top) < 10
             && {
@@ -94,7 +102,7 @@ impl Behaviours {
                 (self.is_air(state) || self.block(state) == self.named.snow)
                     && self.snow_survives(level, top)
             };
-        let kind = match Self::precipitation_kind(settings, below, sea) {
+        let kind = match kind_at(below) {
             BiomePrecipitation::None => PrecipitationKind::None,
             BiomePrecipitation::Rain => PrecipitationKind::Rain,
             BiomePrecipitation::Snow => PrecipitationKind::Snow,
@@ -125,6 +133,9 @@ impl Behaviours {
             return false;
         }
         if self.motion_blocking_top(level, pos).y > pos.y {
+            return false;
+        }
+        if level.force_snow() {
             return false;
         }
         self.biome_settings(level, pos).is_some_and(|s| {

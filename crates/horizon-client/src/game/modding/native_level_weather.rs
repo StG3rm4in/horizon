@@ -8,6 +8,22 @@ use crate::game::level_control_hooks::LevelControl;
 use mod_api::LevelRef;
 
 impl Game<'_> {
+    pub(super) fn level_set_force_snow(&mut self, level: LevelRef, force: bool) -> bool {
+        if self.native_level_world(level).is_none() {
+            return false;
+        }
+        let world = if level.dimension() == self.dim.key() {
+            &mut self.world
+        } else {
+            let Some(world) = self.levels.parked_world_mut_of(level.dimension_id()) else {
+                return false;
+            };
+            world
+        };
+        world.force_snow = force;
+        true
+    }
+
     /// `MinecraftServer.setWeatherParameters(clear, time, raining, thundering)` in the level in
     /// place, as `/weather` and mods set it: `weather_change` may cancel all of it and
     /// `thunder_change` the thunder half.
