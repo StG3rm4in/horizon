@@ -20,8 +20,9 @@ use horizon_core::{
 };
 use serde_json::{Value, value::RawValue};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use {
     super::{
@@ -31,7 +32,10 @@ use {
             lay_out_children, place_start,
         },
         legacy::{LegacyPiece, PieceContext},
-        mod_types::{ModStructureType, ModStructureTypes},
+        mod_types::{
+            ModPlacementCallback, ModStructurePlacements, ModStructureType, ModStructureTypes,
+            mod_structure_placements,
+        },
     },
     horizon_core::bounding_box::BoundingBox,
 };
@@ -160,7 +164,58 @@ enum Placement {
     /// being the chunk of the NoiseSpawnFinder position). The type has no
     /// salt, frequency reduction or exclusion zone: the chunk alone decides.
     DimensionOrigin,
+    Mod(ModPlacement),
     Unsupported,
+}
+
+struct ModPlacement {
+    callback: Arc<ModPlacementCallback>,
+    params: String,
+    primary: OnceLock<(i64, Vec<ChunkPos>)>,
+    /// The lists of the other seeds this placement served (another world in the same process).
+    others: std::sync::Mutex<Vec<(i64, Arc<[ChunkPos]>)>>,
+}
+
+impl std::fmt::Debug for ModPlacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModPlacement")
+            .field("params", &self.params)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModPlacement {
+    fn chunks(&self, seed: i64) -> Cow<'_, [ChunkPos]> {
+        let compute = || {
+            // The world border is 29,999,984 blocks: chunks beyond it can never start a structure,
+            // and far larger ones would overflow the block arithmetic of locate.
+            const BORDER_CHUNKS: u32 = 1_875_000;
+            let mut chunks: Vec<_> = (self.callback)(seed, &self.params)
+                .into_iter()
+                .filter(|[x, z]| {
+                    x.unsigned_abs() <= BORDER_CHUNKS && z.unsigned_abs() <= BORDER_CHUNKS
+                })
+                .map(|[x, z]| ChunkPos::new(x, z))
+                .collect();
+            chunks.sort_unstable_by_key(|chunk| (chunk.x, chunk.z));
+            chunks.dedup();
+            chunks
+        };
+        let (primary_seed, chunks) = self.primary.get_or_init(|| (seed, compute()));
+        if seed == *primary_seed {
+            return Cow::Borrowed(chunks.as_slice());
+        }
+        let mut others = self
+            .others
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, list)) = others.iter().find(|(s, _)| *s == seed) {
+            return Cow::Owned(list.to_vec());
+        }
+        let list: Arc<[ChunkPos]> = compute().into();
+        others.push((seed, list.clone()));
+        Cow::Owned(list.to_vec())
+    }
 }
 /// Concentric ring chunk positions by structure set name.
 pub type Rings = BTreeMap<String, Vec<ChunkPos>>;
@@ -382,6 +437,24 @@ impl StructureRegistry {
         // before `Unsupported` (`"type": "modid:tower"`).
         mod_types: &ModStructureTypes,
     ) -> Result<Self, DecodeError> {
+        Self::new_with_placements(
+            structures,
+            sets,
+            pools,
+            biome_set,
+            mod_types,
+            mod_structure_placements(),
+        )
+    }
+
+    pub(crate) fn new_with_placements(
+        structures: &BTreeMap<String, String>,
+        sets: &BTreeMap<String, String>,
+        pools: BTreeMap<String, String>,
+        biome_set: &dyn Fn(&Value) -> Result<BTreeSet<BiomeId>, DecodeError>,
+        mod_types: &ModStructureTypes,
+        placements: &ModStructurePlacements,
+    ) -> Result<Self, DecodeError> {
         let mut defs = Vec::new();
         for (name, json) in structures {
             let v: Value = serde_json::from_str(json)?;
@@ -528,7 +601,21 @@ impl StructureRegistry {
                     count: p["count"].as_i64().unwrap_or(0) as i32,
                     preferred: biome_set(&p["preferred_biomes"])?,
                 },
-                _ => Placement::Unsupported,
+                ty => match placements.get(ty) {
+                    Some(callback) => {
+                        let mut params = p.clone();
+                        if let Some(params) = params.as_object_mut() {
+                            params.remove("type");
+                        }
+                        Placement::Mod(ModPlacement {
+                            callback: callback.clone(),
+                            params: params.to_string(),
+                            primary: OnceLock::new(),
+                            others: Default::default(),
+                        })
+                    }
+                    None => Placement::Unsupported,
+                },
             };
             let mut structures = Vec::new();
             for entry in v["structures"].as_array().into_iter().flatten() {
@@ -734,6 +821,10 @@ impl StructureRegistry {
             Placement::ConcentricRings { .. } => rings
                 .get(&set.name)
                 .is_some_and(|r| r.contains(&ChunkPos::new(x, z))),
+            Placement::Mod(ref placement) => placement
+                .chunks(seed)
+                .binary_search_by_key(&(x, z), |chunk| (chunk.x, chunk.z))
+                .is_ok(),
             Placement::Unsupported => false,
         };
         if !placed {
@@ -909,6 +1000,13 @@ impl StructureRegistry {
     }
 }
 impl StructureSet {
+    pub(crate) fn mod_placement_chunks(&self, seed: i64) -> Option<Cow<'_, [ChunkPos]>> {
+        match &self.placement {
+            Placement::Mod(placement) => Some(placement.chunks(seed)),
+            _ => None,
+        }
+    }
+
     /// The random spread's spacing in chunks (`None` for rings).
     pub fn spacing(&self) -> Option<i32> {
         match self.placement {

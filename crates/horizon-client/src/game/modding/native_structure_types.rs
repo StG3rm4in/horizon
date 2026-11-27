@@ -404,6 +404,24 @@ mod book_example;
 #[path = "native_structure_types/tests.rs"]
 mod tests;
 
+pub(in crate::game) fn install_structure_placements() {
+    use horizon_world::worldgen::structure::mod_types::{
+        ModPlacementCallback, install_mod_structure_placements,
+    };
+
+    let placements = mod_api::__private::structure_placement_declarations()
+        .into_iter()
+        .map(|(id, placement)| {
+            let callback: Arc<ModPlacementCallback> =
+                Arc::new(move |seed, params| placement.start_chunks(seed, params));
+            (id, callback)
+        })
+        .collect();
+    if install_mod_structure_placements(placements).is_err() {
+        log::warn!("Mod structure placements already installed; keeping the first table");
+    }
+}
+
 /// Registered API declarations become engine adapters once, not once per chunk.
 pub(in crate::game) fn installed_structure_types()
 -> horizon_world::worldgen::structure::mod_types::ModStructureTypes {

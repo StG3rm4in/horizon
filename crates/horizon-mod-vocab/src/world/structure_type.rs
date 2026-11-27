@@ -322,6 +322,35 @@ pub trait PieceContext {
     fn block_entity(&mut self, pos: [i32; 3], nbt: Compound);
 }
 
+/// A finite structure placement supplied by a native mod.
+///
+/// The same world seed and parameters must produce the same finite set of
+/// chunks on any worker. Return chunk coordinates within the world border.
+/// The engine uses this list for both generation and structure searches and
+/// may cache it. Keep the list small and independent of generated terrain,
+/// loaded chunks, and mutable game state.
+pub trait ModStructurePlacement: Send + Sync + 'static {
+    /// Candidate start chunks as `[chunk_x, chunk_z]`. `params_json` is the
+    /// placement object with `type` removed. Return an empty list for invalid
+    /// parameters. The engine still applies the set's common placement rules
+    /// and the structure's biome and generation checks.
+    fn start_chunks(&self, world_seed: i64, params_json: &str) -> Vec<[i32; 2]>;
+}
+
+pub(crate) struct StructurePlacementInfo {
+    pub(crate) id: Box<str>,
+    pub(crate) placement: Arc<dyn ModStructurePlacement>,
+}
+
+/// Registered placements for the executable's worldgen integration.
+#[doc(hidden)]
+pub fn structure_placement_declarations() -> Vec<(String, Arc<dyn ModStructurePlacement>)> {
+    crate::parts::installed_structure_placement_list()
+        .iter()
+        .map(|info| (info.id.to_string(), info.placement.clone()))
+        .collect()
+}
+
 /// A registered API behaviour; the game builds its engine adapter at startup.
 pub(crate) struct StructureTypeInfo {
     pub(crate) id: Box<str>,

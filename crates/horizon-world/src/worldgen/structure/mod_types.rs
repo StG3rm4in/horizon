@@ -54,6 +54,24 @@ pub type ModStructureTypes = BTreeMap<String, Arc<dyn ModStructureType>>;
 
 static MOD_TYPES: OnceLock<ModStructureTypes> = OnceLock::new();
 
+/// An installed native placement's finite candidate function.
+pub type ModPlacementCallback = dyn Fn(i64, &str) -> Vec<[i32; 2]> + Send + Sync;
+pub type ModStructurePlacements = BTreeMap<String, Arc<ModPlacementCallback>>;
+
+static MOD_PLACEMENTS: OnceLock<ModStructurePlacements> = OnceLock::new();
+static EMPTY_PLACEMENTS: ModStructurePlacements = BTreeMap::new();
+
+/// Install the linked mods' placement types before decoding worldgen registries.
+pub fn install_mod_structure_placements(
+    placements: ModStructurePlacements,
+) -> Result<(), ModStructurePlacements> {
+    MOD_PLACEMENTS.set(placements)
+}
+
+pub fn mod_structure_placements() -> &'static ModStructurePlacements {
+    MOD_PLACEMENTS.get().unwrap_or(&EMPTY_PLACEMENTS)
+}
+
 #[cfg(test)]
 thread_local! {
     /// The types a test installs, in place of the process-wide table.

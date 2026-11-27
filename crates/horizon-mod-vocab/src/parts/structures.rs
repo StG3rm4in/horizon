@@ -6,7 +6,23 @@ pub(crate) fn installed_structure_type_list()
     installed().map_or(&[], |installed| installed.structure_types.as_slice())
 }
 
+pub(crate) fn installed_structure_placement_list()
+-> &'static [crate::world::structure_type::StructurePlacementInfo] {
+    installed().map_or(&[], |installed| installed.structure_placements.as_slice())
+}
+
 impl dyn Registrar + '_ {
+    /// Register a finite placement under an owned id (`site` or `mymod:site`).
+    /// A structure set can select it with `"placement": {"type": "mymod:site", ...}`.
+    /// Duplicate and invalid ids are refused at startup.
+    pub fn register_structure_placement<T: crate::ModStructurePlacement>(
+        &mut self,
+        name: &str,
+        placement: T,
+    ) {
+        self.add_structure_placement(name, Arc::new(placement));
+    }
+
     /// Register structure type `name` (`tower` or `mymod:tower`), the way
     /// NeoForge's registries `STRUCTURE_TYPE` and `STRUCTURE_PIECE` register
     /// once at startup: a data pack structure with `"type": "modid:tower"`
@@ -23,6 +39,20 @@ impl dyn Registrar + '_ {
 
 /// Registrar operations for structures.
 pub trait StructuresRegistrar {
+    /// Register native finite placement `name` with `placement`; mods reach it through
+    /// `register_structure_placement`.
+    ///
+    /// Not on wasm: ModStructurePlacement is not bound by the generated worker interface. A wasm
+    /// mod's structure set can name a placement a native mod registered.
+    fn add_structure_placement(
+        &mut self,
+        name: &str,
+        placement: Arc<dyn crate::ModStructurePlacement>,
+    ) {
+        let _ = placement;
+        panic!("structure placement {name:?}: a wasm mod cannot register a structure placement");
+    }
+
     /// Register structure type `name` with `ty`; mods reach it through
     /// `register_structure_type`.
     ///

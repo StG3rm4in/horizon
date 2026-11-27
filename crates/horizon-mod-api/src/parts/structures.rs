@@ -67,6 +67,31 @@ pub mod tests {
 }
 
 impl StructuresRegistrar for PartRegistrar {
+    fn add_structure_placement(
+        &mut self,
+        name: &str,
+        placement: Arc<dyn crate::ModStructurePlacement>,
+    ) {
+        let id = match self.owned_declaration_id(name) {
+            Ok(id) => id,
+            Err(reason) => {
+                self.refused.push(reason);
+                return;
+            }
+        };
+        if self.structure_placements.iter().any(|entry| *entry.id == *id) {
+            self.refused.push(format!(
+                "{} registered structure placement {id} twice",
+                self.mod_id
+            ));
+            return;
+        }
+        self.structure_placements.push(StructurePlacementInfo {
+            id: id.into(),
+            placement,
+        });
+    }
+
     fn add_structure_type(&mut self, name: &str, ty: Arc<dyn crate::StructureType>) {
         let id = match self.owned_declaration_id(name) {
             Ok(id) => id,

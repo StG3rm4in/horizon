@@ -11590,6 +11590,7 @@ pub(crate) fn run_with(
     native_chunk_generator::install();
     native_biome_source::install();
     native_density_function::install();
+    native_structure_types::install_structure_placements();
     mods::register_components(&vanilla_root)?;
     mods::register_standalone_models(options.execution_role);
     mods::register_layer_definitions(options.execution_role, &vanilla_root);

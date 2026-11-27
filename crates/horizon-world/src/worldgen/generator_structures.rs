@@ -977,6 +977,21 @@ impl StructureState {
             if !set.structures.iter().any(|(s, _)| wanted(*s)) {
                 continue;
             }
+            if let Some(chunks) = set.mod_placement_chunks(seed) {
+                for &chunk in chunks.iter() {
+                    let p = set.locate_pos(chunk);
+                    let d = dist(p);
+                    if best.as_ref().is_none_or(|(b, ..)| d < *b)
+                        && self
+                            .registry
+                            .is_structure_chunk(set, seed, chunk.x, chunk.z, &rings)
+                        && let Some(name) = found_at(self, context, chunk)
+                    {
+                        best = Some((d, name, p));
+                    }
+                }
+                continue;
+            }
             match set.spacing() {
                 None => {
                     // Rings: nearest by the chunk's (8, 32, 8) block.
@@ -1345,6 +1360,229 @@ pub(crate) fn tag_json(tag: &horizon_core::nbt::Tag) -> Value {
 mod tests {
     use super::*;
     use crate::worldgen::structure::stronghold::{ring_positions, ring_searches};
+
+    use crate::{
+        heightmap::HeightmapType,
+        registry::BlockRegistry,
+        worldgen::{
+            anchor::WorldGenerationContext,
+            structure::{
+                StateTransforms,
+                jigsaw::JigsawContext,
+                mod_types::{ModPlacementCallback, ModStructurePlacements, ModStructureTypes},
+                start::NoiseColumnTarget,
+            },
+        },
+    };
+
+    const PLACEMENT_SEED: i64 = -71;
+    const PLACEMENT_START: ChunkPos = ChunkPos { x: -7, z: 9 };
+    const PLACEMENT_STRUCTURE: &str = "test:treasure";
+
+    struct PlacementTestContext;
+
+    impl JigsawContext for PlacementTestContext {
+        fn min_y(&self) -> i32 {
+            -64
+        }
+
+        fn max_y(&self) -> i32 {
+            320
+        }
+
+        fn base_height(&mut self, _: i32, _: i32, _: HeightmapType) -> i32 {
+            63
+        }
+
+        fn column_has_valid_biome(&mut self, _: i32, _: i32, _: i32, _: i32) -> bool {
+            true
+        }
+    }
+
+    impl StartContext for PlacementTestContext {
+        fn seed(&self) -> i64 {
+            PLACEMENT_SEED
+        }
+
+        fn sea_level(&self) -> i32 {
+            63
+        }
+
+        fn base_column(&mut self, _: i32, _: i32, _: HeightmapType) -> Vec<bool> {
+            unreachable!("treasure only queries the height")
+        }
+
+        fn base_columns_by(
+            &mut self,
+            _: i32,
+            _: i32,
+            _: usize,
+            _: &dyn Fn(usize) -> HeightmapType,
+        ) -> Vec<Vec<bool>> {
+            unreachable!("treasure only queries the height")
+        }
+
+        fn noise_column_into(&mut self, _: i32, _: i32, _: &mut dyn NoiseColumnTarget) {
+            unreachable!("treasure only queries the height")
+        }
+
+        fn cold_enough_to_snow(&mut self, _: BiomeId, _: [i32; 3]) -> bool {
+            false
+        }
+
+        fn generation(&self) -> WorldGenerationContext {
+            WorldGenerationContext::new(-64, 384, 63)
+        }
+
+        fn noise_biome(&mut self, _: [i32; 3]) -> BiomeId {
+            BiomeId(0)
+        }
+
+        fn noise_biomes(&mut self, quarts: &[[i32; 3]]) -> Vec<BiomeId> {
+            vec![BiomeId(0); quarts.len()]
+        }
+
+        fn set_valid_biomes(&mut self, _: Option<&BTreeSet<BiomeId>>) {}
+    }
+
+    fn f23_placement_state(registered: bool) -> StructureState {
+        use horizon_core::nbt::{Tag, parse_snbt};
+
+        let (mut tag, _) = parse_snbt(
+            r#"{DataVersion:0,states:[{id:"minecraft:air"},{id:"minecraft:cave_air"},
+            {id:"minecraft:void_air"}],defaults:{"minecraft:air":0,"minecraft:cave_air":1,
+            "minecraft:void_air":2}}"#,
+        )
+        .unwrap();
+        *tag.get_mut("DataVersion").unwrap() = Tag::Int(crate::DATA_VERSION);
+        let blocks = Box::leak(Box::new(BlockRegistry::from_nbt(&tag).unwrap()));
+        let mut placements = ModStructurePlacements::new();
+        if registered {
+            let callback: Arc<ModPlacementCallback> = Arc::new(|seed, params| {
+                let params: Value = serde_json::from_str(params).unwrap();
+                assert!(params.get("type").is_none());
+                assert_eq!(params["site"].as_str(), Some("test"));
+                let x = seed.rem_euclid(16) as i32 - 16;
+                vec![[x, 9], [x, 9]]
+            });
+            placements.insert("test:finite".into(), callback);
+        }
+        let registry = StructureRegistry::new_with_placements(
+            &BTreeMap::from([(
+                PLACEMENT_STRUCTURE.into(),
+                r#"{"type":"minecraft:buried_treasure"}"#.into(),
+            )]),
+            &BTreeMap::from([(
+                "test:set".into(),
+                serde_json::json!({
+                    "structures": [{"structure": PLACEMENT_STRUCTURE, "weight": 1}],
+                    "placement": {
+                        "type": "test:finite", "site": "test", "locate_offset": [3, 1, 4]
+                    }
+                })
+                .to_string(),
+            )]),
+            BTreeMap::new(),
+            &|_| Ok(BTreeSet::from([BiomeId(0)])),
+            &ModStructureTypes::new(),
+            &placements,
+        )
+        .unwrap();
+        StructureState {
+            registry,
+            resources: Arc::new(StructureResources::new(
+                blocks,
+                StateTransforms::default(),
+                std::path::Path::new("unused"),
+                BTreeMap::new(),
+                &BTreeMap::new(),
+            )),
+            bindings: FeatureBlockBindings::new(blocks, BTreeSet::new()).unwrap(),
+            possible_sets: vec![0],
+            by_step: Vec::new(),
+            starts: StartCache::new(),
+            saved: OnceLock::new(),
+            start_work: ChunkWork::new(),
+            rings: Arc::new(OnceLock::new()),
+            ring_work: OnceLock::new(),
+            ring_seed: None,
+            fixed_biome: false,
+            zone_reach: 0,
+            biome_names: crate::worldgen::structure_terrain::BiomeNames::new(&[]),
+        }
+    }
+
+    #[test]
+    fn f23_mod_start_is_deterministic_across_threads_and_orders() {
+        let chunks = [ChunkPos::new(-8, 9), PLACEMENT_START, ChunkPos::new(-7, 10)];
+        let check = |state: &StructureState, order: [ChunkPos; 3]| {
+            let mut context = PlacementTestContext;
+            for chunk in order {
+                let starts = state.starts_at(&mut context, chunk);
+                if chunk == PLACEMENT_START {
+                    assert_eq!(starts.len(), 1);
+                    assert_eq!(starts[0].chunk, chunk);
+                    assert_eq!(starts[0].name, PLACEMENT_STRUCTURE);
+                } else {
+                    assert!(starts.is_empty());
+                }
+            }
+        };
+        let state = f23_placement_state(true);
+        let reversed = [chunks[2], chunks[1], chunks[0]];
+        std::thread::scope(|scope| {
+            scope.spawn(|| check(&state, chunks));
+            scope.spawn(|| check(&state, reversed));
+        });
+        check(&f23_placement_state(true), reversed);
+        assert!(!state.registry.is_structure_chunk(
+            &state.registry.sets[0],
+            PLACEMENT_SEED + 1,
+            PLACEMENT_START.x,
+            PLACEMENT_START.z,
+            &Rings::new(),
+        ));
+    }
+
+    #[test]
+    fn f23_unknown_placement_stays_unsupported() {
+        let state = f23_placement_state(false);
+        assert!(
+            state.registry.sets[0]
+                .mod_placement_chunks(PLACEMENT_SEED)
+                .is_none()
+        );
+        let mut context = PlacementTestContext;
+        assert!(state.starts_at(&mut context, PLACEMENT_START).is_empty());
+        assert_eq!(
+            state.locate(
+                &mut context,
+                &[PLACEMENT_STRUCTURE.into()],
+                [0; 3],
+                100,
+                &|_, _| false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn f23_locate_finds_unbuilt_mod_start_and_honors_skip() {
+        let state = f23_placement_state(true);
+        let mut context = PlacementTestContext;
+        let names = [PLACEMENT_STRUCTURE.into()];
+        assert!(state.cached_starts_at(PLACEMENT_START).is_none());
+        assert_eq!(
+            state.locate(&mut context, &names, [0; 3], 0, &|_, _| false),
+            Some((PLACEMENT_STRUCTURE.into(), [-109, 1, 148]))
+        );
+        assert_eq!(
+            state.locate(&mut context, &names, [0; 3], 0, &|_, chunk| {
+                chunk == PLACEMENT_START
+            }),
+            None
+        );
+    }
 
     #[test]
     fn structure_biome_plain_lists_and_scalar_fields_keep_their_leniency() {
