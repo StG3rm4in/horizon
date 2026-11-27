@@ -1302,5 +1302,13 @@
     "path": "crates/horizon-client/src/game/creatures/prep.rs",
     "reason": "needs the upstream-parallel-mobs feature and prepared resources",
     "rationale": "Compiled only with the `upstream-parallel-mobs` feature, which the daily shards never build, and needs HORIZON_TEST_RESOURCES. Run by hand: cargo test -p horizon-client --lib --features upstream-parallel-mob-islands -- --ignored --exact game::creatures::prep::tests::the_nearest_player_is_asked_again_after_a_move (parallel-mobs' checks run it with the islands' tests). Not selected by daily shards."
+  },
+  {
+    "package": "horizon-client",
+    "target": "lib",
+    "test": "game::creatures::mob_islands::tests::walk_to_matches_borrowed_turns_and_clear_stops_navigation",
+    "path": "crates/horizon-client/src/game/creatures/mob_islands.rs",
+    "reason": "needs prepared resources and multiple helpers to exercise grouping",
+    "rationale": "Compiled only with --features upstream-parallel-mob-islands. Run by hand with prepared resources and multiple helpers as listed in tools/ci/ignored-tests/manual-horizon-client-parallel-mobs.txt."
   }
 ]

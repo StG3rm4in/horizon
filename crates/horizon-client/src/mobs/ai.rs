@@ -409,6 +409,8 @@ pub struct Ai {
     /// Mob keeps homePosition even when clearHome makes homeRadius -1.
     /// Active homes still use `home`; this only retains its hidden position.
     last_home_position: [i32; 3],
+    /// Runtime destination of the engine's mod-configured `WalkTo` goal.
+    pub walk_destination: Option<[i32; 3]>,
     pub goals: GoalSelector,
     pub targets: GoalSelector,
     pub nav: Navigation,

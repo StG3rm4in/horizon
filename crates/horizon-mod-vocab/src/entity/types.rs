@@ -400,11 +400,9 @@ pub enum MobFilter {
     Species(Vec<String>),
 }
 
-/// A vanilla AI goal, as a mob's `add_goal` and `add_target_goal` give one:
-/// only the kinds Horizon's own species code runs, with the vanilla
-/// constructor's parameters (`MeleeAttackGoal(speed, followUnseen)`). Goals
-/// with behavior of their own (a `MoveToBlockGoal` subclass's block test)
-/// stay out: they take code, not parameters.
+/// An engine AI goal, as a mob's `add_goal` and `add_target_goal` give one.
+/// Most kinds take their vanilla constructor's parameters.
+/// `WalkTo` takes its destination from `MobRef::set_walk_destination`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 #[derive(horizon_mod_api_macros::Wire)]
@@ -537,6 +535,15 @@ pub enum GoalSpec {
         /// Also alert nearby mobs of the same kind, as `setAlert()`.
         alert: bool,
     },
+    /// Follow ordinary ground navigation toward a mod-supplied block.
+    /// Takes `MOVE` on the goal selector and yields while the mob has a
+    /// combat target. The destination is separate from the goal parameters.
+    WalkTo {
+        /// Movement speed multiplier, finite and in `0.0..=4.0`.
+        speed: f64,
+        /// Horizontal arrival radius from the block center, finite and nonnegative.
+        stop: f64,
+    },
 }
 
 impl GoalSpec {
@@ -565,6 +572,7 @@ impl GoalSpec {
             Self::BreathAir => "breath_air",
             Self::TryFindWater => "try_find_water",
             Self::NearestTarget { .. } => "nearest_target",
+            Self::WalkTo { .. } => "walk_to",
             Self::HurtByTarget { .. } => "hurt_by_target",
         }
     }

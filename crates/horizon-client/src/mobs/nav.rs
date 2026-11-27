@@ -499,6 +499,30 @@ impl Mob {
     pub fn nav_stop(&mut self) {
         self.ai.nav.path = None;
     }
+    /// Drop the walk route and any queued refresh of it. Ground navigation
+    /// can adjust the destination's Y as the surface changes. Check the path
+    /// and recompute target separately: a replacement goal's canUse can
+    /// prepare its own target before the selector stops the old goal.
+    pub(super) fn nav_stop_walk_to(&mut self, at: [i32; 3]) {
+        let nav = if let Some(redirect) = &mut self.ai.navigation_redirect {
+            &mut redirect.own
+        } else {
+            &mut self.ai.nav
+        };
+        let same_column = |target: [i32; 3]| target[0] == at[0] && target[2] == at[2];
+        if nav
+            .path
+            .as_ref()
+            .is_some_and(|path| same_column(path.target))
+        {
+            nav.path = None;
+        }
+        if nav.target_pos.is_some_and(same_column) {
+            nav.target_pos = None;
+            nav.pending_recompute = false;
+            nav.delayed_recompute = false;
+        }
+    }
     fn recompute_path(&mut self, w: &MobWorld) {
         // Our rule for a path a mod supplied (it keeps no recompute target):
         // a block change on it, or anything else that asks for a recompute,

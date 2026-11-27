@@ -63,6 +63,23 @@ fn pathfinder(species: Species) -> bool {
 }
 
 impl Game<'_> {
+    pub(super) fn mob_set_walk_destination(&mut self, mob: MobRef, at: Option<[i32; 3]>) -> bool {
+        if at.is_some_and(|p| p.iter().any(|v| !(-30_000_000..=30_000_000).contains(v))) {
+            return false;
+        }
+        let Some(Target::Mob(id)) = self.native_entity_target(mob.entity()) else {
+            return false;
+        };
+        let Some(m) = self.mobs.iter_mut().find(|m| m.id == id) else {
+            return false;
+        };
+        if at.is_some() && m.ai.nav.kind != NavKind::Ground {
+            return false;
+        }
+        m.ai.walk_destination = at;
+        true
+    }
+
     /// `GoalSelector.addGoal(priority, goal)` on a mob's goal selector.
     /// Refuses a stale or unavailable mob, a client, and the dragon (it
     /// keeps no selector); a goal the mob's vanilla class does not hold (a
@@ -104,6 +121,9 @@ impl Game<'_> {
         priority: i32,
         goal: &GoalSpec,
     ) -> bool {
+        if matches!(goal, GoalSpec::WalkTo { .. }) {
+            return false;
+        }
         let Some(Target::Mob(id)) = self.native_entity_target(mob.entity()) else {
             return false;
         };
@@ -476,6 +496,18 @@ impl Game<'_> {
                 }
                 Some(Box::new(FollowMob::new(*speed, *stop, *area)))
             }
+            GoalSpec::WalkTo { speed, stop } => {
+                // Stay inside the existing island locomotion bound for a speed
+                // multiplier first written during this turn.
+                if navigation != NavKind::Ground
+                    || !(0.0..=4.0).contains(speed)
+                    || !stop.is_finite()
+                    || *stop < 0.0
+                {
+                    return None;
+                }
+                Some(Box::new(mobs::goals::WalkTo::new(*speed, *stop)))
+            }
             GoalSpec::RestrictSun => Some(Box::new(RestrictSun)),
             GoalSpec::FleeSun { speed } => {
                 if !speed.is_finite() || *speed < 0.0 {
@@ -551,6 +583,46 @@ mod tests {
     /// Whether the mob's goal selector holds a goal of kind `id`.
     fn has(game: &super::super::Game<'_>, mob: MobRef, id: &str) -> bool {
         mob.goals(game).unwrap().iter().any(|e| e.id == id)
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn walk_to_handle_updates_only_the_destination() {
+        with_game(|game| {
+            let mob = mob_in_game(game, "minecraft:zombie", 501);
+            let spec = GoalSpec::WalkTo { speed: 1.0, stop: 6.0 };
+            assert!(!mob.add_target_goal(game, 4, &spec));
+            assert!(!mob.add_goal(game, 4, &GoalSpec::WalkTo { speed: 4.01, stop: 6.0 }));
+            assert!(!mob.add_goal(game, 4, &GoalSpec::WalkTo { speed: 1.0, stop: f64::NAN }));
+            game.mobs[0].ai.nav.kind = super::NavKind::Flying;
+            assert!(!mob.add_goal(game, 4, &spec));
+            assert!(!mob.set_walk_destination(game, Some([8, 65, 9])));
+            game.mobs[0].ai.nav.kind = super::NavKind::Ground;
+            assert!(mob.add_goal(game, 4, &spec));
+            assert!(has(game, mob, spec.id()));
+            let nav = format!("{:?}", game.mobs[0].ai.nav);
+            let goals = format!("{:?}", game.mobs[0].ai.goals);
+            let random = format!("{:?} {:?}", game.mobs[0].random, game.world.random);
+            let dest = [8, 65, 9];
+            assert!(mob.set_walk_destination(game, Some(dest)));
+            assert!(mob.set_walk_destination(game, Some(dest)));
+            assert!(!mob.set_walk_destination(game, Some([i32::MIN, 65, 9])));
+            let entity = mob.entity();
+            let stale = MobRef::new(EntityRef::new(
+                WorldEpoch::new(entity.epoch().get() + 1),
+                entity.id(),
+            ));
+            assert!(!stale.set_walk_destination(game, None));
+            assert_eq!(game.mobs[0].ai.walk_destination, Some(dest));
+            assert!(mob.set_walk_destination(game, None));
+            assert_eq!(game.mobs[0].ai.walk_destination, None);
+            assert_eq!(format!("{:?}", game.mobs[0].ai.nav), nav);
+            assert_eq!(format!("{:?}", game.mobs[0].ai.goals), goals);
+            assert_eq!(
+                format!("{:?} {:?}", game.mobs[0].random, game.world.random),
+                random,
+            );
+        });
     }
 
     #[test]

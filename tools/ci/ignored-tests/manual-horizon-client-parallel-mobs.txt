@@ -16,6 +16,7 @@ horizon-client game::creatures::mob_islands::tests::startup_and_turn_failures_re
 horizon-client game::creatures::mob_islands::tests::static_mannequin_turns_match_the_borrowed_loop by-hand manual # compiled only with --features upstream-parallel-mob-islands; needs prepared resources
 horizon-client game::creatures::mob_islands::tests::verification_detects_snapshot_and_gaussian_only_differences by-hand manual # compiled only with --features upstream-parallel-mob-islands; needs prepared resources
 horizon-client game::creatures::mob_islands::tests::villagers_on_their_own_random_tick_in_groups_as_serial by-hand manual # compiled only with --features upstream-parallel-mob-islands; needs prepared resources
+horizon-client game::creatures::mob_islands::tests::walk_to_matches_borrowed_turns_and_clear_stops_navigation by-hand manual # compiled only with --features upstream-parallel-mob-islands; needs prepared resources and multiple helpers
 horizon-client game::creatures::mob_islands::tests::zombies_read_the_villages_by_night_only by-hand manual # compiled only with --features upstream-parallel-mob-islands; needs prepared resources
 horizon-client game::creatures::prep::tests::the_nearest_player_is_asked_again_after_a_move by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources
 horizon-client game::natural_spawning::parallel::tests::spawn_proposal_finalization_can_cancel_on_the_server_thread by-hand manual # compiled only with --features upstream-parallel-mobs; needs prepared resources

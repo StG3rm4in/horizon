@@ -1827,6 +1827,7 @@ horizon-client game::native_mob_goals::tests::goals_read_add_remove_and_refuse_w
 horizon-client game::native_mob_goals::tests::removing_hold_ground_notifies_nearby_raiders lib daily resources
 horizon-client game::native_mob_goals::tests::removing_running_goal_supplies_snapshot_and_persists_level_random lib daily resources
 horizon-client game::native_mob_goals::tests::removing_school_goal_updates_the_leader lib daily resources
+horizon-client game::native_mob_goals::tests::walk_to_handle_updates_only_the_destination lib daily resources
 horizon-client game::native_mob_navigation::tests::navigation_speed_is_the_paths_speed_modifier lib daily resources
 horizon-client game::native_mob_navigation::tests::navigation_starts_a_real_path_and_refuses_stale_handles lib daily resources
 horizon-client game::native_mob_refs::tests::a_restriction_round_trips_through_the_handle_and_saves lib daily resources

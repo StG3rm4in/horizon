@@ -314,6 +314,16 @@ pub trait MobsBackendMut {
     #[access(WorldOnly)]
     fn mob_reset_goals(&mut self, mob: MobRef) -> bool;
     /// Side: server.
+    /// Set the transient block destination read by `GoalSpec::WalkTo`, or clear
+    /// it with `None`. A write neither searches nor stops navigation. The
+    /// goal selector handles the change on its next full update. The slot
+    /// belongs to the live mob and is shared by its `WalkTo` goals.
+    /// False for an unavailable mob, a destination outside the supported
+    /// coordinate range (absolute coordinate greater than 30,000,000), or
+    /// a set on a mob without ordinary ground navigation.
+    #[access(WorldOnly)]
+    fn mob_set_walk_destination(&mut self, mob: MobRef, at: Option<[i32; 3]>) -> bool;
+    /// Side: server.
     /// `PathNavigation.moveTo(x, y, z, speed)`: true if a path was started.
     /// Refuses a stale or unavailable mob, a client, non-finite arguments,
     /// and coordinates too large for safe block arithmetic. As in vanilla,

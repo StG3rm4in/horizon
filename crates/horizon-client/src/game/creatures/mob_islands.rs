@@ -3091,8 +3091,13 @@ mod tests {
             let mut expected = None;
             let mut seeds = None;
             for requested in [1, 3] {
-                (game.mobs, game.world.random, game.died) =
-                    (mobs.clone(), random.clone(), died.clone());
+                // Cloned rows are detached. Restore them through the live owner
+                // so the residency journal sees the removals and installations.
+                game.mobs.clear();
+                game.mobs
+                    .restore(mobs.clone(), horizon_client::join_seq::RestoreOrder::SpawnsFirst);
+                game.world.random = random.clone();
+                game.died = died.clone();
                 game.world.path_writes = path_writes.clone();
                 LANES.with(|l| l.set(Some(requested)));
                 VERIFY.with(|v| v.set(verify && requested > 1));
@@ -3137,6 +3142,106 @@ mod tests {
             }
         }
         first.unwrap()
+    }
+
+    #[test]
+    #[ignore = "needs prepared resources and multiple helpers to exercise grouping"]
+    fn walk_to_matches_borrowed_turns_and_clear_stops_navigation() {
+        let mut game = separated_herds_game();
+        let quiet = mod_api::ModEntry::new(
+            "walk-to-probe",
+            Box::new(TurnSubscriptions(&[Some(mod_api::HookId::ServerTick)])),
+        );
+        mod_platform::testing::with_mods(vec![quiet].into(), || {
+            let mut walkers = Vec::new();
+            for x in [2, 98, 194] {
+                let start = Vec3::new(f64::from(x) + 0.5, 65.0, 16.5);
+                let destination = [x + 15, 65, 16];
+                assert!(game.run_command(&format!("summon cow {x}.5 65 16.5")));
+                assert!(game.entity_ticking_area()(x, 16), "walker at {x} cannot tick");
+                let m = game.mobs.last_mut().unwrap();
+                assert_eq!(m.position, start);
+                m.on_ground = true;
+                // Start grounded with a downward delta for the first floor collision.
+                m.velocity = Vec3::new(0.0, -0.08, 0.0);
+                // Recently hurt mobs run AI on every turn even when DAB is enabled.
+                // Set only the animation timer, with no attacker or damage impulse.
+                m.hurt_time = 32;
+                m.ai.goals.clear();
+                m.ai.targets.clear();
+                assert!(!m.no_ai && !m.ai.ai_paused);
+                let id = m.id;
+                // Exercise the normal pathfinder on a clone before installing the
+                // goal. The live cow must acquire its own route on a real turn.
+                let mut probe = m.clone();
+                let w = game.mob_world_base(&[]);
+                let path = probe
+                    .create_path_to(&w, destination, 1)
+                    .unwrap_or_else(|| panic!("walker {id}: fixture has no ground path"));
+                assert!(
+                    path.target == destination && path.reached && path.nodes.len() > 1,
+                    "walker {id}: fixture route is unusable: {path:?}",
+                );
+
+                let host: &dyn mod_api::Host = &game;
+                let mob = host.mob(host.entity(id).unwrap()).unwrap();
+                assert!(mob.add_goal(
+                    &mut game,
+                    4,
+                    &mod_api::GoalSpec::WalkTo {
+                        speed: 1.0,
+                        stop: 2.0,
+                    },
+                ));
+                assert!(mob.set_walk_destination(&mut game, Some(destination)));
+                walkers.push((id, mob, start, destination));
+            }
+            assert_eq!(
+                grouped_as_serial(&mut game, 12, "walk_to", |_| {}),
+                groups_for(3),
+            );
+            for &(id, _, start, destination) in &walkers {
+                let m = game.mobs.iter().find(|m| m.id == id).unwrap();
+                assert_eq!(m.age, 12, "walker {id}: creature turns");
+                assert!(
+                    m.ai.goals.is_running("walk_to"),
+                    "walker {id}: goal did not start (paused={}, target={:?})",
+                    m.ai.ai_paused,
+                    m.ai.target,
+                );
+                assert!(
+                    !m.ai.nav.is_done(),
+                    "walker {id}: goal has no active route: {:?}",
+                    m.ai.nav,
+                );
+                assert_eq!(m.ai.nav.target_pos, Some(destination));
+                let remaining = (m.position.x - (f64::from(destination[0]) + 0.5))
+                    .hypot(m.position.z - (f64::from(destination[2]) + 0.5));
+                assert!(
+                    m.position.x > start.x && remaining < 15.0,
+                    "walker {id}: active route did not move it toward its destination                      (position={:?}, control={:?}, velocity={:?})",
+                    m.position,
+                    m.ai.mov,
+                    m.velocity,
+                );
+                assert!(remaining > 2.0, "walker {id} arrived before clear");
+            }
+            for &(_, mob, _, _) in &walkers {
+                assert!(mob.set_walk_destination(&mut game, None));
+            }
+            assert_eq!(
+                grouped_as_serial(&mut game, 4, "walk_to clear", |_| {}),
+                groups_for(3),
+            );
+            for (id, _, _, _) in walkers {
+                let m = game.mobs.iter().find(|m| m.id == id).unwrap();
+                assert_eq!(m.age, 16, "walker {id}: creature turns after clear");
+                assert!(!m.ai.goals.is_running("walk_to"), "walker {id}: goal still running");
+                assert!(m.ai.nav.is_done(), "walker {id}: route still active");
+                assert_eq!(m.ai.nav.target_pos, None, "walker {id}: route can reappear");
+                assert_eq!(m.ai.zza, 0.0, "walker {id}: still driving forward");
+            }
+        });
     }
 
     #[test]

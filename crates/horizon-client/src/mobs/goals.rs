@@ -2461,6 +2461,88 @@ impl Goal for FollowParent {
         }
     }
 }
+/// An engine MOVE goal for a fixed block supplied outside the mob turn.
+#[derive(Clone, Debug)]
+pub struct WalkTo {
+    speed: f64,
+    stop: f64,
+    active: Option<[i32; 3]>,
+    retry_in: u8,
+}
+
+impl WalkTo {
+    pub fn new(speed: f64, stop: f64) -> Self {
+        Self {
+            speed,
+            stop,
+            active: None,
+            retry_in: 0,
+        }
+    }
+
+    fn destination(&self, m: &Mob) -> Option<[i32; 3]> {
+        let at = m.ai.walk_destination?;
+        if m.ai.target.is_some()
+            || m.ai.navigation_redirect.is_some()
+            || m.ai.nav.kind != super::nav::NavKind::Ground
+        {
+            return None;
+        }
+        let dx = m.position.x - (f64::from(at[0]) + 0.5);
+        let dz = m.position.z - (f64::from(at[2]) + 0.5);
+        (dx.hypot(dz) > self.stop).then_some(at)
+    }
+}
+
+impl Goal for WalkTo {
+    goal_clone!();
+    fn name(&self) -> &'static str {
+        "walk_to"
+    }
+    fn flags(&self) -> u8 {
+        MOVE
+    }
+    fn can_use(&mut self, m: &mut Mob, _: &mut Cx) -> bool {
+        self.destination(m).is_some()
+    }
+    fn can_continue(&mut self, m: &mut Mob, _: &mut Cx) -> bool {
+        self.active.is_some() && self.active == self.destination(m)
+    }
+    fn stop(&mut self, m: &mut Mob, _: &mut Cx) {
+        if let Some(at) = self.active.take() {
+            m.nav_stop_walk_to(at);
+        }
+        self.retry_in = 0;
+    }
+    fn every_tick(&self) -> bool {
+        true
+    }
+    fn tick(&mut self, m: &mut Mob, cx: &mut Cx) {
+        let Some(at) = self.destination(m) else {
+            return;
+        };
+        // A running-only selector update can see a write before the full
+        // update releases MOVE and restarts the goal for the new block.
+        if self.active.is_some_and(|active| active != at) {
+            return;
+        }
+        self.retry_in = self.retry_in.saturating_sub(1);
+        if self.active.is_none() || (self.retry_in == 0 && m.ai.nav.is_done()) {
+            self.active = Some(at);
+            self.retry_in = 20;
+            m.nav_move_to(
+                cx.w,
+                [
+                    f64::from(at[0]) + 0.5,
+                    f64::from(at[1]),
+                    f64::from(at[2]) + 0.5,
+                ],
+                self.speed,
+            );
+        }
+    }
+}
+
 /// `FollowMobGoal` `(mob, speed, stopDistance, areaSize)`: follows the first
 /// visible mob of another class within `area` blocks and keeps `stop` away
 /// from it (a parrot hovers by the other animals).
