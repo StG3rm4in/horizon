@@ -753,6 +753,9 @@ impl LevelAccess for GameLevel<'_> {
     fn force_snow(&self) -> bool {
         self.world.force_snow
     }
+    fn force_melt(&self) -> bool {
+        self.world.force_melt
+    }
     fn precipitation(&self, pos: BlockPos) -> Option<horizon_world::level::Precipitation> {
         self.behaviours.precipitation_info(self, pos)
     }

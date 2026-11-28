@@ -704,7 +704,144 @@ mod tests {
 
     #[test]
     #[ignore = "daily"]
+    fn force_melt_rejects_unavailable_handles() {
+        use crate::game::execution_role::ExecutionRole;
+        use mod_api::{LevelRef, WorldEpoch};
+
+        with_game(|game| {
+            let level = game.level(game.dim.id()).unwrap();
+            let stale = LevelRef::new(WorldEpoch::new(level.epoch().get() + 1), level.dimension());
+            let unknown = LevelRef::new(
+                level.epoch(),
+                mod_api::__private::dimension_key("test:unknown_melt_level"),
+            );
+
+            assert!(!game.world.force_melt);
+            assert!(!stale.set_force_melt(game, true));
+            assert!(!unknown.set_force_melt(game, true));
+            game.options.execution_role = ExecutionRole::Client;
+            assert!(!level.set_force_melt(game, true));
+            assert!(!game.world.force_melt);
+
+            game.options.execution_role = ExecutionRole::IntegratedServer;
+            assert!(level.set_force_melt(game, true));
+            assert!(game.world.force_melt);
+            game.enter_level(super::super::Dim::Nether).unwrap();
+            assert!(!game.world.force_melt);
+            assert!(level.set_force_melt(game, false));
+            game.enter_level(super::super::Dim::Overworld).unwrap();
+            assert!(!game.world.force_melt);
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn force_melt_only_changes_eligible_sampled_surfaces() {
+        with_mods(mod_api::Mods::default(), || {
+            with_game(|game| {
+                game.install_live_features();
+                for (x, biome) in [(0, "minecraft:plains"), (1, "minecraft:snowy_plains")] {
+                    let chunk = chunk_in(game, x, biome);
+                    game.world.chunks.insert((x, 0), chunk);
+                    let pos = BlockPos::new(x * 16, 65, 8);
+                    game.block_ticks.add_empty_chunk(pos.chunk()).unwrap();
+                }
+
+                let handle = game.level(game.dim.id()).unwrap();
+                assert!(!game.world.force_melt);
+                assert!(handle.set_weather_levels(game, 0.0, 0.0));
+                let registry = game.pack.assets.registry;
+                let default = |name| registry.default_state(name).unwrap();
+                let air = default("minecraft:air");
+                let stone = default("minecraft:stone");
+                let snow = default("minecraft:snow");
+                let ice = default("minecraft:ice");
+                let water = default("minecraft:water");
+                let snow_block = default("minecraft:snow_block");
+                let packed_ice = default("minecraft:packed_ice");
+                let blue_ice = default("minecraft:blue_ice");
+                let powder_snow = default("minecraft:powder_snow");
+                let mut state = registry.state(snow).unwrap().clone();
+                state.properties.insert("layers".into(), "2".into());
+                let two_layers = registry.resolve(&state).unwrap();
+
+                let columns = [
+                    (1, stone, two_layers, snow),
+                    (3, water, ice, water),
+                    (5, stone, ice, ice),
+                    (7, stone, snow_block, snow_block),
+                    (9, water, packed_ice, packed_ice),
+                    (11, water, blue_ice, blue_ice),
+                    (13, stone, powder_snow, powder_snow),
+                    (14, water, ice, ice),
+                    (20, stone, two_layers, two_layers),
+                    (24, water, ice, ice),
+                ];
+                for (x, support, initial, _) in columns {
+                    game.world.set(x, 64, 8, support).unwrap();
+                    game.world.set(x, 65, 8, initial).unwrap();
+                }
+                game.world.set(14, 67, 8, stone).unwrap();
+                let selected_pass = |game: &mut super::Game<'_>| {
+                    game.with_level(|b, level, ticks| {
+                        for (x, _, _, _) in columns {
+                            b.tick_precipitation_column(level, ticks, BlockPos::new(x, 0, 8));
+                        }
+                    });
+                };
+                let assert_original = |game: &super::Game<'_>| {
+                    for (x, support, initial, _) in columns {
+                        assert_eq!(game.world.block(x, 64, 8), support, "support at {x}");
+                        assert_eq!(game.world.block(x, 65, 8), initial, "surface at {x}");
+                    }
+                };
+
+                for _ in 0..16 {
+                    selected_pass(game);
+                }
+                assert_original(game);
+
+                assert!(handle.set_force_melt(game, true));
+                assert!(handle.set_force_snow(game, true));
+                selected_pass(game);
+                assert_original(game);
+
+                assert!(handle.set_force_snow(game, false));
+                selected_pass(game);
+                for (x, support, _, expected) in columns {
+                    assert_eq!(game.world.block(x, 64, 8), support, "support at {x}");
+                    assert_eq!(game.world.block(x, 65, 8), expected, "surface at {x}");
+                }
+
+                assert!(handle.set_force_melt(game, false));
+                selected_pass(game);
+                assert_eq!(game.world.block(1, 65, 8), snow);
+                assert!(handle.set_force_melt(game, true));
+                selected_pass(game);
+                assert_eq!(game.world.block(1, 65, 8), air);
+            });
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
     fn forced_snow_keeps_generated_columns_identical() {
+        check_generated_columns(|game, handle, force| {
+            assert!(handle.set_force_snow(game, force));
+            assert_eq!(game.world.force_snow, force);
+        });
+    }
+
+    #[test]
+    #[ignore = "daily"]
+    fn force_melt_keeps_generated_columns_identical() {
+        check_generated_columns(|game, handle, force| {
+            assert!(handle.set_force_melt(game, force));
+            assert_eq!(game.world.force_melt, force);
+        });
+    }
+
+    fn check_generated_columns(set_policy: impl Fn(&mut super::Game<'_>, mod_api::LevelRef, bool)) {
         use horizon_client::{
             save::{SaveTables, client_heightmaps_in},
             streaming::Streaming,
@@ -736,18 +873,17 @@ mod tests {
                 streaming.mesh = false;
                 game.world = super::Game::world_for_mods(game.res.facts().air, SEED);
                 let handle = game.level(game.dim.id()).unwrap();
-                assert!(handle.set_force_snow(game, force));
+                set_policy(game, handle, force);
                 CHUNKS.map(|key| {
                     streaming.load_full_chunk(&mut game.world, key);
                     let column = game.world.chunks.get(&key).unwrap();
                     assert!(column.generated, "{key:?}");
-                    assert_eq!(game.world.force_snow, force);
                     Arc::clone(column)
                 })
             };
             let baseline = generate(false);
-            let winter = generate(true);
-            for (a, b) in baseline.iter().zip(&winter) {
+            let enabled = generate(true);
+            for (a, b) in baseline.iter().zip(&enabled) {
                 assert_eq!(a.layout(), b.layout());
                 for y in a.min_y()..a.max_y() {
                     for z in 0..16 {

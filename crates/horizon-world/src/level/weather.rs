@@ -43,9 +43,18 @@ impl Behaviours {
         level: &L,
         pos: BlockPos,
     ) -> BlockPos {
+        let surface_y = level.world_surface(pos.x, pos.z).min(level.max_y());
+        self.motion_blocking_top_from_surface(level, pos, surface_y)
+    }
+
+    fn motion_blocking_top_from_surface<L: LevelAccess + ?Sized>(
+        &self,
+        level: &L,
+        pos: BlockPos,
+        surface_y: i32,
+    ) -> BlockPos {
         let blocks = self.tag("minecraft:blocks_motion_in_heightmap");
-        let top = level.world_surface(pos.x, pos.z).min(level.max_y());
-        for y in (level.min_y()..top).rev() {
+        for y in (level.min_y()..surface_y).rev() {
             let state = level.block_state(BlockPos::new(pos.x, y, pos.z));
             let fluid = self.fluid(state).kind() != FluidKind::Empty;
             if fluid || blocks.is_some_and(|t| t.contains(self.block(state))) {
@@ -61,7 +70,8 @@ impl Behaviours {
         level: &L,
         pos: BlockPos,
     ) -> Option<Precipitation> {
-        let top = self.motion_blocking_top(level, pos);
+        let surface_y = level.world_surface(pos.x, pos.z).min(level.max_y());
+        let top = self.motion_blocking_top_from_surface(level, pos, surface_y);
         let below = BlockPos::new(top.x, top.y - 1, top.z);
         let settings = self.biome_settings(level, top)?;
         let force_snow = level.force_snow();
@@ -109,11 +119,23 @@ impl Behaviours {
         };
         Some(Precipitation {
             top,
+            surface_y,
             freezes_below,
             snows_at_top,
             kind,
         })
     }
+
+    pub(super) fn warm_enough_to_melt<L: LevelAccess + ?Sized>(
+        &self,
+        level: &L,
+        pos: BlockPos,
+    ) -> bool {
+        // Biome.warmEnoughToRain is the inverse of coldEnoughToSnow, even in dry biomes.
+        self.biome_settings(level, pos)
+            .is_some_and(|settings| settings.height_adjusted(pos, sea_level(level)) >= 0.15)
+    }
+
     /// `SnowLayerBlock.canSurvive` for a default snow layer at `pos`.
     fn snow_survives<L: LevelAccess + ?Sized>(&self, level: &L, pos: BlockPos) -> bool {
         let below = level.block_state(BlockPos::new(pos.x, pos.y - 1, pos.z));

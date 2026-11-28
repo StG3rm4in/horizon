@@ -1618,6 +1618,33 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
             self.level_event(1034, pos, 0);
         }
     }
+    fn melt_precipitation_surface(&mut self, info: Precipitation) {
+        let b = self.b;
+        let pos = BlockPos::new(info.top.x, info.surface_y - 1, info.top.z);
+        if pos.y < self.level.min_y() {
+            return;
+        }
+        let state = self.state(pos);
+        if b.is_block(state, b.named.snow) {
+            if b.warm_enough_to_melt(self.level, pos) {
+                let layers = b.table.int(state, b.props.layers);
+                let target = if layers > 1 {
+                    b.table.set_int(state, b.props.layers, layers - 1)
+                } else {
+                    b.air()
+                };
+                self.set_block_and_update(pos, target);
+            }
+        } else if b.is_block(state, b.named.ice)
+            && pos.y > self.level.min_y()
+            && self.level.dimension_type().height.has_skylight
+            && b.is_block(self.state(below(pos)), b.named.water)
+            && b.warm_enough_to_melt(self.level, pos)
+        {
+            self.ice_melt_into_water(pos, state, b.default_of(b.named.water));
+        }
+    }
+
     /// `ServerLevel.tickPrecipitation` at a column whose top (motion-blocking
     /// heightmap) position and biome answers are supplied by the caller.
     pub(crate) fn precipitation_tick(&mut self, info: Precipitation) {
@@ -1899,6 +1926,8 @@ pub enum PrecipitationKind {
 pub struct Precipitation {
     /// `getHeightmapPos(MOTION_BLOCKING, pos)`.
     pub top: BlockPos,
+    /// First air above the highest non-air block, from the same height lookup.
+    pub surface_y: i32,
     /// `biome.shouldFreeze(level, top.below())`.
     pub freezes_below: bool,
     /// `biome.shouldSnow(level, top)`.
@@ -2009,7 +2038,11 @@ impl Behaviours {
         pos: BlockPos,
     ) {
         if let Some(info) = level.precipitation(pos) {
-            self.sim(level, ticks).precipitation_tick(info);
+            let mut sim = self.sim(level, ticks);
+            sim.precipitation_tick(info);
+            if sim.level.force_melt() && !sim.level.force_snow() {
+                sim.melt_precipitation_surface(info);
+            }
         }
     }
 

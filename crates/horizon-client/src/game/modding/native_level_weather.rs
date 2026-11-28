@@ -5,22 +5,32 @@
 //! returns false. The players see the change on the next host sync.
 use super::Game;
 use crate::game::level_control_hooks::LevelControl;
+use horizon_client::world::World;
 use mod_api::LevelRef;
 
 impl Game<'_> {
-    pub(super) fn level_set_force_snow(&mut self, level: LevelRef, force: bool) -> bool {
-        if self.native_level_world(level).is_none() {
-            return false;
-        }
-        let world = if level.dimension() == self.dim.key() {
-            &mut self.world
+    fn precipitation_policy_world_mut(&mut self, level: LevelRef) -> Option<&mut World> {
+        self.native_level_world(level)?;
+        if level.dimension() == self.dim.key() {
+            Some(&mut self.world)
         } else {
-            let Some(world) = self.levels.parked_world_mut_of(level.dimension_id()) else {
-                return false;
-            };
-            world
+            self.levels.parked_world_mut_of(level.dimension_id())
+        }
+    }
+
+    pub(super) fn level_set_force_snow(&mut self, level: LevelRef, force: bool) -> bool {
+        let Some(world) = self.precipitation_policy_world_mut(level) else {
+            return false;
         };
         world.force_snow = force;
+        true
+    }
+
+    pub(super) fn level_set_force_melt(&mut self, level: LevelRef, force: bool) -> bool {
+        let Some(world) = self.precipitation_policy_world_mut(level) else {
+            return false;
+        };
+        world.force_melt = force;
         true
     }
 

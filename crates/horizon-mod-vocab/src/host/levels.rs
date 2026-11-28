@@ -1176,6 +1176,12 @@ pub trait LevelsBackendMut {
     #[access(WorldOnly)]
     fn level_set_force_snow(&mut self, level: LevelRef, force: bool) -> bool;
     /// Side: server.
+    /// Melts warm-biome surface snow and ice during live precipitation ticks until the level
+    /// closes. Forced snow takes precedence.
+    /// False for stale handles, unavailable levels and calls from a client.
+    #[access(WorldOnly)]
+    fn level_set_force_melt(&mut self, level: LevelRef, force: bool) -> bool;
+    /// Side: server.
     /// Sets the weather as `/weather` does (`ServerLevel.setWeatherParameters`): clear for
     /// `clear_ticks`, or raining (and thundering) for `weather_ticks`, after which the
     /// weather cycle goes on as usual. Rain and thunder then fade in or out as vanilla's do;

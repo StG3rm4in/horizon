@@ -1264,6 +1264,9 @@ pub trait LevelAccess: BlockEntityNeighbors {
     fn force_snow(&self) -> bool {
         false
     }
+    fn force_melt(&self) -> bool {
+        false
+    }
     /// Biome answers for a precipitation tick at the column of `pos` (see
     /// [`Precipitation`]); None skips snow/ice formation and cauldron filling.
     fn precipitation(&self, _pos: BlockPos) -> Option<Precipitation> {
